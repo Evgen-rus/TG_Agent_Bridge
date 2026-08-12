@@ -13,9 +13,9 @@ from .telegram.bot import create_telegram_application
 
 
 def main() -> None:
-    configure_logging()
     root = Path.cwd()
     settings = Settings.from_env(root)
+    configure_logging(settings.log_dir, settings.log_retention_days)
     registry = ChatRegistry.load(settings.chats_dir)
     store = ChatThreadStore(settings.database_path)
     provider = CodexProvider(
@@ -32,7 +32,7 @@ def main() -> None:
     )
     logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
     telegram_application.run_polling(
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
         drop_pending_updates=True,
     )
 

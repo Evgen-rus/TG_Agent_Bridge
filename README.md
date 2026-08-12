@@ -45,6 +45,23 @@ accumulated while the application was offline. Successfully processed update
 IDs are stored in the same SQLite database, so Telegram retries are not sent to
 Codex twice. Messages authored by bot accounts are ignored.
 
+## Owner learning
+
+Use a separate service group as `OWNER_CHAT_ID`. Any human member can reply to
+a suggestion with a correction in ordinary language. Codex shows how it
+understood the correction; **Да, применить** confirms it and **Нет, уточнить**
+asks for clarification. Rules apply to that client by default. Global scope
+requires explicit wording such as "for all clients".
+
+Use `/rules` in the owner group to inspect active rules and `/undo` to deactivate
+the most recently confirmed active rule. Corrected suggestions still go only to
+the owner group and are never sent to a client chat.
+
+Diagnostic logs are written to `runtime/logs/agentbridge.log`, rotate daily,
+and retain seven days by default. They contain event identifiers and processing
+stages, not Telegram message bodies. `LOG_DIR` and `LOG_RETENTION_DAYS` override
+the defaults.
+
 ## Test
 
 ```powershell

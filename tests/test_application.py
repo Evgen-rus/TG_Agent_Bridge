@@ -20,6 +20,7 @@ class FakeProvider:
         sender_name: str,
         chat_name: str,
         wiki: str,
+        rules: list[str],
         thread_id: str | None,
     ) -> AgentReply:
         self.calls.append(
@@ -28,6 +29,7 @@ class FakeProvider:
                 "sender_name": sender_name,
                 "chat_name": chat_name,
                 "wiki": wiki,
+                "rules": rules,
                 "thread_id": thread_id,
             }
         )
