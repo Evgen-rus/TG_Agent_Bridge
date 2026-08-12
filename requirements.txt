@@ -1,0 +1,7 @@
+openai-codex==0.144.4
+python-telegram-bot==22.8
+python-dotenv==1.2.2
+PyYAML==6.0.3
+pytest==9.1.1
+pytest-asyncio==1.4.0
+

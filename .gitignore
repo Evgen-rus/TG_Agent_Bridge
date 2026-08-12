@@ -6,6 +6,10 @@
 # Server-only runtime state: secrets, reports, SQLite and access credentials
 runtime/
 
+# Local Telegram client configurations and wiki context
+chats/*
+!chats/.gitkeep
+
 # Python
 __pycache__/
 *.py[cod]
