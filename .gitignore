@@ -1,0 +1,114 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Server-only runtime state: secrets, reports, SQLite and access credentials
+runtime/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+.cursor/
+.cursorignore/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+instructions/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Virtual Environment
+venv/
+ENV/
+.venv/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Sensitive data
+credentials/
+database/
+amo/tokens.json
+.agents/
+.codex/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Local client data and generated reports
+Docs/
+reports/
+knowledge/
+!knowledge/
+knowledge/*
+!knowledge/clients/
+knowledge/clients/*
+!knowledge/clients/praktikm/
+knowledge/clients/praktikm/*
+!knowledge/clients/praktikm/attention_delta_core.md
+!knowledge/clients/praktikm/attention_delta_lead.md
+!knowledge/clients/praktikm/attention_delta_deal.md
+downloads/
+tmp/
+
+# The optimization plan is intentionally versioned; all other local Docs files
+# remain excluded because they can contain client-specific runbooks or exports.
+!Docs/
+Docs/*
+!Docs/context_memory_optimization_plan.md
+!Docs/temporary_tunnel_runbook.md
+!Docs/github_actions_vps_cicd_guide.md
+
+# Benchmark fixtures and results are local-only because they may reference
+# customer workspaces and generated ROP artifacts.
+benchmarks/local/
+benchmarks/results/
+
+# Local media and generated transcripts/analysis exports
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.flac
+*.webm
+*.mp4
+*.mov
+*.avi
+*_transcript.txt
+*_transcript.md
+*_transcript.json
+*_analysis.json
+*_rop_report.md
+*_raw_model_output.txt
+*_request_prompt.txt
+
+# Local Bitrix exports and private CRM maps
+поля.txt
+статус.txt
+crm_pipeline_map.json
