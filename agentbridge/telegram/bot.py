@@ -9,6 +9,7 @@ import logging
 from typing import Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage
@@ -32,6 +33,14 @@ def _confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("Да, применить", callback_data=f"learn:yes:{draft_id}"),
         InlineKeyboardButton("Нет, уточнить", callback_data=f"learn:no:{draft_id}"),
     ]])
+
+
+async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
+    """UX-only Telegram calls: a timeout must not abort local work like saving a rule."""
+    try:
+        await coro
+    except NetworkError:
+        logger.warning("event=telegram_transient_error operation=%s", operation)
 
 
 def create_telegram_application(*, token: str, owner_chat_id: int, message_service: IncomingMessageService, batch_seconds: float = 20.0) -> Application:
@@ -144,7 +153,7 @@ def create_telegram_application(*, token: str, owner_chat_id: int, message_servi
         query = update.callback_query
         if query is None or query.message is None or query.message.chat.id != owner_chat_id:
             return
-        await query.answer()
+        await _telegram_try("answer_callback", query.answer())
         try:
             _, action, raw_id = (query.data or "").split(":", 2)
             draft_id = int(raw_id)
@@ -154,10 +163,10 @@ def create_telegram_application(*, token: str, owner_chat_id: int, message_servi
             prompt = await _send(context.bot, chat_id=owner_chat_id, text="Что я понял неправильно? Ответьте на это сообщение уточнением.")
             if prompt is not None and getattr(prompt, "message_id", None) is not None:
                 message_service.mark_awaiting_clarification(draft_id, prompt.message_id)
-            await query.edit_message_reply_markup(reply_markup=None)
+            await _telegram_try("clear_confirmation_buttons", query.edit_message_reply_markup(reply_markup=None))
             return
         result = await message_service.confirm_learning(draft_id)
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _telegram_try("clear_confirmation_buttons", query.edit_message_reply_markup(reply_markup=None))
         if result is None:
             await _send(context.bot, chat_id=owner_chat_id, text="Это изменение уже обработано или больше недоступно.")
             return

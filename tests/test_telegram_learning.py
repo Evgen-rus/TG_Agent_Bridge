@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from agentbridge.application import LearningProposal
+from telegram.error import TimedOut
+
+from agentbridge.application import LearningProposal, LearningResult
 from agentbridge.telegram.bot import create_telegram_application
 
 
@@ -63,6 +65,8 @@ class FakeUpdate:
 @dataclass
 class FakeLearningService:
     feedback_calls: list[dict] = field(default_factory=list)
+    confirm_calls: list[int] = field(default_factory=list)
+    confirm_result: LearningResult | None = field(default_factory=lambda: LearningResult("Acme", True, None, False))
 
     async def handle_messages(self, telegram_chat_id, messages):
         raise AssertionError("Owner messages must not enter the client pipeline")
@@ -80,9 +84,47 @@ class FakeLearningService:
         })
         return LearningProposal(7, "Acme", "Write warmer", "Use a warm tone", "client", True)
 
+    async def confirm_learning(self, draft_id: int):
+        self.confirm_calls.append(draft_id)
+        return self.confirm_result
+
+
+@dataclass
+class FakeCallbackMessage:
+    chat: FakeChat
+
+
+@dataclass
+class FakeCallbackQuery:
+    data: str
+    message: FakeCallbackMessage
+    answer_error: BaseException | None = None
+    edit_error: BaseException | None = None
+    answered: bool = False
+    markup_cleared: bool = False
+
+    async def answer(self, **kwargs):
+        if self.answer_error is not None:
+            raise self.answer_error
+        self.answered = True
+
+    async def edit_message_reply_markup(self, reply_markup=None):
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.markup_cleared = True
+
+
+@dataclass
+class FakeCallbackUpdate:
+    callback_query: FakeCallbackQuery
+
 
 def _text_callback(application):
     return application.handlers[0][0].callback
+
+
+def _learning_callback(application):
+    return application.handlers[0][1].callback
 
 
 @pytest.mark.asyncio
@@ -147,3 +189,48 @@ async def test_reply_to_human_in_owner_group_stays_ordinary_conversation() -> No
     )
     assert service.feedback_calls == []
     assert bot.sent == []
+
+
+def _yes_callback_update(*, owner_chat_id: int = 7654321, draft_id: int = 2, answer_error=None, edit_error=None) -> FakeCallbackUpdate:
+    query = FakeCallbackQuery(
+        data=f"learn:yes:{draft_id}",
+        message=FakeCallbackMessage(FakeChat(owner_chat_id)),
+        answer_error=answer_error,
+        edit_error=edit_error,
+    )
+    return FakeCallbackUpdate(query)
+
+
+@pytest.mark.asyncio
+async def test_yes_button_confirms_learning() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    update = _yes_callback_update()
+    await _learning_callback(application)(update, FakeContext(bot))
+    assert service.confirm_calls == [2]
+    assert update.callback_query.answered is True
+    assert update.callback_query.markup_cleared is True
+    assert bot.sent[-1]["text"] == "Правило сохранено."
+
+
+@pytest.mark.asyncio
+async def test_yes_button_still_confirms_when_telegram_ack_times_out() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    update = _yes_callback_update(answer_error=TimedOut("Timed out"))
+    await _learning_callback(application)(update, FakeContext(bot))
+    assert service.confirm_calls == [2]
+    assert bot.sent[-1]["text"] == "Правило сохранено."
+
+
+@pytest.mark.asyncio
+async def test_yes_button_still_confirms_when_clearing_buttons_times_out() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    update = _yes_callback_update(edit_error=TimedOut("Timed out"))
+    await _learning_callback(application)(update, FakeContext(bot))
+    assert service.confirm_calls == [2]
+    assert bot.sent[-1]["text"] == "Правило сохранено."
