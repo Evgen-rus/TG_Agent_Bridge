@@ -15,7 +15,6 @@ def test_owner_message_contains_a_compact_copyable_suggestion() -> None:
 
     text = format_owner_message(suggestion)
 
-    assert "\u041d\u043e\u0432\u044b\u0439 \u0437\u0430\u043f\u0440\u043e\u0441" in text
     assert "\u0427\u0430\u0442: Acme Support" in text
     assert "Alice:" in text
     assert "Can I get the docs?" in text

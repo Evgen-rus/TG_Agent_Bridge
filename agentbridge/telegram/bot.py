@@ -43,13 +43,23 @@ async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
         logger.warning("event=telegram_transient_error operation=%s", operation)
 
 
-def create_telegram_application(*, token: str, owner_chat_id: int, message_service: IncomingMessageService, batch_seconds: float = 20.0) -> Application:
+def create_telegram_application(
+    *,
+    token: str,
+    owner_chat_id: int,
+    message_service: IncomingMessageService,
+    batch_seconds: float = 20.0,
+    delivery_retry_seconds: float = 30.0,
+) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
     if batch_seconds < 0:
         raise ValueError("Message batch interval must not be negative.")
-    application = Application.builder().token(token.strip()).build()
+    if delivery_retry_seconds <= 0:
+        raise ValueError("Delivery retry interval must be positive.")
     pending_batches: dict[int, _PendingBatch] = {}
+    delivery_lock = asyncio.Lock()
+    retry_task: asyncio.Task[None] | None = None
 
     async def _send(bot, *, chat_id: int, text: str, reply_markup=None):
         kwargs = {"chat_id": chat_id, "text": text}
@@ -57,11 +67,58 @@ def create_telegram_application(*, token: str, owner_chat_id: int, message_servi
             kwargs["reply_markup"] = reply_markup
         return await bot.send_message(**kwargs)
 
-    async def _deliver_suggestion(bot, suggestion) -> None:
-        sent = await _send(bot, chat_id=owner_chat_id, text=format_owner_message(suggestion))
-        if sent is not None and getattr(sent, "message_id", None) is not None and suggestion.recommendation_id:
-            message_service.record_owner_delivery(suggestion.recommendation_id, owner_chat_id, sent.message_id)
-        logger.info("event=owner_suggestion_sent recommendation_id=%s owner_message_id=%s", suggestion.recommendation_id, getattr(sent, "message_id", None))
+    async def _deliver_suggestion(bot, suggestion) -> bool:
+        async with delivery_lock:
+            if suggestion.recommendation_id:
+                is_linked = getattr(message_service, "is_owner_delivery_linked", None)
+                if is_linked is not None and is_linked(suggestion.recommendation_id, owner_chat_id):
+                    logger.info("event=owner_delivery_already_linked recommendation_id=%s", suggestion.recommendation_id)
+                    return True
+            try:
+                sent = await _send(bot, chat_id=owner_chat_id, text=format_owner_message(suggestion))
+                message_id = getattr(sent, "message_id", None)
+                if message_id is None:
+                    logger.warning("event=owner_delivery_pending reason=no_message_id recommendation_id=%s", suggestion.recommendation_id)
+                    return False
+                if suggestion.recommendation_id:
+                    message_service.record_owner_delivery(recommendation_id=suggestion.recommendation_id, owner_chat_id=owner_chat_id, owner_message_id=message_id)
+                logger.info("event=owner_suggestion_sent recommendation_id=%s owner_message_id=%s", suggestion.recommendation_id, message_id)
+                return True
+            except NetworkError:
+                logger.warning("event=owner_delivery_pending reason=telegram_network_error recommendation_id=%s", suggestion.recommendation_id)
+                return False
+            except Exception:
+                logger.exception("event=owner_delivery_pending reason=delivery_error recommendation_id=%s", suggestion.recommendation_id)
+                return False
+
+    async def _retry_pending_deliveries(bot) -> None:
+        pending = getattr(message_service, "pending_suggestions", None)
+        if pending is None:
+            return
+        try:
+            suggestions = pending(owner_chat_id)
+        except Exception:
+            logger.exception("event=owner_delivery_scan_failed")
+            return
+        for suggestion in suggestions:
+            await _deliver_suggestion(bot, suggestion)
+
+    async def _delivery_retry_loop(application: Application) -> None:
+        while True:
+            await _retry_pending_deliveries(application.bot)
+            await asyncio.sleep(delivery_retry_seconds)
+
+    async def _post_init(application: Application) -> None:
+        nonlocal retry_task
+        retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
+
+    async def _post_stop(application: Application) -> None:
+        nonlocal retry_task
+        if retry_task is None:
+            return
+        retry_task.cancel()
+        await asyncio.gather(retry_task, return_exceptions=True)
+        retry_task = None
 
     async def send_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
@@ -187,6 +244,7 @@ def create_telegram_application(*, token: str, owner_chat_id: int, message_servi
         text = "Активных правил для отмены нет." if rule is None else f"Последнее правило отменено:\n{rule.rule_text}"
         await _send(context.bot, chat_id=owner_chat_id, text=text)
 
+    application = Application.builder().token(token.strip()).post_init(_post_init).post_stop(_post_stop).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, queue_message))
     application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^learn:(yes|no):\d+$"))
     application.add_handler(CommandHandler("rules", rules_command))

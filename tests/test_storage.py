@@ -28,3 +28,27 @@ def test_processed_update_survives_a_new_store_instance(tmp_path) -> None:
     restarted_store = ChatThreadStore(database_path)
 
     assert restarted_store.is_update_processed(456) is True
+
+
+def test_pending_recommendation_survives_restart_until_owner_delivery(tmp_path) -> None:
+    database_path = tmp_path / "runtime" / "agentbridge.sqlite3"
+    first_store = ChatThreadStore(database_path)
+    recommendation_id = first_store.create_recommendation(
+        telegram_chat_id=-100123456,
+        chat_name="Acme Support",
+        sender_name="Alice",
+        original_message="Hello",
+        situation="Greeting",
+        suggested_reply="Hi",
+        owner_chat_id=7654321,
+    )
+
+    restarted_store = ChatThreadStore(database_path)
+
+    pending = restarted_store.pending_recommendations(7654321)
+    assert [record.id for record in pending] == [recommendation_id]
+    assert pending[0].owner_message_id is None
+
+    restarted_store.attach_owner_message(recommendation_id, 7654321, 9001)
+
+    assert restarted_store.pending_recommendations(7654321) == []

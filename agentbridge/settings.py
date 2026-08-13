@@ -18,6 +18,7 @@ class Settings:
     codex_model: str = "gpt-5.6-sol"
     codex_reasoning_effort: str = "medium"
     message_batch_seconds: float = 20.0
+    delivery_retry_seconds: float = 30.0
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -45,4 +46,5 @@ class Settings:
             codex_model=os.getenv("CODEX_MODEL", "gpt-5.6-sol").strip(),
             codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip(),
             message_batch_seconds=float(os.getenv("MESSAGE_BATCH_SECONDS", "20")),
+            delivery_retry_seconds=float(os.getenv("DELIVERY_RETRY_SECONDS", "30")),
         )

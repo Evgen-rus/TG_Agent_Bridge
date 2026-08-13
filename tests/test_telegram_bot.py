@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 import pytest
+from telegram.error import NetworkError
 
 from agentbridge.application import Suggestion
 from agentbridge.telegram.bot import create_telegram_application
@@ -51,6 +52,37 @@ class FakeBot:
 
     async def send_message(self, *, chat_id: int, text: str) -> None:
         self.sent.append({"chat_id": chat_id, "text": text})
+
+
+@dataclass
+class RetryingBot:
+    failures_remaining: int = 1
+    sent: list[dict[str, object]] = field(default_factory=list)
+
+    async def send_message(self, *, chat_id: int, text: str):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise NetworkError("temporary Telegram outage")
+        self.sent.append({"chat_id": chat_id, "text": text})
+        return type("SentMessage", (), {"message_id": 9000 + len(self.sent)})()
+
+
+@dataclass
+class PersistentDeliveryService:
+    suggestion: Suggestion
+    pending: bool = True
+
+    async def handle_messages(self, telegram_chat_id, messages):
+        return self.suggestion
+
+    def pending_suggestions(self, owner_chat_id):
+        return [self.suggestion] if self.pending else []
+
+    def is_owner_delivery_linked(self, recommendation_id, owner_chat_id):
+        return not self.pending
+
+    def record_owner_delivery(self, recommendation_id, owner_chat_id, owner_message_id):
+        self.pending = False
 
 
 @dataclass
@@ -224,3 +256,42 @@ async def test_messages_in_same_chat_are_sent_as_one_batch() -> None:
     assert len(service.calls) == 1
     assert service.batch_sizes == [2]
     assert len(bot.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_owner_delivery_is_retried_by_delivery_loop() -> None:
+    owner_chat_id = 7654321
+    suggestion = Suggestion(
+        chat_name="Acme",
+        sender_name="Alice",
+        original_message="Hello",
+        situation="Greeting",
+        suggested_reply="Hi",
+        recommendation_id=12,
+    )
+    service = PersistentDeliveryService(suggestion)
+    application = create_telegram_application(
+        token="test-token",
+        owner_chat_id=owner_chat_id,
+        message_service=service,
+        batch_seconds=0,
+        delivery_retry_seconds=0.01,
+    )
+    bot = RetryingBot()
+    application.bot = bot
+
+    await _message_callback(application)(
+        FakeUpdate(FakeMessage("Hello"), FakeChat(-100123456), FakeUser()),
+        FakeContext(bot),
+    )
+    await asyncio.sleep(0.01)
+    assert bot.sent == []
+    assert service.pending is True
+
+    await application.post_init(application)
+    await asyncio.sleep(0.02)
+    await application.post_stop(application)
+
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["chat_id"] == owner_chat_id
+    assert service.pending is False

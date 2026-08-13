@@ -21,6 +21,7 @@ class RecommendationRecord:
     original_message: str
     situation: str
     suggested_reply: str
+    owner_chat_id: int | None
     owner_message_id: int | None
 
 
@@ -167,21 +168,51 @@ class ChatThreadStore:
         with self._connect() as connection:
             connection.execute("INSERT OR IGNORE INTO processed_updates VALUES (?, ?)", (telegram_update_id, _now()))
 
-    def create_recommendation(self, telegram_chat_id: int, chat_name: str, sender_name: str, original_message: str, situation: str, suggested_reply: str) -> int:
+    def create_recommendation(
+        self,
+        telegram_chat_id: int,
+        chat_name: str,
+        sender_name: str,
+        original_message: str,
+        situation: str,
+        suggested_reply: str,
+        owner_chat_id: int | None = None,
+    ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO recommendations
-                (telegram_chat_id, chat_name, sender_name, original_message, situation, suggested_reply, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (telegram_chat_id, chat_name, sender_name, original_message, situation, suggested_reply, _now()),
+                (telegram_chat_id, chat_name, sender_name, original_message, situation, suggested_reply,
+                 owner_chat_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (telegram_chat_id, chat_name, sender_name, original_message, situation, suggested_reply,
+                 owner_chat_id, _now()),
             )
             return int(cursor.lastrowid)
+
+    def pending_recommendations(self, owner_chat_id: int) -> list[RecommendationRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM recommendations
+                WHERE owner_chat_id=? AND owner_message_id IS NULL
+                ORDER BY id""",
+                (owner_chat_id,),
+            ).fetchall()
+        return [self._recommendation(row) for row in rows]
 
     def attach_owner_message(self, recommendation_id: int, owner_chat_id: int, owner_message_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE recommendations SET owner_chat_id=?, owner_message_id=? WHERE id=?",
                 (owner_chat_id, owner_message_id, recommendation_id),
+            )
+
+    def assign_unowned_pending_recommendations(self, owner_chat_id: int) -> None:
+        """Recover rows created before durable owner delivery was introduced."""
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE recommendations SET owner_chat_id=?
+                WHERE owner_chat_id IS NULL AND owner_message_id IS NULL""",
+                (owner_chat_id,),
             )
 
     def get_recommendation_by_owner_message(self, owner_chat_id: int, owner_message_id: int) -> RecommendationRecord | None:
@@ -202,7 +233,8 @@ class ChatThreadStore:
         return RecommendationRecord(
             id=row["id"], telegram_chat_id=row["telegram_chat_id"], chat_name=row["chat_name"],
             sender_name=row["sender_name"], original_message=row["original_message"], situation=row["situation"],
-            suggested_reply=row["suggested_reply"], owner_message_id=row["owner_message_id"],
+            suggested_reply=row["suggested_reply"], owner_chat_id=row["owner_chat_id"],
+            owner_message_id=row["owner_message_id"],
         )
 
     def create_learning_draft(self, recommendation_id: int, author_user_id: int, author_name: str, feedback: str, analysis) -> LearningDraft:

@@ -23,12 +23,13 @@ def main() -> None:
         reasoning_effort=settings.codex_reasoning_effort,
         cwd=root,
     )
-    service = AgentBridgeApplication(registry, store, provider)
+    service = AgentBridgeApplication(registry, store, provider, settings.owner_chat_id)
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,
         owner_chat_id=settings.owner_chat_id,
         message_service=service,
         batch_seconds=settings.message_batch_seconds,
+        delivery_retry_seconds=settings.delivery_retry_seconds,
     )
     logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
     telegram_application.run_polling(

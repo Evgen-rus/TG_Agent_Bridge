@@ -37,7 +37,7 @@ Messages from different Telegram chats are never placed in one batch.
 - `agentbridge/chats/loader.py`: loads `chats/*/config.yaml` plus sibling
   `wiki.md` into a registry keyed by Telegram chat ID.
 - `agentbridge/storage/sqlite.py`: SQLite threads, processed updates,
-  recommendation links, learning drafts, and versioned rules.
+  pending/delivered recommendation links, learning drafts, and versioned rules.
 - `agentbridge/logging.py`: secret redaction and seven-day daily diagnostic
   file rotation.
 
@@ -53,6 +53,11 @@ There are two durable context layers:
 SQLite also stores processed Telegram update IDs for duplicate suppression. The
 20-second pending batch exists only in process memory and is lost on shutdown.
 Telegram message history itself is not stored locally.
+
+Recommendations are persisted before owner delivery. A missing owner message ID
+means the recommendation is pending; the Telegram adapter retries pending rows
+periodically and on startup. This is at-least-once delivery, so a crash between
+Telegram acceptance and SQLite acknowledgement can produce a duplicate.
 
 Confirmed rules form a third durable context layer and are included in future
 Codex turns for the matching chat. Feedback is interpreted in a separate Codex

@@ -50,10 +50,17 @@ class LearningResult:
 
 
 class AgentBridgeApplication:
-    def __init__(self, registry: ChatRegistry, store: ChatThreadStore, provider: AgentProvider):
+    def __init__(
+        self,
+        registry: ChatRegistry,
+        store: ChatThreadStore,
+        provider: AgentProvider,
+        owner_chat_id: int | None = None,
+    ):
         self.registry = registry
         self.store = store
         self.provider = provider
+        self.owner_chat_id = owner_chat_id
         self._chat_locks: dict[int, asyncio.Lock] = {}
 
     async def handle_message(self, telegram_chat_id: int, sender_name: str, message: str, update_id: int | None = None) -> Suggestion | None:
@@ -87,7 +94,8 @@ class AgentBridgeApplication:
                 logger.info("event=codex_suggestion_suppressed chat_id=%s rule_count=%d", telegram_chat_id, len(rules))
                 return None
             recommendation_id = self.store.create_recommendation(
-                telegram_chat_id, chat.name, sender_name, combined_message, reply.situation, reply.suggested_reply
+                telegram_chat_id, chat.name, sender_name, combined_message, reply.situation,
+                reply.suggested_reply, self.owner_chat_id,
             )
             logger.info("event=codex_suggest_done chat_id=%s recommendation_id=%s", telegram_chat_id, recommendation_id)
         return Suggestion(chat.name, sender_name, combined_message, reply.situation, reply.suggested_reply, recommendation_id, telegram_chat_id)
@@ -95,6 +103,29 @@ class AgentBridgeApplication:
     def record_owner_delivery(self, recommendation_id: int, owner_chat_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_message(recommendation_id, owner_chat_id, owner_message_id)
         logger.info("event=owner_delivery_linked recommendation_id=%s owner_message_id=%s", recommendation_id, owner_message_id)
+
+    def pending_suggestions(self, owner_chat_id: int) -> list[Suggestion]:
+        self.store.assign_unowned_pending_recommendations(owner_chat_id)
+        return [
+            Suggestion(
+                chat_name=record.chat_name,
+                sender_name=record.sender_name,
+                original_message=record.original_message,
+                situation=record.situation,
+                suggested_reply=record.suggested_reply,
+                recommendation_id=record.id,
+                telegram_chat_id=record.telegram_chat_id,
+            )
+            for record in self.store.pending_recommendations(owner_chat_id)
+        ]
+
+    def is_owner_delivery_linked(self, recommendation_id: int, owner_chat_id: int) -> bool:
+        record = self.store.get_recommendation(recommendation_id)
+        return bool(
+            record is not None
+            and record.owner_chat_id == owner_chat_id
+            and record.owner_message_id is not None
+        )
 
     async def handle_owner_feedback(self, owner_chat_id: int, reply_to_message_id: int, author_user_id: int, author_name: str, feedback: str, update_id: int | None = None) -> LearningProposal | None:
         if update_id is not None and self.store.is_update_processed(update_id):
@@ -169,7 +200,11 @@ class AgentBridgeApplication:
                 )
                 self.store.save_thread(chat.telegram_chat_id, chat.name, reply.thread_id, chat.agent_provider)
                 if reply.should_notify:
-                    new_id = self.store.create_recommendation(chat.telegram_chat_id, chat.name, recommendation.sender_name, recommendation.original_message, reply.situation, reply.suggested_reply)
+                    new_id = self.store.create_recommendation(
+                        chat.telegram_chat_id, chat.name, recommendation.sender_name,
+                        recommendation.original_message, reply.situation, reply.suggested_reply,
+                        self.owner_chat_id,
+                    )
                     revised = Suggestion(chat.name, recommendation.sender_name, recommendation.original_message, reply.situation, reply.suggested_reply, new_id, chat.telegram_chat_id)
                     logger.info("event=recommendation_revised draft_id=%s recommendation_id=%s", draft_id, new_id)
                 else:
