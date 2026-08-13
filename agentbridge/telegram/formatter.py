@@ -5,12 +5,10 @@ from __future__ import annotations
 
 def format_owner_message(suggestion: "Suggestion") -> str:
     return (
-        "Новый запрос\n\n"
         f"Чат: {suggestion.chat_name}\n"
         f"{suggestion.sender_name}:\n{suggestion.original_message}\n\n"
         f"Ситуация:\n{suggestion.situation}\n\n"
         f"Предлагаемый ответ:\n{suggestion.suggested_reply}\n\n"
-        "Чтобы скорректировать или обучить помощника, ответьте на это сообщение."
     )
 
 
