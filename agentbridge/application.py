@@ -11,6 +11,15 @@ from .storage.sqlite import ChatThreadStore, LearningDraft, RuleRecord
 
 logger = logging.getLogger(__name__)
 _GLOBAL_WORDING = re.compile(r"\b(для\s+всех|всем\s+клиент|глобальн)", re.IGNORECASE)
+_INTERNAL_PARTICIPANTS = frozenset({"евгений расюк", "евгений росюк", "дмитрий смагин"})
+_MEMORY_PREFIXES = (
+    ("общий контекст:", "global"),
+    ("запомни для всех чатов:", "global"),
+    ("контекст проекта:", "project"),
+    ("запомни для проекта:", "project"),
+    ("контекст:", "chat"),
+    ("запомни для этого чата:", "chat"),
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,14 @@ class LearningResult:
     current_suppressed: bool = False
 
 
+@dataclass(frozen=True)
+class MemoryProposal:
+    draft_id: int
+    chat_name: str
+    content: str
+    scope: str
+
+
 class AgentBridgeApplication:
     def __init__(
         self,
@@ -77,17 +94,30 @@ class AgentBridgeApplication:
             if not pending:
                 logger.info("event=client_batch_ignored reason=empty_or_duplicate chat_id=%s", telegram_chat_id)
                 return None
-            sender_names = list(dict.fromkeys(item.sender_name.strip() or "Неизвестный отправитель" for item in pending))
+            internal, external = self._split_internal_messages(pending)
+            for item in internal:
+                self.store.record_internal_context(
+                    telegram_chat_id, chat.name, item.sender_name.strip() or "Внутренний участник", item.text.strip(),
+                )
+                if item.update_id is not None:
+                    self.store.mark_update_processed(item.update_id)
+            if not external:
+                logger.info("event=client_batch_context_only chat_id=%s count=%d", telegram_chat_id, len(internal))
+                return None
+            sender_names = list(dict.fromkeys(item.sender_name.strip() or "Неизвестный отправитель" for item in external))
             sender_name = sender_names[0] if len(sender_names) == 1 else ", ".join(sender_names)
-            combined_message = pending[0].text.strip() if len(pending) == 1 else "\n".join(
-                f"{item.sender_name.strip() or 'Неизвестный отправитель'}: {item.text.strip()}" for item in pending
+            combined_message = external[0].text.strip() if len(external) == 1 else "\n".join(
+                f"{item.sender_name.strip() or 'Неизвестный отправитель'}: {item.text.strip()}" for item in external
             )
             rules = self.store.active_rule_texts(telegram_chat_id)
             thread_id = self.store.get_thread_id(telegram_chat_id)
             logger.info("event=codex_suggest_start chat_id=%s chat=%r batch_size=%d rule_count=%d thread=%s", telegram_chat_id, chat.name, len(pending), len(rules), "resume" if thread_id else "new")
-            reply = await self.provider.suggest(message=combined_message, sender_name=sender_name, chat_name=chat.name, wiki=chat.wiki, rules=rules, thread_id=thread_id)
+            reply = await self.provider.suggest(
+                message=combined_message, sender_name=sender_name, chat_name=chat.name,
+                wiki=self._contextual_wiki(chat), rules=rules, thread_id=thread_id,
+            )
             self.store.save_thread(chat.telegram_chat_id, chat.name, reply.thread_id, chat.agent_provider)
-            for item in pending:
+            for item in external:
                 if item.update_id is not None:
                     self.store.mark_update_processed(item.update_id)
             if not reply.should_notify:
@@ -99,6 +129,21 @@ class AgentBridgeApplication:
             )
             logger.info("event=codex_suggest_done chat_id=%s recommendation_id=%s", telegram_chat_id, recommendation_id)
         return Suggestion(chat.name, sender_name, combined_message, reply.situation, reply.suggested_reply, recommendation_id, telegram_chat_id)
+
+    @staticmethod
+    def _split_internal_messages(messages: list[IncomingMessage]) -> tuple[list[IncomingMessage], list[IncomingMessage]]:
+        internal = [item for item in messages if item.sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS]
+        return internal, [item for item in messages if item not in internal]
+
+    def _contextual_wiki(self, chat) -> str:
+        sections = [chat.wiki]
+        memories = self.store.active_memory_texts(chat.telegram_chat_id, chat.memory_project)
+        if memories:
+            sections.append("Подтверждённая память:\n" + "\n".join(f"- {item}" for item in memories))
+        internal = self.store.recent_internal_context(chat.telegram_chat_id)
+        if internal:
+            sections.append("Недавний внутренний контекст (это не сообщение клиента):\n" + "\n".join(f"- {item}" for item in internal))
+        return "\n\n".join(sections)
 
     def record_owner_delivery(self, recommendation_id: int, owner_chat_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_message(recommendation_id, owner_chat_id, owner_message_id)
@@ -150,6 +195,54 @@ class AgentBridgeApplication:
         logger.info("event=feedback_analysis_done draft_id=%s recommendation_id=%s scope=%s regenerate=%s", draft.id, recommendation.id, draft.scope, draft.regenerate_current)
         return self._proposal(draft, recommendation.chat_name)
 
+    @staticmethod
+    def is_memory_context_command(text: str) -> bool:
+        lowered = text.strip().casefold()
+        return any(lowered.startswith(prefix) for prefix, _ in _MEMORY_PREFIXES)
+
+    async def handle_owner_context(
+        self, owner_chat_id: int, reply_to_message_id: int, author_user_id: int,
+        author_name: str, text: str, update_id: int | None = None,
+    ) -> MemoryProposal | None:
+        if update_id is not None and self.store.is_update_processed(update_id):
+            return None
+        command = self._parse_memory_command(text)
+        if command is None:
+            return None
+        scope, content = command
+        recommendation = self.store.get_recommendation_by_owner_message(owner_chat_id, reply_to_message_id)
+        if recommendation is None:
+            return None
+        chat = self.registry.get(recommendation.telegram_chat_id)
+        project_key = chat.memory_project if chat is not None else None
+        if scope == "project" and not project_key:
+            return None
+        draft = self.store.create_memory_draft(
+            recommendation.id, author_user_id, author_name, content, scope, project_key if scope == "project" else None,
+        )
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        return MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
+
+    @staticmethod
+    def _parse_memory_command(text: str) -> tuple[str, str] | None:
+        lowered = text.strip().casefold()
+        for prefix, scope in _MEMORY_PREFIXES:
+            if lowered.startswith(prefix):
+                content = text.strip()[len(prefix):].strip()
+                return (scope, content) if content else None
+        return None
+
+    def confirm_memory(self, draft_id: int) -> MemoryProposal | None:
+        draft = self.store.confirm_memory_draft(draft_id)
+        if draft is None:
+            return None
+        recommendation = self.store.get_recommendation(draft.recommendation_id)
+        return None if recommendation is None else MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
+
+    def reject_memory(self, draft_id: int) -> bool:
+        return self.store.reject_memory_draft(draft_id)
+
     async def clarify_feedback(self, prompt_message_id: int, feedback: str, update_id: int | None = None) -> LearningProposal | None:
         if update_id is not None and self.store.is_update_processed(update_id):
             return None
@@ -196,7 +289,7 @@ class AgentBridgeApplication:
                 reply = await self.provider.revise(
                     feedback=draft.revision_instruction or draft.feedback,
                     message=recommendation.original_message, sender_name=recommendation.sender_name,
-                    chat_name=chat.name, wiki=chat.wiki, rules=rules, thread_id=thread_id,
+                    chat_name=chat.name, wiki=self._contextual_wiki(chat), rules=rules, thread_id=thread_id,
                 )
                 self.store.save_thread(chat.telegram_chat_id, chat.name, reply.thread_id, chat.agent_provider)
                 if reply.should_notify:

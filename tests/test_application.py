@@ -97,3 +97,42 @@ async def test_duplicate_update_is_ignored_across_restart(tmp_path, chat_registr
 
     assert duplicate is None
     assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_internal_participant_is_saved_without_a_recommendation(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = FakeProvider()
+    service = AgentBridgeApplication(chat_registry, store, provider)
+
+    result = await service.handle_message(
+        -100123456, "Евгений Расюк", "Клиент подтвердил самостоятельный прозвон.", update_id=91,
+    )
+
+    assert result is None
+    assert provider.calls == []
+    assert store.recent_internal_context(-100123456) == [
+        "Евгений Расюк: Клиент подтвердил самостоятельный прозвон."
+    ]
+    assert store.is_update_processed(91)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_chat_memory_and_internal_context_are_sent_only_to_that_chat(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = FakeProvider()
+    service = AgentBridgeApplication(chat_registry, store, provider)
+    suggestion = await service.handle_message(-100123456, "Alice", "Can I get the docs?")
+    assert suggestion is not None
+    service.record_owner_delivery(suggestion.recommendation_id, 7654321, 9001)
+    proposal = await service.handle_owner_context(
+        7654321, 9001, 42, "Owner", "Контекст: Клиенту нужен договор до запуска проекта."
+    )
+    assert proposal is not None and proposal.scope == "chat"
+    assert service.confirm_memory(proposal.draft_id) is not None
+    await service.handle_message(-100123456, "Евгений Расюк", "Юрист уже получил реквизиты.")
+    await service.handle_message(-100123456, "Alice", "What is the next step?")
+
+    wiki = str(provider.calls[-1]["wiki"])
+    assert "Клиенту нужен договор до запуска проекта." in wiki
+    assert "Юрист уже получил реквизиты." in wiki

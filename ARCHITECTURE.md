@@ -48,11 +48,18 @@ There are two durable context layers:
 1. `chats/<name>/wiki.md` contains stable, manually maintained knowledge and is
    included in every Codex turn for that chat.
 2. SQLite stores `telegram_chat_id -> codex_thread_id`; later batches resume the
-   same Codex thread, which provides conversational continuity.
+same Codex thread, which provides conversational continuity.
+
+SQLite also stores recent internal messages from the configured LeadRecord
+participants for their original chat. Those messages never create an owner
+recommendation, but are supplied as local context on a later client turn.
+Confirmed memory entries have an explicit `chat`, `project`, or `global` scope;
+project and global entries are created only after owner confirmation.
 
 SQLite also stores processed Telegram update IDs for duplicate suppression. The
 20-second pending batch exists only in process memory and is lost on shutdown.
-Telegram message history itself is not stored locally.
+Полная история Telegram не хранится локально; исключение — недавние сообщения
+настроенных внутренних участников, сохранённые как контекст их исходного чата.
 
 Recommendations are persisted before owner delivery. A missing owner message ID
 means the recommendation is pending; the Telegram adapter retries pending rows
@@ -76,6 +83,10 @@ duplicate-processing state.
 - One Telegram chat maps to one independent Codex thread and wiki.
 - Wiki is read-only at runtime.
 - Bot-authored messages and commands do not invoke Codex.
+- Messages from configured internal LeadRecord participants are captured as
+  local context and do not create a recommendation.
+- Cross-chat context is limited to explicitly confirmed project/global memory;
+  raw client-chat context remains isolated.
 - A successful batch is marked processed only after the Codex turn and thread
   mapping are saved.
 - Tokens and credentials never appear unredacted in logs or tracked files.

@@ -26,6 +26,19 @@ def format_learning_proposal(proposal: "LearningProposal") -> str:
     )
 
 
+def format_memory_proposal(proposal: "MemoryProposal") -> str:
+    scope = {
+        "chat": f"только для чата «{proposal.chat_name}»",
+        "project": "для связанного проекта",
+        "global": "для всех подключённых чатов",
+    }[proposal.scope]
+    return (
+        f"Контекст для сохранения:\n{proposal.content}\n\n"
+        f"Область: {scope}\n\n"
+        "Сохранить?"
+    )
+
+
 def format_rules(rules: list["RuleRecord"]) -> str:
     if not rules:
         return "Активных подтверждённых правил пока нет."
@@ -38,5 +51,5 @@ def format_rules(rules: list["RuleRecord"]) -> str:
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from agentbridge.application import LearningProposal, Suggestion
+    from agentbridge.application import LearningProposal, MemoryProposal, Suggestion
     from agentbridge.storage.sqlite import RuleRecord

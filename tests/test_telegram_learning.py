@@ -6,7 +6,7 @@ import pytest
 
 from telegram.error import TimedOut
 
-from agentbridge.application import LearningProposal, LearningResult
+from agentbridge.application import LearningProposal, LearningResult, MemoryProposal
 from agentbridge.telegram.bot import create_telegram_application
 
 
@@ -67,6 +67,8 @@ class FakeLearningService:
     feedback_calls: list[dict] = field(default_factory=list)
     confirm_calls: list[int] = field(default_factory=list)
     confirm_result: LearningResult | None = field(default_factory=lambda: LearningResult("Acme", True, None, False))
+    context_calls: list[dict] = field(default_factory=list)
+    memory_confirm_calls: list[int] = field(default_factory=list)
 
     async def handle_messages(self, telegram_chat_id, messages):
         raise AssertionError("Owner messages must not enter the client pipeline")
@@ -83,6 +85,21 @@ class FakeLearningService:
             "update_id": update_id,
         })
         return LearningProposal(7, "Acme", "Write warmer", "Use a warm tone", "client", True)
+
+    @staticmethod
+    def is_memory_context_command(text: str) -> bool:
+        return text.startswith("Контекст:")
+
+    async def handle_owner_context(self, owner_chat_id, reply_to_message_id, author_user_id, author_name, text, update_id=None):
+        self.context_calls.append({"reply_to_message_id": reply_to_message_id, "text": text})
+        return MemoryProposal(8, "Acme", "Known fact", "chat")
+
+    def confirm_memory(self, draft_id: int):
+        self.memory_confirm_calls.append(draft_id)
+        return MemoryProposal(draft_id, "Acme", "Known fact", "chat")
+
+    def reject_memory(self, draft_id: int):
+        return True
 
     async def confirm_learning(self, draft_id: int):
         self.confirm_calls.append(draft_id)
@@ -158,6 +175,20 @@ async def test_reply_to_bot_recommendation_creates_confirmable_proposal() -> Non
     assert "Я понял так" in bot.sent[0]["text"]
     buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
     assert [button.callback_data for button in buttons] == ["learn:yes:7", "learn:no:7"]
+
+
+@pytest.mark.asyncio
+async def test_context_reply_to_bot_recommendation_creates_memory_confirmation() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _text_callback(application)(
+        FakeUpdate(FakeMessage("Контекст: Клиент использует свой колл-центр.", FakeReply(9001, FakeUser(777, "AgentBridge", True))), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert service.context_calls == [{"reply_to_message_id": 9001, "text": "Контекст: Клиент использует свой колл-центр."}]
+    buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
+    assert [button.callback_data for button in buttons] == ["memory:yes:8", "memory:no:8"]
 
 
 @pytest.mark.asyncio

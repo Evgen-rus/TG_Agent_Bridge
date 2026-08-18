@@ -57,6 +57,23 @@ Use `/rules` in the owner group to inspect active rules and `/undo` to deactivat
 the most recently confirmed active rule. Corrected suggestions still go only to
 the owner group and are never sent to a client chat.
 
+### Context memory
+
+Reply to an owner recommendation with one of these prefixes to prepare a
+confirmable memory entry:
+
+```text
+Контекст: факт, важный только для этого чата
+Контекст проекта: факт для связанных чатов одного проекта
+Общий контекст: факт, применимый во всех подключённых чатах
+```
+
+The bot asks for confirmation before saving the entry. Chat memory stays within
+that chat; project memory is available only to chats with the same
+`memory_project` in `config.yaml`; common memory is available everywhere.
+Messages from the configured internal LeadRecord participants are not answered,
+but their recent text is retained as local context for later client messages.
+
 Diagnostic logs are written to `runtime/logs/agentbridge.log`, rotate daily,
 and retain seven days by default. They contain event identifiers and processing
 stages, not Telegram message bodies. `LOG_DIR` and `LOG_RETENTION_DAYS` override

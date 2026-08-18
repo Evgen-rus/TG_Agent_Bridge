@@ -13,6 +13,7 @@ class ChatConfig:
     agent_provider: str
     wiki: str
     directory: Path
+    memory_project: str | None = None
 
 
 class ChatRegistry:
@@ -48,6 +49,7 @@ class ChatRegistry:
                 agent_provider=provider,
                 wiki=wiki_path.read_text(encoding="utf-8").strip(),
                 directory=config_path.parent,
+                memory_project=str(raw.get("memory_project", "")).strip() or None,
             )
         if not chats:
             raise ValueError(f"No chat configurations found in: {chats_dir}")
@@ -58,4 +60,3 @@ class ChatRegistry:
 
     def __len__(self) -> int:
         return len(self._chats)
-

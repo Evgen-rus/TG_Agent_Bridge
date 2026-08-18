@@ -13,7 +13,7 @@ from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage
-from .formatter import format_learning_proposal, format_owner_message, format_rules
+from .formatter import format_learning_proposal, format_memory_proposal, format_owner_message, format_rules
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,13 @@ def _confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Да, применить", callback_data=f"learn:yes:{draft_id}"),
         InlineKeyboardButton("Нет, уточнить", callback_data=f"learn:no:{draft_id}"),
+    ]])
+
+
+def _memory_confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, сохранить", callback_data=f"memory:yes:{draft_id}"),
+        InlineKeyboardButton("Нет, отменить", callback_data=f"memory:no:{draft_id}"),
     ]])
 
 
@@ -163,6 +170,24 @@ def create_telegram_application(
             "event=owner_feedback_received owner_message_id=%s reply_to_message_id=%s author_id=%s update_id=%s",
             getattr(message, "message_id", None), reply_id, getattr(sender, "id", None), update.update_id,
         )
+        context_handler = getattr(message_service, "handle_owner_context", None)
+        is_context_command = getattr(message_service, "is_memory_context_command", lambda _: False)
+        if is_context_command(message.text):
+            proposal = await context_handler(
+                owner_chat_id, reply_id, getattr(sender, "id", 0),
+                getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+            ) if context_handler is not None else None
+            if proposal is None:
+                await _send(
+                    context.bot, chat_id=owner_chat_id,
+                    text="Не удалось подготовить контекст. Для проектного контекста чат должен быть привязан к проекту; ответьте на актуальную рекомендацию бота.",
+                )
+                return True
+            await _send(
+                context.bot, chat_id=owner_chat_id, text=format_memory_proposal(proposal),
+                reply_markup=_memory_confirmation_keyboard(proposal.draft_id),
+            )
+            return True
         proposal = await message_service.clarify_feedback(reply_id, message.text, update.update_id)
         if proposal is None:
             proposal = await message_service.handle_owner_feedback(
@@ -212,9 +237,18 @@ def create_telegram_application(
             return
         await _telegram_try("answer_callback", query.answer())
         try:
-            _, action, raw_id = (query.data or "").split(":", 2)
+            kind, action, raw_id = (query.data or "").split(":", 2)
             draft_id = int(raw_id)
         except (ValueError, AttributeError):
+            return
+        if kind == "memory":
+            await _telegram_try("clear_confirmation_buttons", query.edit_message_reply_markup(reply_markup=None))
+            if action == "no":
+                rejected = message_service.reject_memory(draft_id)
+                await _send(context.bot, chat_id=owner_chat_id, text="Сохранение контекста отменено." if rejected else "Этот контекст уже обработан или больше недоступен.")
+                return
+            proposal = message_service.confirm_memory(draft_id)
+            await _send(context.bot, chat_id=owner_chat_id, text="Контекст сохранён." if proposal is not None else "Этот контекст уже обработан или больше недоступен.")
             return
         if action == "no":
             prompt = await _send(context.bot, chat_id=owner_chat_id, text="Что я понял неправильно? Ответьте на это сообщение уточнением.")
@@ -246,7 +280,7 @@ def create_telegram_application(
 
     application = Application.builder().token(token.strip()).post_init(_post_init).post_stop(_post_stop).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, queue_message))
-    application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^learn:(yes|no):\d+$"))
+    application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^(learn|memory):(yes|no):\d+$"))
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("undo", undo_command))
     return application

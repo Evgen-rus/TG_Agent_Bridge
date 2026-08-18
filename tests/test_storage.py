@@ -52,3 +52,19 @@ def test_pending_recommendation_survives_restart_until_owner_delivery(tmp_path) 
     restarted_store.attach_owner_message(recommendation_id, 7654321, 9001)
 
     assert restarted_store.pending_recommendations(7654321) == []
+
+
+def test_confirmed_project_and_global_memory_are_scoped(tmp_path) -> None:
+    store = ChatThreadStore(tmp_path / "runtime" / "agentbridge.sqlite3")
+    first = store.create_recommendation(-1001, "First", "Alice", "Hello", "Greeting", "Hi")
+    second = store.create_recommendation(-1002, "Second", "Bob", "Hello", "Greeting", "Hi")
+    project = store.create_memory_draft(first, 1, "Owner", "Project fact", "project", "pilot")
+    global_memory = store.create_memory_draft(first, 1, "Owner", "Global fact", "global", None)
+    local = store.create_memory_draft(first, 1, "Owner", "Local fact", "chat", None)
+    assert store.confirm_memory_draft(project.id) is not None
+    assert store.confirm_memory_draft(global_memory.id) is not None
+    assert store.confirm_memory_draft(local.id) is not None
+
+    assert store.active_memory_texts(-1001, "pilot") == ["Project fact", "Global fact", "Local fact"]
+    assert store.active_memory_texts(-1002, "pilot") == ["Project fact", "Global fact"]
+    assert store.active_memory_texts(-1002, None) == ["Global fact"]

@@ -52,6 +52,18 @@ class RuleRecord:
     created_at: str
 
 
+@dataclass(frozen=True)
+class MemoryDraft:
+    id: int
+    recommendation_id: int
+    author_user_id: int
+    author_name: str
+    content: str
+    scope: str
+    project_key: str | None
+    status: str
+
+
 class ChatThreadStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path
@@ -134,6 +146,44 @@ class ChatThreadStore:
                     ON recommendations(owner_chat_id, owner_message_id);
                 CREATE INDEX IF NOT EXISTS idx_active_rules
                     ON learning_rules(status, telegram_chat_id);
+                CREATE TABLE IF NOT EXISTS internal_context_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_chat_id INTEGER NOT NULL,
+                    chat_name TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_internal_context_chat
+                    ON internal_context_messages(telegram_chat_id, id DESC);
+                CREATE TABLE IF NOT EXISTS memory_drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recommendation_id INTEGER NOT NULL,
+                    author_user_id INTEGER NOT NULL,
+                    author_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
+                    project_key TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(recommendation_id) REFERENCES recommendations(id)
+                );
+                CREATE TABLE IF NOT EXISTS memory_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_chat_id INTEGER,
+                    project_key TEXT,
+                    content TEXT NOT NULL,
+                    scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
+                    author_user_id INTEGER NOT NULL,
+                    author_name TEXT NOT NULL,
+                    source_draft_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(source_draft_id) REFERENCES memory_drafts(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_active_memory
+                    ON memory_entries(status, scope, telegram_chat_id, project_key);
                 """
             )
 
@@ -167,6 +217,24 @@ class ChatThreadStore:
     def mark_update_processed(self, telegram_update_id: int) -> None:
         with self._connect() as connection:
             connection.execute("INSERT OR IGNORE INTO processed_updates VALUES (?, ?)", (telegram_update_id, _now()))
+
+    def record_internal_context(self, telegram_chat_id: int, chat_name: str, sender_name: str, message_text: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO internal_context_messages
+                (telegram_chat_id, chat_name, sender_name, message_text, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (telegram_chat_id, chat_name, sender_name, message_text, _now()),
+            )
+
+    def recent_internal_context(self, telegram_chat_id: int, limit: int = 8) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT sender_name, message_text FROM internal_context_messages
+                WHERE telegram_chat_id=? ORDER BY id DESC LIMIT ?""",
+                (telegram_chat_id, limit),
+            ).fetchall()
+        return [f"{row['sender_name']}: {row['message_text']}" for row in reversed(rows)]
 
     def create_recommendation(
         self,
@@ -364,3 +432,73 @@ class ChatThreadStore:
                             (previous["id"],),
                         )
         return rule
+
+    def create_memory_draft(
+        self, recommendation_id: int, author_user_id: int, author_name: str,
+        content: str, scope: str, project_key: str | None,
+    ) -> MemoryDraft:
+        now = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO memory_drafts
+                (recommendation_id, author_user_id, author_name, content, scope, project_key, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (recommendation_id, author_user_id, author_name, content, scope, project_key, now, now),
+            )
+            draft_id = int(cursor.lastrowid)
+        return self.get_memory_draft(draft_id)  # type: ignore[return-value]
+
+    def get_memory_draft(self, draft_id: int) -> MemoryDraft | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM memory_drafts WHERE id=?", (draft_id,)).fetchone()
+        if row is None:
+            return None
+        return MemoryDraft(
+            id=row["id"], recommendation_id=row["recommendation_id"], author_user_id=row["author_user_id"],
+            author_name=row["author_name"], content=row["content"], scope=row["scope"],
+            project_key=row["project_key"], status=row["status"],
+        )
+
+    def confirm_memory_draft(self, draft_id: int) -> MemoryDraft | None:
+        draft = self.get_memory_draft(draft_id)
+        if draft is None or draft.status != "pending":
+            return None
+        recommendation = self.get_recommendation(draft.recommendation_id)
+        if recommendation is None:
+            return None
+        with self._connect() as connection:
+            claimed = connection.execute(
+                "UPDATE memory_drafts SET status='confirming', updated_at=? WHERE id=? AND status='pending'",
+                (_now(), draft_id),
+            )
+            if claimed.rowcount != 1:
+                return None
+            chat_id = recommendation.telegram_chat_id if draft.scope == "chat" else None
+            connection.execute(
+                """INSERT INTO memory_entries
+                (telegram_chat_id, project_key, content, scope, author_user_id, author_name, source_draft_id, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+                (chat_id, draft.project_key, draft.content, draft.scope, draft.author_user_id,
+                 draft.author_name, draft.id, _now()),
+            )
+            connection.execute("UPDATE memory_drafts SET status='confirmed', updated_at=? WHERE id=?", (_now(), draft_id))
+        return self.get_memory_draft(draft_id)
+
+    def reject_memory_draft(self, draft_id: int) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE memory_drafts SET status='rejected', updated_at=? WHERE id=? AND status='pending'",
+                (_now(), draft_id),
+            )
+        return result.rowcount == 1
+
+    def active_memory_texts(self, telegram_chat_id: int, project_key: str | None) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT content FROM memory_entries WHERE status='active' AND (
+                    scope='global' OR (scope='chat' AND telegram_chat_id=?)
+                    OR (scope='project' AND project_key=?)
+                ) ORDER BY id""",
+                (telegram_chat_id, project_key),
+            ).fetchall()
+        return [row["content"] for row in rows]
