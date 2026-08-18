@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
 import time
@@ -13,7 +14,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, QuestionReplyResult
+from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
 from .formatter import (
     format_learning_proposal,
     format_memory_proposal,
@@ -25,6 +26,7 @@ from .formatter import (
 
 _ADMIN_STATUSES = {"administrator", "creator"}
 _LEFT_STATUSES = {"left", "kicked"}
+_TYPING_REFRESH_SECONDS = 4.0
 logger = logging.getLogger(__name__)
 
 
@@ -121,6 +123,70 @@ def create_telegram_application(
             kwargs["reply_markup"] = reply_markup
         return await bot.send_message(**kwargs)
 
+    async def _send_typing(bot, chat_id: int) -> None:
+        send_action = getattr(bot, "send_chat_action", None)
+        if send_action is None:
+            return
+        await _telegram_try("typing", send_action(chat_id=chat_id, action="typing"))
+
+    @asynccontextmanager
+    async def _typing(bot, chat_id: int):
+        # Не ждём sendChatAction: через прокси он может зависнуть, а Codex должен стартовать сразу.
+        async def _loop() -> None:
+            while True:
+                await _send_typing(bot, chat_id)
+                await asyncio.sleep(_TYPING_REFRESH_SECONDS)
+
+        task = asyncio.create_task(_loop(), name="agentbridge-typing")
+        try:
+            await asyncio.sleep(0)
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _deliver_owner_query(bot, result) -> None:
+        if result is None:
+            return
+        text = result.text if isinstance(result, OwnerQueryResult) else str(result)
+        prompt_id = result.prompt_id if isinstance(result, OwnerQueryResult) else None
+        delivery_id = result.delivery_id if isinstance(result, OwnerQueryResult) else None
+        if not text:
+            return
+        save = getattr(message_service, "save_pending_owner_query_delivery", None)
+        if delivery_id is None and save is not None:
+            delivery_id = save(text, prompt_id)
+        try:
+            sent = await _send(bot, chat_id=owner_chat_id, text=text)
+        except NetworkError:
+            logger.warning("event=owner_query_delivery_pending reason=telegram_network_error")
+            return
+        except Exception:
+            logger.exception("event=owner_query_delivery_pending reason=delivery_error")
+            return
+        message_id = getattr(sent, "message_id", None)
+        record = getattr(message_service, "record_owner_query_delivery", None)
+        if delivery_id is not None and record is not None and message_id is not None:
+            record(delivery_id, message_id)
+        attach = getattr(message_service, "attach_owner_query_prompt", None)
+        if prompt_id is not None and attach is not None and message_id is not None:
+            attach(prompt_id, message_id)
+
+    async def _try_continue_owner_query(bot, update: Update, reply_id: int | None) -> bool:
+        handler = getattr(message_service, "continue_owner_query", None)
+        message = update.effective_message
+        if handler is None or reply_id is None or message is None or not message.text:
+            return False
+        async with _typing(bot, owner_chat_id):
+            result = await handler(reply_id, message.text, update.update_id)
+            if result is None:
+                return False
+            await _deliver_owner_query(bot, result)
+            return True
+
     async def _deliver_suggestion(bot, suggestion) -> bool:
         async with delivery_lock:
             if suggestion.recommendation_id:
@@ -155,6 +221,15 @@ def create_telegram_application(
                 suggestions = []
             for suggestion in suggestions:
                 await _deliver_suggestion(bot, suggestion)
+        pending_queries = getattr(message_service, "pending_owner_query_deliveries", None)
+        if pending_queries is not None:
+            try:
+                query_results = pending_queries()
+            except Exception:
+                logger.exception("event=owner_query_delivery_scan_failed")
+                query_results = []
+            for query_result in query_results:
+                await _deliver_owner_query(bot, query_result)
         notices = getattr(message_service, "pending_onboarding_notices", None)
         if notices is None:
             return
@@ -415,33 +490,41 @@ def create_telegram_application(
         if replied_to_this_bot and reply_id is not None:
             onboard_brief = getattr(message_service, "handle_onboarding_brief", None)
             if onboard_brief is not None:
-                draft = await onboard_brief(
-                    owner_chat_id, reply_id,
-                    getattr(sender, "full_name", "") or "Неизвестный владелец",
-                    message.text, update.update_id,
-                )
-                if draft is not None:
-                    await _deliver_onboarding_draft(context.bot, draft)
-                    return True
+                async with _typing(context.bot, owner_chat_id):
+                    draft = await onboard_brief(
+                        owner_chat_id, reply_id,
+                        getattr(sender, "full_name", "") or "Неизвестный владелец",
+                        message.text, update.update_id,
+                    )
+                    if draft is not None:
+                        await _deliver_onboarding_draft(context.bot, draft)
+                        return True
         if mentions:
             question_handler = getattr(message_service, "handle_owner_question_reply", None)
             if replied_to_this_bot and question_handler is not None and reply_id is not None:
-                result = await question_handler(
-                    owner_chat_id, reply_id, getattr(sender, "id", 0),
-                    getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
-                )
-                if result is not None:
-                    await _handle_question_result(context.bot, result)
-                    return True
+                async with _typing(context.bot, owner_chat_id):
+                    result = await question_handler(
+                        owner_chat_id, reply_id, getattr(sender, "id", 0),
+                        getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+                    )
+                    if result is not None:
+                        await _handle_question_result(context.bot, result)
+                        return True
+            if replied_to_this_bot and await _try_continue_owner_query(context.bot, update, reply_id):
+                return True
             query = getattr(message_service, "handle_owner_query", None)
             if query is None:
                 return True
             logger.info("event=owner_query_received owner_message_id=%s update_id=%s", getattr(message, "message_id", None), update.update_id)
-            answer = await query(message.text, reply_to_message_id=reply_id, update_id=update.update_id)
-            if answer:
-                await _send(context.bot, chat_id=owner_chat_id, text=answer)
+            async with _typing(context.bot, owner_chat_id):
+                answer = await query(message.text, reply_to_message_id=reply_id, update_id=update.update_id)
+                await _deliver_owner_query(context.bot, answer)
             return True
         if reply_id is None:
+            logger.info(
+                "event=owner_message_ignored reason=no_mention_or_reply owner_message_id=%s update_id=%s username=%s",
+                getattr(message, "message_id", None), update.update_id, getattr(context.bot, "username", None),
+            )
             return True
         if not replied_to_this_bot:
             logger.info(
@@ -455,13 +538,16 @@ def create_telegram_application(
         )
         question_handler = getattr(message_service, "handle_owner_question_reply", None)
         if question_handler is not None:
-            result = await question_handler(
-                owner_chat_id, reply_id, getattr(sender, "id", 0),
-                getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
-            )
-            if result is not None:
-                await _handle_question_result(context.bot, result)
-                return True
+            async with _typing(context.bot, owner_chat_id):
+                result = await question_handler(
+                    owner_chat_id, reply_id, getattr(sender, "id", 0),
+                    getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+                )
+                if result is not None:
+                    await _handle_question_result(context.bot, result)
+                    return True
+        if await _try_continue_owner_query(context.bot, update, reply_id):
+            return True
         context_handler = getattr(message_service, "handle_owner_context", None)
         is_context_command = getattr(message_service, "is_memory_context_command", lambda _: False)
         if is_context_command(message.text):
@@ -477,27 +563,28 @@ def create_telegram_application(
                 return True
             await _send_memory_proposal(context.bot, proposal)
             return True
-        proposal = await message_service.clarify_feedback(reply_id, message.text, update.update_id)
-        if proposal is None:
-            proposal = await message_service.handle_owner_feedback(
-                owner_chat_id, reply_id, getattr(sender, "id", 0), getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id
-            )
-        if proposal is None:
-            logger.info(
-                "event=owner_feedback_ignored reason=unlinked_or_duplicate reply_to_message_id=%s update_id=%s",
-                reply_id, update.update_id,
-            )
-            await _send(
-                context.bot,
-                chat_id=owner_chat_id,
-                text=(
-                    "Не могу связать это замечание с рекомендацией. Возможно, она была "
-                    "отправлена до обновления AgentBridge. Ответьте на новую рекомендацию бота."
-                ),
-            )
+        async with _typing(context.bot, owner_chat_id):
+            proposal = await message_service.clarify_feedback(reply_id, message.text, update.update_id)
+            if proposal is None:
+                proposal = await message_service.handle_owner_feedback(
+                    owner_chat_id, reply_id, getattr(sender, "id", 0), getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id
+                )
+            if proposal is None:
+                logger.info(
+                    "event=owner_feedback_ignored reason=unlinked_or_duplicate reply_to_message_id=%s update_id=%s",
+                    reply_id, update.update_id,
+                )
+                await _send(
+                    context.bot,
+                    chat_id=owner_chat_id,
+                    text=(
+                        "Не могу связать это замечание с рекомендацией. Возможно, она была "
+                        "отправлена до обновления AgentBridge. Ответьте на новую рекомендацию бота."
+                    ),
+                )
+                return True
+            await _send(context.bot, chat_id=owner_chat_id, text=format_learning_proposal(proposal), reply_markup=_confirmation_keyboard(proposal.draft_id))
             return True
-        await _send(context.bot, chat_id=owner_chat_id, text=format_learning_proposal(proposal), reply_markup=_confirmation_keyboard(proposal.draft_id))
-        return True
 
     async def _handle_question_result(bot, result: QuestionReplyResult) -> None:
         if result.memory_proposal is not None:

@@ -134,12 +134,21 @@ class ChatRegistry:
         return list(self._chats)
 
     def find_by_name(self, text: str) -> ChatConfig | None:
-        lowered = text.casefold()
-        matches = [
-            chat for chat in self._chats.values()
-            if chat.name.casefold() in lowered or chat.directory.name.casefold() in lowered
-        ]
-        return matches[0] if len(matches) == 1 else None
+        needle = " ".join(text.strip().casefold().split())
+        if not needle:
+            return None
+        matches: list[ChatConfig] = []
+        for chat in self._chats.values():
+            name = chat.name.casefold()
+            slug = chat.directory.name.casefold()
+            slug_spaced = slug.replace("_", " ")
+            if name in needle or slug in needle or slug_spaced in needle:
+                matches.append(chat)
+                continue
+            if len(needle) >= 3 and (needle in name or needle in slug or needle in slug_spaced):
+                matches.append(chat)
+        unique = {chat.telegram_chat_id: chat for chat in matches}
+        return next(iter(unique.values())) if len(unique) == 1 else None
 
     def __len__(self) -> int:
         return len(self._chats)

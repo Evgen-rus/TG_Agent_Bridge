@@ -91,6 +91,15 @@ class OwnerQuestion:
 
 
 @dataclass(frozen=True)
+class OwnerQueryPrompt:
+    id: int
+    question: str
+    owner_message_id: int | None
+    status: str
+    telegram_chat_id: int | None = None
+
+
+@dataclass(frozen=True)
 class LearningDraft:
     id: int
     recommendation_id: int
@@ -302,6 +311,25 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_owner_questions_message
                     ON owner_questions(owner_message_id, status);
+                CREATE TABLE IF NOT EXISTS owner_query_prompts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question TEXT NOT NULL,
+                    owner_message_id INTEGER,
+                    telegram_chat_id INTEGER,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_owner_query_prompts_message
+                    ON owner_query_prompts(owner_message_id, status);
+                CREATE TABLE IF NOT EXISTS owner_query_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT NOT NULL,
+                    prompt_id INTEGER,
+                    owner_message_id INTEGER,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_owner_query_deliveries_pending
+                    ON owner_query_deliveries(owner_message_id);
                 CREATE TABLE IF NOT EXISTS experience_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_chat_id INTEGER,
@@ -355,6 +383,7 @@ class ChatThreadStore:
             "memory_drafts": (("kind", "TEXT NOT NULL DEFAULT 'fact'"),),
             "memory_entries": (("kind", "TEXT NOT NULL DEFAULT 'fact'"),),
             "chat_threads": (("prompt_version", "INTEGER"),),
+            "owner_query_prompts": (("telegram_chat_id", "INTEGER"),),
         }
         for table, specs in columns.items():
             existing = {
@@ -931,6 +960,69 @@ class ChatThreadStore:
             recommendation_id=row["recommendation_id"], question=row["question"],
             owner_message_id=row["owner_message_id"], status=row["status"],
         )
+
+    def create_owner_query_prompt(self, question: str, telegram_chat_id: int | None = None) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO owner_query_prompts (question, telegram_chat_id, status, created_at)
+                VALUES (?, ?, 'pending', ?)""",
+                (question.strip(), telegram_chat_id, _now()),
+            )
+            return int(cursor.lastrowid)
+
+    def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE owner_query_prompts SET owner_message_id=? WHERE id=? AND status='pending'",
+                (owner_message_id, prompt_id),
+            )
+
+    def get_owner_query_prompt_by_message(self, owner_message_id: int) -> OwnerQueryPrompt | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM owner_query_prompts WHERE owner_message_id=? AND status='pending'",
+                (owner_message_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = row.keys()
+        return OwnerQueryPrompt(
+            id=row["id"], question=row["question"],
+            owner_message_id=row["owner_message_id"], status=row["status"],
+            telegram_chat_id=row["telegram_chat_id"] if "telegram_chat_id" in keys else None,
+        )
+
+    def answer_owner_query_prompt(self, prompt_id: int) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE owner_query_prompts SET status='answered' WHERE id=? AND status='pending'",
+                (prompt_id,),
+            )
+        return result.rowcount == 1
+
+    def create_owner_query_delivery(self, text: str, prompt_id: int | None) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO owner_query_deliveries (text, prompt_id, created_at)
+                VALUES (?, ?, ?)""",
+                (text, prompt_id, _now()),
+            )
+            return int(cursor.lastrowid)
+
+    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, text, prompt_id FROM owner_query_deliveries
+                WHERE owner_message_id IS NULL ORDER BY id""",
+            ).fetchall()
+        return [(int(row["id"]), row["text"], row["prompt_id"]) for row in rows]
+
+    def attach_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE owner_query_deliveries SET owner_message_id=? WHERE id=? AND owner_message_id IS NULL",
+                (owner_message_id, delivery_id),
+            )
 
     def answer_owner_question(self, question_id: int) -> OwnerQuestion | None:
         with self._connect() as connection:

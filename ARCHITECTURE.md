@@ -21,6 +21,8 @@ OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
   -> reply to a proactive question: fill the knowledge gap
   -> mention/tag of the bot: assistant query
+  -> reply to a “which chat?” clarification or to the last assistant answer:
+     continue that query
   -> reply to a new-group card: client brief, then confirm wiki draft
   -> ordinary human conversation is ignored
 ```

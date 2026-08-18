@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
+from telegram.error import TimedOut
 
-from agentbridge.application import MemoryProposal, QuestionReplyResult, Suggestion
+from agentbridge.application import MemoryProposal, OwnerQueryResult, QuestionReplyResult, Suggestion
 from agentbridge.telegram.bot import create_telegram_application
 
 
@@ -16,12 +17,16 @@ class FakeSentMessage:
 @dataclass
 class FakeBot:
     sent: list[dict] = field(default_factory=list)
+    actions: list[dict] = field(default_factory=list)
     id: int = 777
     username: str = "agentbridge"
 
     async def send_message(self, **kwargs):
         self.sent.append(kwargs)
         return FakeSentMessage(1000 + len(self.sent))
+
+    async def send_chat_action(self, **kwargs):
+        self.actions.append(kwargs)
 
 
 @dataclass
@@ -92,6 +97,39 @@ class OwnerAssistantService:
         raise AssertionError("Knowledge-gap replies must not go through ordinary learning")
 
 
+@dataclass
+class ClarifyingAssistantService:
+    query_calls: list[dict] = field(default_factory=list)
+    continued: list[dict] = field(default_factory=list)
+    attached: list[tuple[int, int]] = field(default_factory=list)
+    question_calls: list[dict] = field(default_factory=list)
+    client_calls: list = field(default_factory=list)
+
+    async def handle_messages(self, telegram_chat_id, messages):
+        self.client_calls.append((telegram_chat_id, messages))
+        raise AssertionError("Owner messages must not enter the client pipeline")
+
+    async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
+        self.query_calls.append({"text": text, "reply_to_message_id": reply_to_message_id, "update_id": update_id})
+        return OwnerQueryResult("Уточните, о каком чате речь. Сейчас подключены: [LR224] ОптоБель.", 11)
+
+    def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
+        self.attached.append((prompt_id, owner_message_id))
+
+    async def continue_owner_query(self, owner_message_id: int, text: str, update_id=None):
+        self.continued.append({"reply_to_message_id": owner_message_id, "text": text})
+        return "Для ОптоБель: звоните по методике дозвона."
+
+    async def handle_owner_question_reply(self, *args, **kwargs):
+        return None
+
+    async def clarify_feedback(self, *args, **kwargs):
+        return None
+
+    async def handle_owner_feedback(self, *args, **kwargs):
+        raise AssertionError("Chat clarification replies must not go through ordinary learning")
+
+
 def _callback(application):
     return application.handlers[0][0].callback
 
@@ -120,6 +158,9 @@ async def test_owner_mention_asks_the_assistant() -> None:
     assert service.query_calls[0]["text"] == "@agent что мы сейчас ждём от Acme Support?"
     assert bot.sent[0]["chat_id"] == 7654321
     assert "ждём расчёт" in bot.sent[0]["text"]
+    assert bot.actions
+    assert bot.actions[0]["chat_id"] == 7654321
+    assert bot.actions[0]["action"] == "typing"
 
 
 @pytest.mark.asyncio
@@ -158,3 +199,47 @@ async def test_reply_to_proactive_question_is_linked_to_the_client() -> None:
     assert service.client_calls == []
     assert all(item["chat_id"] == 7654321 for item in bot.sent)
     assert any("Сохранить?" in item["text"] for item in bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_reply_to_which_chat_clarification_continues_the_query() -> None:
+    service = ClarifyingAssistantService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    context = FakeContext(bot)
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agentbridge подскажи как дозваниваться"), FakeChat(7654321), FakeUser(), 201),
+        context,
+    )
+    assert service.attached == [(11, 1001)]
+    assert "Уточните, о каком чате речь" in bot.sent[0]["text"]
+    await _callback(application)(
+        FakeUpdate(
+            FakeMessage("[LR224] ОптоБель", FakeReply(1001, FakeUser(777, "AgentBridge", True))),
+            FakeChat(7654321),
+            FakeUser(),
+            202,
+        ),
+        context,
+    )
+    assert service.continued == [{"reply_to_message_id": 1001, "text": "[LR224] ОптоБель"}]
+    assert service.question_calls == []
+    assert "методике дозвона" in bot.sent[-1]["text"]
+
+
+class TimeoutBot(FakeBot):
+    async def send_message(self, **kwargs):
+        raise TimedOut("proxy timeout")
+
+
+@pytest.mark.asyncio
+async def test_owner_query_telegram_timeout_does_not_crash_handler() -> None:
+    service = OwnerAssistantService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = TimeoutBot()
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agentbridge что сейчас с Acme Support?"), FakeChat(7654321), FakeUser(), 301),
+        FakeContext(bot),
+    )
+    assert service.query_calls
+    assert bot.sent == []

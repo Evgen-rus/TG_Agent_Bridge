@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
 from agentbridge.agents.base import AgentReply
-from agentbridge.application import AgentBridgeApplication
+from agentbridge.application import AgentBridgeApplication, OwnerQueryResult
+from agentbridge.chats.loader import ChatConfig, ChatRegistry
 from agentbridge.storage.sqlite import ChatThreadStore
 
 
@@ -152,3 +154,58 @@ async def test_current_episode_is_not_repeated_in_recent_history(tmp_path, chat_
     assert "Need the docs" in history
     assert "And a timeline" not in history
     assert "And a timeline" in current
+
+
+@dataclass
+class QueryProvider(FakeProvider):
+    questions: list[dict[str, str]] = field(default_factory=list)
+
+    async def answer_owner_query(self, *, question: str, chat_name: str, context_pack: str) -> str:
+        self.questions.append({"question": question, "chat_name": chat_name})
+        return f"Для {chat_name}: методика дозвона."
+
+
+@pytest.mark.asyncio
+async def test_owner_query_clarifies_chat_then_uses_original_question(tmp_path) -> None:
+    optobel = ChatConfig(
+        -1001, "[LR224] ОптоБель", "codex", "Wiki Optobel", Path("chats/lr224_optobel"),
+    )
+    other = ChatConfig(
+        -1002, "[LR220] Риолюкс ЕКБ", "codex", "Wiki Rio", Path("chats/lr220"),
+    )
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = QueryProvider()
+    service = AgentBridgeApplication(
+        ChatRegistry({optobel.telegram_chat_id: optobel, other.telegram_chat_id: other}),
+        store,
+        provider,
+        owner_chat_id=7654321,
+        knowledge_dir=tmp_path / "knowledge",
+    )
+    first = await service.handle_owner_query(
+        "@spare_eyes_bot подскажи для клиента сообщение как дозваниваться",
+        update_id=501,
+    )
+    assert isinstance(first, OwnerQueryResult)
+    assert first.prompt_id is not None
+    assert "Уточните, о каком чате речь" in first.text
+    service.attach_owner_query_prompt(first.prompt_id, 9001)
+    second = await service.continue_owner_query(9001, "[LR224] ОптоБель", update_id=502)
+    assert isinstance(second, OwnerQueryResult)
+    assert second.text == "Для [LR224] ОптоБель: методика дозвона."
+    assert second.prompt_id is not None
+    assert provider.questions == [
+        {
+            "question": "@spare_eyes_bot подскажи для клиента сообщение как дозваниваться",
+            "chat_name": "[LR224] ОптоБель",
+        }
+    ]
+    service.attach_owner_query_prompt(second.prompt_id, 9002)
+    third = await service.continue_owner_query(
+        9002, "а для тг можешь сделать чтобы красиво читалось", update_id=503,
+    )
+    assert isinstance(third, OwnerQueryResult)
+    assert provider.questions[-1] == {
+        "question": "а для тг можешь сделать чтобы красиво читалось",
+        "chat_name": "[LR224] ОптоБель",
+    }

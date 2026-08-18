@@ -107,6 +107,13 @@ class OnboardingDraftProposal:
     wiki: str
 
 
+@dataclass(frozen=True)
+class OwnerQueryResult:
+    text: str
+    prompt_id: int | None = None
+    delivery_id: int | None = None
+
+
 class AgentBridgeApplication:
     def __init__(
         self,
@@ -644,9 +651,13 @@ class AgentBridgeApplication:
 
     async def handle_owner_query(
         self, text: str, *, reply_to_message_id: int | None = None, update_id: int | None = None,
-    ) -> str | None:
+    ) -> OwnerQueryResult | str | None:
         if update_id is not None and self.store.is_update_processed(update_id):
             return None
+        if reply_to_message_id is not None:
+            continued = await self.continue_owner_query(reply_to_message_id, text, update_id)
+            if continued is not None:
+                return continued
         chat = None
         if reply_to_message_id is not None and self.owner_chat_id is not None:
             recommendation = self.store.get_recommendation_by_owner_message(self.owner_chat_id, reply_to_message_id)
@@ -658,16 +669,75 @@ class AgentBridgeApplication:
             chat = self.registry.all_chats()[0]
         if chat is None:
             names = ", ".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
-            return f"Уточните, о каком чате речь. Сейчас подключены: {names}."
+            prompt_id = self.store.create_owner_query_prompt(text)
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return OwnerQueryResult(
+                f"Уточните, о каком чате речь. Сейчас подключены: {names}.",
+                prompt_id,
+            )
+        answer = await self._answer_owner_query_for_chat(chat, text)
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        return self._follow_up_query_result(chat, text, answer)
+
+    def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
+        self.store.attach_owner_query_prompt(prompt_id, owner_message_id)
+
+    def save_pending_owner_query_delivery(self, text: str, prompt_id: int | None) -> int:
+        return self.store.create_owner_query_delivery(text, prompt_id)
+
+    def pending_owner_query_deliveries(self) -> list[OwnerQueryResult]:
+        return [
+            OwnerQueryResult(text=text, prompt_id=prompt_id, delivery_id=delivery_id)
+            for delivery_id, text, prompt_id in self.store.pending_owner_query_deliveries()
+        ]
+
+    def record_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
+        self.store.attach_owner_query_delivery(delivery_id, owner_message_id)
+
+    async def continue_owner_query(
+        self, owner_message_id: int, text: str, update_id: int | None = None,
+    ) -> OwnerQueryResult | str | None:
+        if update_id is not None and self.store.is_update_processed(update_id):
+            return None
+        prompt = self.store.get_owner_query_prompt_by_message(owner_message_id)
+        if prompt is None:
+            return None
+        if prompt.telegram_chat_id is not None:
+            chat = self.registry.get(prompt.telegram_chat_id)
+            if chat is None:
+                return None
+            self.store.answer_owner_query_prompt(prompt.id)
+            answer = await self._answer_owner_query_for_chat(chat, text)
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return self._follow_up_query_result(chat, text, answer)
+        chat = self.registry.find_by_name(text)
+        if chat is None:
+            names = ", ".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return OwnerQueryResult(
+                f"Не нашёл такой чат. Напишите имя ещё раз. Сейчас подключены: {names}.",
+                prompt.id,
+            )
+        self.store.answer_owner_query_prompt(prompt.id)
+        answer = await self._answer_owner_query_for_chat(chat, prompt.question)
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        return self._follow_up_query_result(chat, prompt.question, answer)
+
+    def _follow_up_query_result(self, chat: ChatConfig, question: str, answer: str) -> OwnerQueryResult:
+        prompt_id = self.store.create_owner_query_prompt(question, chat.telegram_chat_id)
+        return OwnerQueryResult(answer, prompt_id)
+
+    async def _answer_owner_query_for_chat(self, chat: ChatConfig, question: str) -> str:
         answerer = getattr(self.provider, "answer_owner_query", None)
         pack = self._context_pack(chat)
         if answerer is not None:
-            answer = await answerer(question=text, chat_name=chat.name, context_pack=pack)
-        else:
-            answer = self._local_status(chat)
-        if update_id is not None:
-            self.store.mark_update_processed(update_id)
-        return answer
+            return await answerer(question=question, chat_name=chat.name, context_pack=pack)
+        return self._local_status(chat)
 
     def _local_status(self, chat: ChatConfig) -> str:
         state = self.store.get_chat_state(chat.telegram_chat_id)
