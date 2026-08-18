@@ -15,6 +15,8 @@ notifies the owner only about the current outcome.
 2. Set `TELEGRAM_BOT_TOKEN` and `OWNER_CHAT_ID`.
 3. Copy `chats/example` to a meaningful directory, set the monitored numeric
    `telegram_chat_id`, and replace `wiki.md` with that chat's stable context.
+   Loaded chats receive the compact `knowledge/leadgenbureau` pack by default.
+   Set `knowledge_pack: none` to opt out. Only `core.md` is injected each turn.
 4. Remove the example directory or change its placeholder chat ID.
 
 Codex defaults to `gpt-5.6-luna` with reasoning effort `xhigh`. The official

@@ -58,6 +58,8 @@ a series of outdated recommendations.
   structured Codex output.
 - `agentbridge/chats/loader.py`: loads `chats/*/config.yaml` plus sibling
   `wiki.md` into a registry keyed by Telegram chat ID.
+- `agentbridge/knowledge.py`: compact shared knowledge pack loader (`core.md`
+  plus an on-demand file index).
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
   state, processed updates, pending/delivered recommendation links, learning
   drafts, versioned rules, memory, owner questions, and experience.
@@ -72,17 +74,23 @@ Durable context layers, in order of authority:
    what was said. Codex thread is continuity only.
 2. `chats/<name>/wiki.md` contains stable, manually maintained knowledge and is
    included in every model turn for that chat.
-3. `chat_state` is a compact working snapshot (facts, decisions, commitments,
+3. `knowledge/<pack>/core.md` is compact company knowledge. A chat receives it
+   when `knowledge_pack` is set; the default for loaded chats is
+   `leadgenbureau`. Use `knowledge_pack: none` to opt out. Only the core and a
+   file index go into the prompt; extra documents stay on disk for on-demand
+   reads. Chat wiki and confirmed chat memory override the shared pack.
+4. `chat_state` is a compact working snapshot (facts, decisions, commitments,
    open questions, next step). It is updated after a successful episode.
-4. Confirmed memory entries have `fact` / `decision` / `commitment` /
+5. Confirmed memory entries have `fact` / `decision` / `commitment` /
    `preference` / `open_question` / `rule` / `assumption` / `experience` kinds
    and an explicit `chat`, `project`, or `global` scope.
-5. Confirmed learning rules and recent confirmed experience are added to the
+6. Confirmed learning rules and recent confirmed experience are added to the
    context pack when relevant.
 
-Before a model turn the application builds a compact context pack: wiki, current
-`chat_state`, recent history, the current episode, confirmed memory, rules, and
-recent experience. Do not send the whole archive.
+Before a model turn the application builds a compact context pack: wiki, shared
+core if attached, current `chat_state`, recent history, the current episode,
+confirmed memory, rules, and recent experience. Do not send the whole archive
+or the whole knowledge pack.
 
 SQLite also stores recent internal messages from the configured LeadRecord
 participants for their original chat. Those messages never create an owner
@@ -115,8 +123,9 @@ client automatically.
 - Bot-authored messages and commands do not invoke Codex.
 - Messages from configured internal LeadRecord participants are captured as
   local context and do not create a recommendation on their own.
-- Cross-chat context is limited to explicitly confirmed project/global memory;
-  raw client-chat context remains isolated.
+- Cross-chat context is limited to explicitly confirmed project/global memory
+  and the attached shared knowledge pack; raw client-chat context remains
+  isolated. Shared cases are internal and must not be retold to another client.
 - A message is not marked processed until episode logic finishes. A model
   failure leaves the inbox row pending.
 - Tokens and credentials never appear unredacted in logs or tracked files.

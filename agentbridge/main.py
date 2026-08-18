@@ -25,6 +25,7 @@ def main() -> None:
     )
     service = AgentBridgeApplication(
         registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size, settings.chats_dir,
+        knowledge_dir=root / "knowledge",
     )
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,

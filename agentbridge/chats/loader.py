@@ -6,6 +6,8 @@ import re
 
 import yaml
 
+from ..knowledge import DEFAULT_KNOWLEDGE_PACK, parse_knowledge_pack
+
 
 @dataclass(frozen=True)
 class ChatConfig:
@@ -15,6 +17,7 @@ class ChatConfig:
     wiki: str
     directory: Path
     memory_project: str | None = None
+    knowledge_pack: str | None = None
 
 
 _CYRILLIC = str.maketrans(
@@ -55,6 +58,7 @@ def write_new_chat(
                 "name": name.strip(),
                 "telegram_chat_id": telegram_chat_id,
                 "agent_provider": "codex",
+                "knowledge_pack": DEFAULT_KNOWLEDGE_PACK,
             },
             allow_unicode=True,
             sort_keys=False,
@@ -69,6 +73,7 @@ def write_new_chat(
         agent_provider="codex",
         wiki=wiki_text.strip(),
         directory=directory,
+        knowledge_pack=DEFAULT_KNOWLEDGE_PACK,
     )
 
 
@@ -106,6 +111,7 @@ class ChatRegistry:
                 wiki=wiki_path.read_text(encoding="utf-8").strip(),
                 directory=config_path.parent,
                 memory_project=str(raw.get("memory_project", "")).strip() or None,
+                knowledge_pack=parse_knowledge_pack(raw.get("knowledge_pack", DEFAULT_KNOWLEDGE_PACK)),
             )
         if not chats:
             raise ValueError(f"No chat configurations found in: {chats_dir}")

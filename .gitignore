@@ -75,6 +75,8 @@ reports/
 knowledge/
 !knowledge/
 knowledge/*
+!knowledge/leadgenbureau/
+!knowledge/leadgenbureau/**
 !knowledge/clients/
 knowledge/clients/*
 !knowledge/clients/praktikm/

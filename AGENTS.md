@@ -22,6 +22,8 @@ the architecture file when those contracts materially change.
   the next turn when `AGENT_PROMPT_VERSION` changes; do not resume a stale
   developer-instruction thread.
 - Load only that chat's `config.yaml` and `wiki.md`; never mix chat contexts.
+  Shared company knowledge is only the attached `knowledge_pack` core, not
+  another chat's wiki or history.
 - Do not modify wiki files automatically, except creating `wiki.md` after the
   owner confirms a new-chat onboarding draft.
 - Ignore bot-authored messages, Telegram commands, and already processed

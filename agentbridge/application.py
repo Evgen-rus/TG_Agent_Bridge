@@ -9,6 +9,7 @@ import re
 
 from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
+from .knowledge import load_knowledge_pack
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ class AgentBridgeApplication:
         owner_chat_id: int | None = None,
         episode_size: int = 40,
         chats_dir: Path | None = None,
+        knowledge_dir: Path | None = None,
     ):
         self.registry = registry
         self.store = store
@@ -122,6 +124,12 @@ class AgentBridgeApplication:
         self.owner_chat_id = owner_chat_id
         self.episode_size = max(1, episode_size)
         self.chats_dir = chats_dir
+        if knowledge_dir is not None:
+            self.knowledge_dir = knowledge_dir
+        elif chats_dir is not None:
+            self.knowledge_dir = chats_dir.parent / "knowledge"
+        else:
+            self.knowledge_dir = Path.cwd() / "knowledge"
         self._chat_locks: dict[int, asyncio.Lock] = {}
 
     def is_monitored_chat(self, telegram_chat_id: int) -> bool:
@@ -407,10 +415,13 @@ class AgentBridgeApplication:
             if item.update_id not in skipped
         ]
         experience = self.store.recent_experience(chat.telegram_chat_id)
+        shared = self._shared_knowledge(chat)
         parts = [
             f"Wiki:\n{chat.wiki or '(пусто)'}",
-            "Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2),
         ]
+        if shared:
+            parts.append(shared)
+        parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2))
         if recent:
             history = "\n".join(f"{item.sender_name}: {item.text}" for item in recent)
             parts.append("Недавняя история:\n" + history)
@@ -426,6 +437,10 @@ class AgentBridgeApplication:
         if experience:
             parts.append("Похожий подтверждённый опыт:\n" + "\n".join(f"- {item}" for item in experience))
         return "\n\n".join(parts)
+
+    def _shared_knowledge(self, chat: ChatConfig) -> str:
+        # Только compact core и список файлов, не вся база. Wiki чата важнее общей методики.
+        return load_knowledge_pack(self.knowledge_dir, chat.knowledge_pack)
 
     def record_owner_delivery(self, recommendation_id: int, owner_chat_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_message(recommendation_id, owner_chat_id, owner_message_id)

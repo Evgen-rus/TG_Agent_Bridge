@@ -30,8 +30,24 @@ def test_registry_selects_the_matching_chat_and_its_wiki(tmp_path) -> None:
     assert selected is not None
     assert selected.name == "Acme Support"
     assert selected.wiki == "Acme-specific context."
+    assert selected.knowledge_pack == "leadgenbureau"
     assert registry.get(-100000000) is None
     assert added.name == "Новый клиент"
+    assert added.knowledge_pack == "leadgenbureau"
     assert (added.directory / "config.yaml").is_file()
     assert "Контекст нового клиента." in (added.directory / "wiki.md").read_text(encoding="utf-8")
     assert ChatRegistry.load(tmp_path).get(-100555) is not None
+
+
+def test_knowledge_pack_none_opts_out(tmp_path) -> None:
+    chat_dir = tmp_path / "neuro"
+    chat_dir.mkdir()
+    (chat_dir / "config.yaml").write_text(
+        "name: Neuro\ntelegram_chat_id: -100111\nagent_provider: codex\nknowledge_pack: none\n",
+        encoding="utf-8",
+    )
+    (chat_dir / "wiki.md").write_text("Dev chat.", encoding="utf-8")
+    registry = ChatRegistry.load(tmp_path)
+    chat = registry.get(-100111)
+    assert chat is not None
+    assert chat.knowledge_pack is None
