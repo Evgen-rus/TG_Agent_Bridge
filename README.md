@@ -104,6 +104,9 @@ and retain seven days by default. They contain event identifiers and processing
 stages, not Telegram message bodies. `LOG_DIR` and `LOG_RETENTION_DAYS` override
 the defaults.
 
+Startup `getMe` retries `TELEGRAM_BOOTSTRAP_RETRIES` times (5 by default) if
+Telegram times out through a proxy. `0` keeps the old fail-fast behaviour.
+
 Recommendations are written to SQLite before Telegram delivery. If Telegram is
 temporarily unavailable, delivery is retried every `DELIVERY_RETRY_SECONDS`
 seconds and pending recommendations are retried again after application restart.

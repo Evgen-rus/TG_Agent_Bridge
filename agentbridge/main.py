@@ -38,6 +38,7 @@ def main() -> None:
     telegram_application.run_polling(
         allowed_updates=["message", "callback_query"],
         drop_pending_updates=False,
+        bootstrap_retries=settings.telegram_bootstrap_retries,
     )
 
 
