@@ -6,7 +6,7 @@ from pathlib import Path
 
 from openai_codex import Codex, Sandbox
 
-from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis
+from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, OwnerQueryAnswer
 
 _SUGGEST_SCHEMA = {
     "type": "object",
@@ -211,15 +211,27 @@ class CodexProvider:
             revision_instruction=str(payload["revision_instruction"]).strip() if payload["revision_instruction"] else None,
         )
 
-    async def answer_owner_query(self, *, question: str, chat_name: str, context_pack: str) -> str:
-        return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack)
+    async def answer_owner_query(
+        self, *, question: str, chat_name: str, context_pack: str, thread_id: str | None,
+    ) -> OwnerQueryAnswer:
+        return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack, thread_id)
 
-    def _answer_owner_query_sync(self, question: str, chat_name: str, context_pack: str) -> str:
+    def _answer_owner_query_sync(
+        self, question: str, chat_name: str, context_pack: str, thread_id: str | None,
+    ) -> OwnerQueryAnswer:
         prompt = f"Чат: {chat_name}\n\n{context_pack}\n\nВопрос команды:\n{question}"
         with Codex() as codex:
-            thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
-            payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
-        return str(payload["answer"]).strip()
+            if thread_id:
+                try:
+                    thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
+                    payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+                except Exception:
+                    thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
+                    payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+            else:
+                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
+                payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+        return OwnerQueryAnswer(thread.id, str(payload["answer"]).strip())
 
     async def draft_chat_onboarding(self, *, group_title: str, owner_brief: str, telegram_chat_id: int) -> ChatOnboardingDraft:
         return await asyncio.to_thread(self._draft_chat_onboarding_sync, group_title, owner_brief, telegram_chat_id)

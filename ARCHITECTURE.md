@@ -27,6 +27,11 @@ OWNER_CHAT_ID
   -> ordinary human conversation is ignored
 ```
 
+Each monitored chat has two isolated persistent Codex threads: the client
+thread handles client-message recommendations, while the owner-query thread
+continues the team's internal questions about that chat. Both receive a fresh
+context pack on every turn; neither thread is a durable source of truth.
+
 If the bot becomes admin in an unknown group, or a message arrives from a
 group where it is already admin but there is no `chats/*/config.yaml`, the
 owner gets a card. Client messages are stored as `held` and are not sent to
@@ -115,11 +120,12 @@ client automatically.
 ## Invariants
 
 - Suggest-only: never reply automatically to a monitored/client chat.
-- One Telegram chat maps to one independent Codex thread, wiki, history, and
-  `chat_state`. The thread is continuity only and is stored with
-  `prompt_version`. If `AGENT_PROMPT_VERSION` in `agents/codex.py` changes, the
-  next episode starts a new thread instead of resuming the old one. Critique
-  uses a separate ephemeral Codex thread and never overwrites `codex_thread_id`.
+- One Telegram chat maps to independent client and owner-query Codex threads,
+  plus one wiki, history, and `chat_state`. Each thread is continuity only and
+  is stored with `prompt_version`. If `AGENT_PROMPT_VERSION` in
+  `agents/codex.py` changes, the next client episode or owner query starts its
+  respective new thread instead of resuming the old one. Critique uses a
+  separate ephemeral Codex thread and never overwrites `codex_thread_id`.
 - Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
   onboarding.
 - Bot-authored messages and commands do not invoke Codex.

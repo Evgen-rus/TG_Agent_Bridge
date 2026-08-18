@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 import re
 
-from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis
+from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, OwnerQueryAnswer
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
 from .knowledge import load_knowledge_pack
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
@@ -736,8 +736,37 @@ class AgentBridgeApplication:
         answerer = getattr(self.provider, "answer_owner_query", None)
         pack = self._context_pack(chat)
         if answerer is not None:
-            return await answerer(question=question, chat_name=chat.name, context_pack=pack)
+            thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
+            result = await answerer(
+                question=question, chat_name=chat.name, context_pack=pack, thread_id=thread_id,
+            )
+            if isinstance(result, OwnerQueryAnswer):
+                self.store.save_owner_query_thread(
+                    chat.telegram_chat_id,
+                    chat.name,
+                    result.thread_id,
+                    chat.agent_provider,
+                    prompt_version=getattr(self.provider, "prompt_version", None),
+                )
+                return result.answer
+            return str(result)
         return self._local_status(chat)
+
+    def _owner_query_thread_id_for_provider(self, telegram_chat_id: int) -> str | None:
+        thread_id = self.store.get_owner_query_thread_id(telegram_chat_id)
+        if not thread_id:
+            return None
+        current = getattr(self.provider, "prompt_version", None)
+        if current is None:
+            return thread_id
+        saved = self.store.get_owner_query_thread_prompt_version(telegram_chat_id)
+        if saved == current:
+            return thread_id
+        logger.info(
+            "event=owner_query_thread_reset chat_id=%s reason=prompt_version saved=%s current=%s",
+            telegram_chat_id, saved, current,
+        )
+        return None
 
     def _local_status(self, chat: ChatConfig) -> str:
         state = self.store.get_chat_state(chat.telegram_chat_id)
@@ -846,6 +875,7 @@ class AgentBridgeApplication:
                     feedback=draft.revision_instruction or draft.feedback,
                     message=recommendation.original_message, sender_name=recommendation.sender_name,
                     chat_name=chat.name, wiki=self._contextual_wiki(chat), rules=rules, thread_id=thread_id or "",
+                    context_pack=self._context_pack(chat, episode=recommendation.original_message),
                 )
                 self._persist_thread(chat, reply.thread_id)
                 self._apply_state_update(chat.telegram_chat_id, reply.candidate_state, reply.situation)

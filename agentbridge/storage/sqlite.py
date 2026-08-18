@@ -185,6 +185,15 @@ class ChatThreadStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS owner_query_threads (
+                    telegram_chat_id INTEGER PRIMARY KEY,
+                    logical_name TEXT NOT NULL,
+                    codex_thread_id TEXT NOT NULL,
+                    agent_provider TEXT NOT NULL,
+                    prompt_version INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS processed_updates (
                     telegram_update_id INTEGER PRIMARY KEY,
                     processed_at TEXT NOT NULL
@@ -424,6 +433,48 @@ class ChatThreadStore:
             connection.execute(
                 """
                 INSERT INTO chat_threads (
+                    telegram_chat_id, logical_name, codex_thread_id, agent_provider, prompt_version, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(telegram_chat_id) DO UPDATE SET
+                    logical_name=excluded.logical_name, codex_thread_id=excluded.codex_thread_id,
+                    agent_provider=excluded.agent_provider, prompt_version=excluded.prompt_version,
+                    updated_at=excluded.updated_at
+                """,
+                (telegram_chat_id, logical_name, codex_thread_id, agent_provider, prompt_version, now, now),
+            )
+
+    def get_owner_query_thread_id(self, telegram_chat_id: int) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT codex_thread_id FROM owner_query_threads WHERE telegram_chat_id = ?",
+                (telegram_chat_id,),
+            ).fetchone()
+        return None if row is None else row["codex_thread_id"]
+
+    def get_owner_query_thread_prompt_version(self, telegram_chat_id: int) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT prompt_version FROM owner_query_threads WHERE telegram_chat_id = ?",
+                (telegram_chat_id,),
+            ).fetchone()
+        if row is None or row["prompt_version"] is None:
+            return None
+        return int(row["prompt_version"])
+
+    def save_owner_query_thread(
+        self,
+        telegram_chat_id: int,
+        logical_name: str,
+        codex_thread_id: str,
+        agent_provider: str = "codex",
+        prompt_version: int | None = None,
+    ) -> None:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO owner_query_threads (
                     telegram_chat_id, logical_name, codex_thread_id, agent_provider, prompt_version, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)

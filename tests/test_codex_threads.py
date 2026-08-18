@@ -6,7 +6,13 @@ import json
 import pytest
 
 from agentbridge.agents.base import AgentAction, AgentReply
-from agentbridge.agents.codex import AGENT_PROMPT_VERSION, CodexProvider, _CRITIQUE_INSTRUCTIONS, _INSTRUCTIONS
+from agentbridge.agents.codex import (
+    AGENT_PROMPT_VERSION,
+    CodexProvider,
+    _CRITIQUE_INSTRUCTIONS,
+    _INSTRUCTIONS,
+    _OWNER_QUERY_INSTRUCTIONS,
+)
 from agentbridge.application import AgentBridgeApplication
 from agentbridge.storage.sqlite import ChatThreadStore
 
@@ -171,6 +177,7 @@ class _FakeCodex:
     resumes: list[str] = []
     suggest_payload: dict = _suggest_payload()
     critique_payload: dict = _suggest_payload(action="observe", suggested_reply="", observation="Closed.")
+    owner_payload: dict = {"answer": "Owner answer"}
 
     def __enter__(self):
         return self
@@ -182,11 +189,14 @@ class _FakeCodex:
         self.starts.append(kwargs)
         if kwargs.get("developer_instructions") == _CRITIQUE_INSTRUCTIONS:
             return _FakeThread("thread-critique", self.critique_payload)
+        if kwargs.get("developer_instructions") == _OWNER_QUERY_INSTRUCTIONS:
+            return _FakeThread("thread-owner", self.owner_payload)
         return _FakeThread("thread-started", self.suggest_payload)
 
     def thread_resume(self, thread_id: str, **kwargs) -> _FakeThread:
         self.resumes.append(thread_id)
-        return _FakeThread(thread_id, self.suggest_payload)
+        payload = self.owner_payload if thread_id == "thread-owner" else self.suggest_payload
+        return _FakeThread(thread_id, payload)
 
 
 @pytest.fixture
@@ -195,6 +205,40 @@ def fake_codex(monkeypatch):
     _FakeCodex.resumes = []
     monkeypatch.setattr("agentbridge.agents.codex.Codex", _FakeCodex)
     return _FakeCodex
+
+
+@pytest.mark.asyncio
+async def test_codex_owner_query_starts_then_resumes_its_thread(fake_codex) -> None:
+    provider = CodexProvider()
+    first = await provider.answer_owner_query(
+        question="What now?", chat_name="Acme", context_pack="pack one", thread_id=None,
+    )
+    second = await provider.answer_owner_query(
+        question="Why?", chat_name="Acme", context_pack="pack two", thread_id=first.thread_id,
+    )
+
+    assert first.thread_id == "thread-owner"
+    assert second.thread_id == "thread-owner"
+    assert second.answer == "Owner answer"
+    assert fake_codex.resumes == ["thread-owner"]
+    assert fake_codex.starts[0]["developer_instructions"] == _OWNER_QUERY_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_codex_owner_query_restarts_when_saved_thread_is_unavailable(fake_codex, monkeypatch) -> None:
+    def unavailable(self, thread_id: str, **kwargs):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(_FakeCodex, "thread_resume", unavailable)
+    provider = CodexProvider()
+
+    result = await provider.answer_owner_query(
+        question="What now?", chat_name="Acme", context_pack="fresh pack", thread_id="missing-thread",
+    )
+
+    assert result.thread_id == "thread-owner"
+    assert result.answer == "Owner answer"
+    assert fake_codex.starts[-1]["developer_instructions"] == _OWNER_QUERY_INSTRUCTIONS
 
 
 @pytest.mark.asyncio

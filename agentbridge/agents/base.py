@@ -60,6 +60,12 @@ class ChatOnboardingDraft:
     directory_slug: str = ""
 
 
+@dataclass(frozen=True)
+class OwnerQueryAnswer:
+    thread_id: str
+    answer: str
+
+
 class AgentProvider(Protocol):
     async def suggest(
         self,
@@ -94,4 +100,14 @@ class AgentProvider(Protocol):
         wiki: str,
         rules: list[str],
         thread_id: str,
+        context_pack: str = "",
     ) -> AgentReply: ...
+
+    async def answer_owner_query(
+        self,
+        *,
+        question: str,
+        chat_name: str,
+        context_pack: str,
+        thread_id: str | None,
+    ) -> OwnerQueryAnswer: ...

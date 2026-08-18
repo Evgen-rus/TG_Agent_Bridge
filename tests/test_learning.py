@@ -6,6 +6,7 @@ import pytest
 
 from agentbridge.agents.base import AgentReply, FeedbackAnalysis
 from agentbridge.application import AgentBridgeApplication
+from agentbridge.chats.loader import ChatConfig, ChatRegistry
 from agentbridge.storage.sqlite import ChatThreadStore
 
 
@@ -40,7 +41,22 @@ async def _prepared_service(tmp_path, chat_registry, analysis):
 @pytest.mark.asyncio
 async def test_confirmed_rule_is_persisted_and_current_reply_is_revised(tmp_path, chat_registry) -> None:
     analysis = FeedbackAnalysis("Use a warmer tone.", "Use a warm, concise tone.", "reply_tone", "client", True, "Rewrite this reply in a warmer tone.")
-    service, store, provider = await _prepared_service(tmp_path, chat_registry, analysis)
+    original_chat = chat_registry.all_chats()[0]
+    chat = ChatConfig(
+        original_chat.telegram_chat_id,
+        original_chat.name,
+        original_chat.agent_provider,
+        original_chat.wiki,
+        original_chat.directory,
+        knowledge_pack="leadgenbureau",
+    )
+    service, store, provider = await _prepared_service(
+        tmp_path, ChatRegistry({chat.telegram_chat_id: chat}), analysis,
+    )
+    service.knowledge_dir = tmp_path / "knowledge"
+    shared_dir = service.knowledge_dir / "leadgenbureau"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "core.md").write_text("Shared LeadGenBureau core", encoding="utf-8")
     proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Write this warmer")
     assert proposal is not None
     assert store.active_rule_texts(-100123456) == []
@@ -49,6 +65,11 @@ async def test_confirmed_rule_is_persisted_and_current_reply_is_revised(tmp_path
     assert result.revised_suggestion.suggested_reply == "Revised reply"
     assert store.active_rule_texts(-100123456) == ["Use a warm, concise tone."]
     assert provider.revise_calls[0]["rules"] == ["Use a warm, concise tone."]
+    context_pack = provider.revise_calls[0]["context_pack"]
+    assert "Acme uses the Enterprise plan." in context_pack
+    assert "Shared LeadGenBureau core" in context_pack
+    assert "Текущее состояние чата:" in context_pack
+    assert "Can I get the docs?" in context_pack
     assert await service.confirm_learning(proposal.draft_id) is None
 
 

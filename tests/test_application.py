@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agentbridge.agents.base import AgentReply
+from agentbridge.agents.base import AgentReply, OwnerQueryAnswer
 from agentbridge.application import AgentBridgeApplication, OwnerQueryResult
 from agentbridge.chats.loader import ChatConfig, ChatRegistry
 from agentbridge.storage.sqlite import ChatThreadStore
@@ -158,11 +158,23 @@ async def test_current_episode_is_not_repeated_in_recent_history(tmp_path, chat_
 
 @dataclass
 class QueryProvider(FakeProvider):
-    questions: list[dict[str, str]] = field(default_factory=list)
+    prompt_version: int = 3
+    questions: list[dict[str, object]] = field(default_factory=list)
+    owner_threads_created: int = 0
 
-    async def answer_owner_query(self, *, question: str, chat_name: str, context_pack: str) -> str:
-        self.questions.append({"question": question, "chat_name": chat_name})
-        return f"Для {chat_name}: методика дозвона."
+    async def answer_owner_query(
+        self, *, question: str, chat_name: str, context_pack: str, thread_id: str | None,
+    ) -> OwnerQueryAnswer:
+        self.questions.append({
+            "question": question,
+            "chat_name": chat_name,
+            "context_pack": context_pack,
+            "thread_id": thread_id,
+        })
+        if thread_id is None:
+            self.owner_threads_created += 1
+            thread_id = f"owner-thread-{self.owner_threads_created}"
+        return OwnerQueryAnswer(thread_id, f"Для {chat_name}: методика дозвона.")
 
 
 @pytest.mark.asyncio
@@ -194,18 +206,53 @@ async def test_owner_query_clarifies_chat_then_uses_original_question(tmp_path) 
     assert isinstance(second, OwnerQueryResult)
     assert second.text == "Для [LR224] ОптоБель: методика дозвона."
     assert second.prompt_id is not None
-    assert provider.questions == [
-        {
-            "question": "@spare_eyes_bot подскажи для клиента сообщение как дозваниваться",
-            "chat_name": "[LR224] ОптоБель",
-        }
-    ]
+    assert provider.questions[0]["question"] == "@spare_eyes_bot подскажи для клиента сообщение как дозваниваться"
+    assert provider.questions[0]["chat_name"] == "[LR224] ОптоБель"
+    assert provider.questions[0]["thread_id"] is None
     service.attach_owner_query_prompt(second.prompt_id, 9002)
     third = await service.continue_owner_query(
         9002, "а для тг можешь сделать чтобы красиво читалось", update_id=503,
     )
     assert isinstance(third, OwnerQueryResult)
-    assert provider.questions[-1] == {
-        "question": "а для тг можешь сделать чтобы красиво читалось",
-        "chat_name": "[LR224] ОптоБель",
-    }
+    assert provider.questions[-1]["question"] == "а для тг можешь сделать чтобы красиво читалось"
+    assert provider.questions[-1]["chat_name"] == "[LR224] ОптоБель"
+    assert provider.questions[-1]["thread_id"] == "owner-thread-1"
+    assert store.get_owner_query_thread_id(-1001) == "owner-thread-1"
+
+
+@pytest.mark.asyncio
+async def test_owner_query_threads_are_per_chat_and_isolated_from_client_thread(tmp_path) -> None:
+    chat_a = ChatConfig(-1001, "Client A", "codex", "Wiki A", Path("chats/a"))
+    chat_b = ChatConfig(-1002, "Client B", "codex", "Wiki B", Path("chats/b"))
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = QueryProvider()
+    service = AgentBridgeApplication(ChatRegistry({-1001: chat_a, -1002: chat_b}), store, provider)
+
+    await service.handle_message(-1001, "Alice", "Client message")
+    first_a = await service.handle_owner_query("Что у Client A?")
+    assert isinstance(first_a, OwnerQueryResult) and first_a.prompt_id is not None
+    service.attach_owner_query_prompt(first_a.prompt_id, 9101)
+    await service.continue_owner_query(9101, "А почему?")
+    await service.handle_owner_query("Что у Client B?")
+
+    assert [call["thread_id"] for call in provider.questions] == [None, "owner-thread-1", None]
+    assert store.get_thread_id(-1001) == "thread-created-on-first-message"
+    assert store.get_owner_query_thread_id(-1001) == "owner-thread-1"
+    assert store.get_owner_query_thread_id(-1002) == "owner-thread-2"
+    assert store.get_thread_id(-1001) != store.get_owner_query_thread_id(-1001)
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_query_prompt_version_starts_new_thread(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    store.save_owner_query_thread(
+        -100123456, "Acme Support", "owner-thread-old", prompt_version=2,
+    )
+    provider = QueryProvider(prompt_version=3)
+    service = AgentBridgeApplication(chat_registry, store, provider)
+
+    await service.handle_owner_query("Что происходит в Acme Support?")
+
+    assert provider.questions[0]["thread_id"] is None
+    assert store.get_owner_query_thread_id(-100123456) == "owner-thread-1"
+    assert store.get_owner_query_thread_prompt_version(-100123456) == 3
