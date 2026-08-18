@@ -15,8 +15,8 @@ class Settings:
     database_path: Path
     log_dir: Path
     log_retention_days: int = 7
-    codex_model: str = "gpt-5.6-sol"
-    codex_reasoning_effort: str = "medium"
+    codex_model: str = "gpt-5.6-luna"
+    codex_reasoning_effort: str = "xhigh"
     message_batch_seconds: float = 20.0
     delivery_retry_seconds: float = 30.0
     catchup_idle_seconds: float = 2.0
@@ -45,8 +45,8 @@ class Settings:
             database_path=root / os.getenv("DATABASE_PATH", "runtime/agentbridge.sqlite3"),
             log_dir=root / os.getenv("LOG_DIR", "runtime/logs"),
             log_retention_days=int(os.getenv("LOG_RETENTION_DAYS", "7")),
-            codex_model=os.getenv("CODEX_MODEL", "gpt-5.6-sol").strip(),
-            codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip(),
+            codex_model=os.getenv("CODEX_MODEL", "gpt-5.6-luna").strip(),
+            codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "xhigh").strip(),
             message_batch_seconds=float(os.getenv("MESSAGE_BATCH_SECONDS", "20")),
             delivery_retry_seconds=float(os.getenv("DELIVERY_RETRY_SECONDS", "30")),
             catchup_idle_seconds=float(os.getenv("CATCHUP_IDLE_SECONDS", "2")),

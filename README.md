@@ -17,7 +17,7 @@ notifies the owner only about the current outcome.
    `telegram_chat_id`, and replace `wiki.md` with that chat's stable context.
 4. Remove the example directory or change its placeholder chat ID.
 
-Codex defaults to `gpt-5.6-sol` with reasoning effort `medium`. The official
+Codex defaults to `gpt-5.6-luna` with reasoning effort `xhigh`. The official
 Python SDK reuses existing Codex authentication. To start browser login from
 Python when no account is available:
 
