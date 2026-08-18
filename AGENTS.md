@@ -18,7 +18,9 @@ the architecture file when those contracts materially change.
   destination is `OWNER_CHAT_ID`; it may equal a monitored chat only for an
   explicit temporary test setup.
 - Keep Telegram isolated from Codex through `AgentProvider`.
-- Keep one persistent Codex thread per monitored Telegram chat.
+- Keep one persistent Codex thread per monitored Telegram chat. Replace it on
+  the next turn when `AGENT_PROMPT_VERSION` changes; do not resume a stale
+  developer-instruction thread.
 - Load only that chat's `config.yaml` and `wiki.md`; never mix chat contexts.
 - Do not modify wiki files automatically, except creating `wiki.md` after the
   owner confirms a new-chat onboarding draft.

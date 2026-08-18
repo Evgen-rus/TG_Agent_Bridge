@@ -70,7 +70,7 @@ amo/tokens.json
 *.sqlite3
 
 # Local client data and generated reports
-Docs/
+Docs/*
 reports/
 knowledge/
 !knowledge/

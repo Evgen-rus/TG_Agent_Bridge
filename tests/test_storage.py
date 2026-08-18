@@ -16,7 +16,18 @@ def test_thread_mapping_survives_a_new_store_instance(tmp_path) -> None:
     restarted_store = ChatThreadStore(database_path)
 
     assert restarted_store.get_thread_id(-100123456) == "thread-abc"
+    assert restarted_store.get_thread_prompt_version(-100123456) is None
     assert restarted_store.get_thread_id(-100999999) is None
+
+
+def test_prompt_version_is_stored_and_survives_restart(tmp_path) -> None:
+    database_path = tmp_path / "runtime" / "agentbridge.sqlite3"
+    first_store = ChatThreadStore(database_path)
+    first_store.save_thread(-100123456, "Acme Support", "thread-old", prompt_version=None)
+    first_store.save_thread(-100123456, "Acme Support", "thread-new", prompt_version=2)
+    restarted = ChatThreadStore(database_path)
+    assert restarted.get_thread_id(-100123456) == "thread-new"
+    assert restarted.get_thread_prompt_version(-100123456) == 2
 
 
 def test_processed_update_survives_a_new_store_instance(tmp_path) -> None:

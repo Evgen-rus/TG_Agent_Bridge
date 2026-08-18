@@ -106,7 +106,10 @@ client automatically.
 
 - Suggest-only: never reply automatically to a monitored/client chat.
 - One Telegram chat maps to one independent Codex thread, wiki, history, and
-  `chat_state`.
+  `chat_state`. The thread is continuity only and is stored with
+  `prompt_version`. If `AGENT_PROMPT_VERSION` in `agents/codex.py` changes, the
+  next episode starts a new thread instead of resuming the old one. Critique
+  uses a separate ephemeral Codex thread and never overwrites `codex_thread_id`.
 - Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
   onboarding.
 - Bot-authored messages and commands do not invoke Codex.

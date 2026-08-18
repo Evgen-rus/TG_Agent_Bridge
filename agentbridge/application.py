@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 from pathlib import Path
@@ -296,7 +296,7 @@ class AgentBridgeApplication:
                 f"{item.sender_name.strip() or 'Неизвестный отправитель'}: {item.text.strip()}" for item in messages
             )
         rules = self.store.active_rule_texts(chat.telegram_chat_id)
-        thread_id = self.store.get_thread_id(chat.telegram_chat_id)
+        thread_id = self._thread_id_for_provider(chat.telegram_chat_id)
         exclude_ids = {item.update_id for item in messages if item.update_id is not None}
         context_pack = self._context_pack(chat, episode=combined_message, exclude_update_ids=exclude_ids)
         logger.info(
@@ -314,7 +314,7 @@ class AgentBridgeApplication:
         }
         reply = await self.provider.suggest(**suggest_kwargs)
         reply = await self._maybe_critique(reply, suggest_kwargs)
-        self.store.save_thread(chat.telegram_chat_id, chat.name, reply.thread_id, chat.agent_provider)
+        self._persist_thread(chat, reply.thread_id)
         self._apply_state_update(chat.telegram_chat_id, reply.candidate_state, reply.situation)
         action = reply.resolved_action()
         if not notify or not reply.notifies_owner():
@@ -342,7 +342,33 @@ class AgentBridgeApplication:
         if critic is None:
             return reply
         logger.info("event=codex_critique_start action=%s confidence=%s", action, reply.confidence)
-        return await critic(previous=reply, **suggest_kwargs)
+        corrected = await critic(previous=reply, **suggest_kwargs)
+        return replace(corrected, thread_id=reply.thread_id)
+
+    def _thread_id_for_provider(self, telegram_chat_id: int) -> str | None:
+        thread_id = self.store.get_thread_id(telegram_chat_id)
+        if not thread_id:
+            return None
+        current = getattr(self.provider, "prompt_version", None)
+        if current is None:
+            return thread_id
+        saved = self.store.get_thread_prompt_version(telegram_chat_id)
+        if saved == current:
+            return thread_id
+        logger.info(
+            "event=codex_thread_reset chat_id=%s reason=prompt_version saved=%s current=%s",
+            telegram_chat_id, saved, current,
+        )
+        return None
+
+    def _persist_thread(self, chat: ChatConfig, thread_id: str) -> None:
+        self.store.save_thread(
+            chat.telegram_chat_id,
+            chat.name,
+            thread_id,
+            chat.agent_provider,
+            prompt_version=getattr(self.provider, "prompt_version", None),
+        )
 
     def _apply_state_update(self, telegram_chat_id: int, candidate_state: dict | None, situation: str) -> None:
         current = self.store.get_chat_state(telegram_chat_id)
@@ -728,15 +754,15 @@ class AgentBridgeApplication:
         current_suppressed = False
         if draft.regenerate_current:
             chat = self.registry.get(recommendation.telegram_chat_id)
-            thread_id = self.store.get_thread_id(recommendation.telegram_chat_id)
-            if chat is not None and thread_id is not None:
+            thread_id = self._thread_id_for_provider(recommendation.telegram_chat_id)
+            if chat is not None:
                 rules = self.store.active_rule_texts(recommendation.telegram_chat_id)
                 reply = await self.provider.revise(
                     feedback=draft.revision_instruction or draft.feedback,
                     message=recommendation.original_message, sender_name=recommendation.sender_name,
-                    chat_name=chat.name, wiki=self._contextual_wiki(chat), rules=rules, thread_id=thread_id,
+                    chat_name=chat.name, wiki=self._contextual_wiki(chat), rules=rules, thread_id=thread_id or "",
                 )
-                self.store.save_thread(chat.telegram_chat_id, chat.name, reply.thread_id, chat.agent_provider)
+                self._persist_thread(chat, reply.thread_id)
                 self._apply_state_update(chat.telegram_chat_id, reply.candidate_state, reply.situation)
                 if reply.notifies_owner():
                     new_id = self.store.create_recommendation(

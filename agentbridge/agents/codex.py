@@ -115,8 +115,12 @@ directory_slug — латиница, строчные, слова через п�
 Не предлагай писать клиенту."""
 _CRITIQUE_INSTRUCTIONS = """Проверь предыдущий JSON-ответ как нейтральный аналитик. Исправь выдуманные факты, устаревшие рекомендации и слабые гипотезы, выданные как факты. Если более поздние сообщения закрыли вопрос — не предлагай reply на него. Не усиливай уверенность и не меняй action ради более острого тона. Голос команды может остаться в observation/owner_question, но смысл должен стать точнее. Верни тот же JSON schema."""
 
+AGENT_PROMPT_VERSION = 2
+
 
 class CodexProvider:
+    prompt_version = AGENT_PROMPT_VERSION
+
     def __init__(self, *, model: str = "gpt-5.6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None):
         self.model = model
         self.reasoning_effort = reasoning_effort
@@ -131,22 +135,60 @@ class CodexProvider:
         return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, feedback, context_pack)
 
     async def critique(self, *, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "") -> AgentReply:
-        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, f"Самопроверка предыдущего вывода:\n{previous.situation}", context_pack, True)
+        return await asyncio.to_thread(self._critique_sync, previous, message, sender_name, chat_name, wiki, rules, context_pack)
 
-    def _suggest_sync(self, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, revision: str | None, context_pack: str = "", critique: bool = False) -> AgentReply:
-        rules_text = "\n".join(f"- {rule}" for rule in rules) or "(нет)"
-        pack = context_pack.strip() or f"Wiki чата:\n{wiki or '(wiki пуста)'}\n\nПодтвержденные правила:\n{rules_text}"
+    def _suggest_sync(self, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, revision: str | None, context_pack: str = "") -> AgentReply:
+        pack = self._pack(wiki, rules, context_pack)
         prompt = f"Чат: {chat_name}\nОтправитель: {sender_name}\n\n{pack}\n\nСообщение:\n{message}"
         if revision:
             prompt += f"\n\nПодтвержденное замечание владельца. Пересоздай текущую рекомендацию:\n{revision}"
-        instructions = _CRITIQUE_INSTRUCTIONS if critique else _INSTRUCTIONS
         with Codex() as codex:
             if thread_id:
                 thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
             else:
-                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=instructions, config={"model_reasoning_effort": self.reasoning_effort})
+                thread = codex.thread_start(
+                    model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                    developer_instructions=_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort},
+                )
             payload = self._run_json(thread, prompt, _SUGGEST_SCHEMA)
             return _reply_from_payload(thread.id, payload)
+
+    def _critique_sync(
+        self, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], context_pack: str,
+    ) -> AgentReply:
+        pack = self._pack(wiki, rules, context_pack)
+        previous_json = json.dumps(
+            {
+                "action": previous.resolved_action(),
+                "situation": previous.situation,
+                "suggested_reply": previous.suggested_reply,
+                "observation": previous.observation,
+                "unknowns": previous.unknowns,
+                "owner_question": previous.owner_question,
+                "should_notify": previous.should_notify,
+                "confidence": previous.confidence,
+                "needs_critique": previous.needs_critique,
+                "candidate_state": previous.candidate_state,
+            },
+            ensure_ascii=False,
+        )
+        prompt = (
+            f"Чат: {chat_name}\nОтправитель: {sender_name}\n\n{pack}\n\n"
+            f"Текущий эпизод:\n{message}\n\nПредыдущий JSON:\n{previous_json}"
+        )
+        with Codex() as codex:
+            thread = codex.thread_start(
+                model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                developer_instructions=_CRITIQUE_INSTRUCTIONS,
+                config={"model_reasoning_effort": self.reasoning_effort},
+            )
+            payload = self._run_json(thread, prompt, _SUGGEST_SCHEMA)
+        return _reply_from_payload(previous.thread_id, payload)
+
+    @staticmethod
+    def _pack(wiki: str, rules: list[str], context_pack: str) -> str:
+        rules_text = "\n".join(f"- {rule}" for rule in rules) or "(нет)"
+        return context_pack.strip() or f"Wiki чата:\n{wiki or '(wiki пуста)'}\n\nПодтвержденные правила:\n{rules_text}"
 
     async def analyze_feedback(self, *, feedback: str, chat_name: str, original_message: str, situation: str, suggested_reply: str, rules: list[str]) -> FeedbackAnalysis:
         return await asyncio.to_thread(self._analyze_feedback_sync, feedback, chat_name, original_message, situation, suggested_reply, rules)
