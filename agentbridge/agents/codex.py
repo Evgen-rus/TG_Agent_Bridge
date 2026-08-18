@@ -6,16 +6,27 @@ from pathlib import Path
 
 from openai_codex import Codex, Sandbox
 
-from .base import AgentReply, FeedbackAnalysis
+from .base import AgentAction, AgentReply, FeedbackAnalysis
 
 _SUGGEST_SCHEMA = {
     "type": "object",
     "properties": {
+        "action": {"type": "string", "enum": ["reply", "ask_owner", "observe", "no_action"]},
         "situation": {"type": "string"},
         "suggested_reply": {"type": "string"},
+        "observation": {"type": "string"},
+        "unknowns": {"type": "string"},
+        "owner_question": {"type": "string"},
         "should_notify": {"type": "boolean"},
+        "confidence": {"type": "number"},
+        "needs_critique": {"type": "boolean"},
+        "candidate_state": {"type": ["object", "null"]},
     },
-    "required": ["situation", "suggested_reply", "should_notify"], "additionalProperties": False,
+    "required": [
+        "action", "situation", "suggested_reply", "observation", "unknowns",
+        "owner_question", "should_notify", "confidence", "needs_critique",
+    ],
+    "additionalProperties": False,
 }
 _FEEDBACK_SCHEMA = {
     "type": "object",
@@ -30,14 +41,27 @@ _FEEDBACK_SCHEMA = {
     "required": ["understanding", "proposed_rule", "conflict_key", "scope", "regenerate_current", "revision_instruction"],
     "additionalProperties": False,
 }
-_INSTRUCTIONS = """Ты помогаешь владельцу ответить на новое сообщение в Telegram.
-Работай только в режиме suggest: не выполняй внешние действия и не отправляй сообщения.
-Опирайся на новое сообщение, wiki, подтвержденные правила и контекст текущего thread.
-Не придумывай факты. При нехватке данных прямо укажи это.
-Если подтвержденные правила говорят не создавать рекомендацию в этой ситуации,
-верни should_notify=false и пустой suggested_reply. Иначе should_notify=true,
-а ответ должен быть коротким, естественным и готовым к копированию.
-Верни JSON по заданной схеме."""
+_OWNER_QUERY_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+_INSTRUCTIONS = """Ты помощник команды по рабочим Telegram-чатам. Режим только suggest: ничего не отправляй клиенту и не выполняй внешние действия.
+Источник правды — context pack: wiki, текущее состояние чата, недавняя история, текущий эпизод, подтверждённая память, правила и опыт. Codex thread — только continuity, не память.
+Различай факты, гипотезы, договорённости и открытые вопросы. Не выдумывай недостающие факты.
+
+Выбери одно действие:
+- reply: клиенту сейчас нужен конкретный ответ. suggested_reply — обычный деловой текст под стиль чата, без характера помощника.
+- ask_owner: не хватает одного важного факта. owner_question — один короткий вопрос команде. Не выдумывай ответ.
+- observe: отвечать клиенту не нужно, но команде стоит увидеть важное изменение или риск.
+- no_action: ничего сообщать не нужно. Если более поздние сообщения уже закрыли ранний вопрос — no_action или observe, не предлагай устаревший ответ.
+
+should_notify=true только для reply, ask_owner и observe.
+observation — голос второго пилота для команды: спокойный, короткий, внимательный к несостыковкам. Можно сказать, что что-то не сходится, вопрос уже изменился или не хватает факта. Без поучений и без психоанализа. Факты отдельно, гипотезы отдельно.
+candidate_state — только изменившиеся поля текущего состояния (summary, stage, facts, decisions, agreements, commitments, waiting_from_client, waiting_from_us, open_questions, risks, unknowns, next_step, participants).
+needs_critique=true только при низкой уверенности, конфликте памяти или важном reply/ask_owner на слабой гипотезе.
+Верни JSON по схеме."""
 _FEEDBACK_INSTRUCTIONS = """Ты разбираешь замечание владельца к рекомендации помощника.
 Сформулируй простыми словами, как понял замечание. Сам определи, является ли оно:
 разовым исправлением текущего ответа, постоянным правилом или одновременно обоими.
@@ -48,6 +72,10 @@ scope=global допустим только при явном указании в
 regenerate_current=true, если замечание требует исправить текущую рекомендацию.
 revision_instruction описывает только необходимое исправление текущего ответа или null.
 Не применяй замечание: только интерпретируй для подтверждения человеком."""
+_OWNER_QUERY_INSTRUCTIONS = """Ты отвечаешь команде во внутреннем чате на вопрос о клиентском чате.
+Опирайся только на context pack. Не выдумывай. Если данных нет — прямо скажи, чего не хватает.
+Пиши как наблюдательный второй пилот: коротко, спокойно, по делу. Не предлагай отправлять это клиенту."""
+_CRITIQUE_INSTRUCTIONS = """Проверь предыдущий JSON-ответ. Исправь выдуманные факты, устаревшие рекомендации и слабые гипотезы, выданные как факты. Если более поздние сообщения закрыли вопрос — не предлагай reply на него. Верни тот же JSON schema."""
 
 
 class CodexProvider:
@@ -58,24 +86,29 @@ class CodexProvider:
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
 
-    async def suggest(self, *, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None) -> AgentReply:
-        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, None)
+    async def suggest(self, *, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "") -> AgentReply:
+        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, None, context_pack)
 
-    async def revise(self, *, feedback: str, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str) -> AgentReply:
-        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, feedback)
+    async def revise(self, *, feedback: str, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str, context_pack: str = "") -> AgentReply:
+        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, feedback, context_pack)
 
-    def _suggest_sync(self, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, revision: str | None) -> AgentReply:
+    async def critique(self, *, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "") -> AgentReply:
+        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, f"Самопроверка предыдущего вывода:\n{previous.situation}", context_pack, True)
+
+    def _suggest_sync(self, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, revision: str | None, context_pack: str = "", critique: bool = False) -> AgentReply:
         rules_text = "\n".join(f"- {rule}" for rule in rules) or "(нет)"
-        prompt = f"Чат: {chat_name}\nОтправитель: {sender_name}\n\nWiki чата:\n{wiki or '(wiki пуста)'}\n\nПодтвержденные правила:\n{rules_text}\n\nСообщение:\n{message}"
+        pack = context_pack.strip() or f"Wiki чата:\n{wiki or '(wiki пуста)'}\n\nПодтвержденные правила:\n{rules_text}"
+        prompt = f"Чат: {chat_name}\nОтправитель: {sender_name}\n\n{pack}\n\nСообщение:\n{message}"
         if revision:
             prompt += f"\n\nПодтвержденное замечание владельца. Пересоздай текущую рекомендацию:\n{revision}"
+        instructions = _CRITIQUE_INSTRUCTIONS if critique else _INSTRUCTIONS
         with Codex() as codex:
             if thread_id:
                 thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
             else:
-                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
+                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=instructions, config={"model_reasoning_effort": self.reasoning_effort})
             payload = self._run_json(thread, prompt, _SUGGEST_SCHEMA)
-            return AgentReply(thread.id, str(payload["situation"]).strip(), str(payload["suggested_reply"]).strip(), bool(payload["should_notify"]))
+            return _reply_from_payload(thread.id, payload)
 
     async def analyze_feedback(self, *, feedback: str, chat_name: str, original_message: str, situation: str, suggested_reply: str, rules: list[str]) -> FeedbackAnalysis:
         return await asyncio.to_thread(self._analyze_feedback_sync, feedback, chat_name, original_message, situation, suggested_reply, rules)
@@ -93,6 +126,16 @@ class CodexProvider:
             revision_instruction=str(payload["revision_instruction"]).strip() if payload["revision_instruction"] else None,
         )
 
+    async def answer_owner_query(self, *, question: str, chat_name: str, context_pack: str) -> str:
+        return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack)
+
+    def _answer_owner_query_sync(self, question: str, chat_name: str, context_pack: str) -> str:
+        prompt = f"Чат: {chat_name}\n\n{context_pack}\n\nВопрос команды:\n{question}"
+        with Codex() as codex:
+            thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
+            payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+        return str(payload["answer"]).strip()
+
     def _run_json(self, thread, prompt: str, schema: dict) -> dict:
         result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
         if result.error is not None:
@@ -103,3 +146,23 @@ class CodexProvider:
             return json.loads(result.final_response)
         except (json.JSONDecodeError, TypeError) as exc:
             raise RuntimeError("Codex returned an invalid structured response") from exc
+
+
+def _reply_from_payload(thread_id: str, payload: dict) -> AgentReply:
+    action = str(payload.get("action") or "").strip()
+    suggested = str(payload.get("suggested_reply") or "").strip()
+    should_notify = bool(payload.get("should_notify", action in {AgentAction.REPLY, AgentAction.ASK_OWNER, AgentAction.OBSERVE}))
+    confidence = payload.get("confidence")
+    return AgentReply(
+        thread_id=thread_id,
+        situation=str(payload.get("situation") or "").strip(),
+        suggested_reply=suggested,
+        should_notify=should_notify,
+        action=action,
+        observation=str(payload.get("observation") or "").strip(),
+        unknowns=str(payload.get("unknowns") or "").strip(),
+        owner_question=str(payload.get("owner_question") or "").strip(),
+        candidate_state=payload.get("candidate_state") if isinstance(payload.get("candidate_state"), dict) else None,
+        confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
+        needs_critique=bool(payload.get("needs_critique")),
+    )

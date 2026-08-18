@@ -23,18 +23,21 @@ def main() -> None:
         reasoning_effort=settings.codex_reasoning_effort,
         cwd=root,
     )
-    service = AgentBridgeApplication(registry, store, provider, settings.owner_chat_id)
+    service = AgentBridgeApplication(
+        registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size,
+    )
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,
         owner_chat_id=settings.owner_chat_id,
         message_service=service,
         batch_seconds=settings.message_batch_seconds,
         delivery_retry_seconds=settings.delivery_retry_seconds,
+        catchup_idle_seconds=settings.catchup_idle_seconds,
     )
     logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
     telegram_application.run_polling(
         allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
 
 

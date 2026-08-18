@@ -3,9 +3,14 @@
 ## Project
 
 AgentBridge is a suggest-only bridge from monitored Telegram chats to Codex.
-It batches new human messages per chat, asks Codex for a compact situation
-summary and proposed reply, and sends the result only to the configured owner
-chat.
+It stores incoming Telegram messages in SQLite first, batches them per chat
+(live debounce or catch-up after restart), asks Codex for a compact situation
+assessment, and sends the result only to the configured owner chat. The model
+may reply, ask the owner, observe, or take no action.
+
+Read `ARCHITECTURE.md` before changing message flow, persistence, provider, or
+Telegram behavior. The current code and tests are the source of truth; update
+the architecture file when those contracts materially change.
 
 Read `ARCHITECTURE.md` before changing message flow, persistence, provider, or
 Telegram behavior. The current code and tests are the source of truth; update
@@ -22,7 +27,17 @@ the architecture file when those contracts materially change.
 - Do not modify wiki files automatically.
 - Ignore bot-authored messages, Telegram commands, unknown chats, and already
   processed update IDs.
+- Persist relevant Telegram updates before model processing. Do not mark an
+  inbox row processed until the episode succeeds; a model failure must leave it
+  pending.
+- After restart, ingest Telegram backlog (`drop_pending_updates=False`) and
+  process pending SQLite rows as catch-up. Do not flood the owner with stale
+  per-message recommendations.
+- Treat SQLite history and `chat_state` as the durable situation source. The
+  Codex thread is continuity only.
 - Preserve the per-chat batching behavior and keep different chats independent.
+- In the owner chat, invoke the agent only on reply-to-bot or an explicit
+  mention/tag.
 - Never log or commit secrets. Telegram tokens must remain redacted in logs.
 
 ## Change discipline
@@ -50,9 +65,10 @@ git diff --check
 ```
 
 For Telegram/Codex integration changes, also verify the affected acceptance
-path with fakes: monitored-chat selection, batching, start/resume thread,
-SQLite persistence, owner-only delivery, duplicate suppression, bot-message
-filtering, and secret redaction.
+path with fakes: monitored-chat selection, durable ingest, live/catch-up
+batching, start/resume thread, SQLite persistence, owner-only delivery,
+duplicate suppression, bot-message filtering, owner mention/reply, ASK_OWNER
+linking, and secret redaction.
 
 ## Runtime
 

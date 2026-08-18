@@ -58,5 +58,19 @@ class ChatRegistry:
     def get(self, telegram_chat_id: int) -> ChatConfig | None:
         return self._chats.get(telegram_chat_id)
 
+    def all_chats(self) -> list[ChatConfig]:
+        return list(self._chats.values())
+
+    def known_ids(self) -> list[int]:
+        return list(self._chats)
+
+    def find_by_name(self, text: str) -> ChatConfig | None:
+        lowered = text.casefold()
+        matches = [
+            chat for chat in self._chats.values()
+            if chat.name.casefold() in lowered or chat.directory.name.casefold() in lowered
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def __len__(self) -> int:
         return len(self._chats)

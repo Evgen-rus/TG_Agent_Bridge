@@ -22,6 +22,7 @@ class FakeProvider:
         wiki: str,
         rules: list[str],
         thread_id: str | None,
+        **kwargs,
     ) -> AgentReply:
         self.calls.append(
             {

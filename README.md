@@ -4,6 +4,11 @@ Minimal suggest-only bridge from monitored Telegram chats to a persistent Codex
 thread. Suggestions go only to the configured owner chat; the bot never replies
 to monitored chats.
 
+Incoming Telegram messages are saved to SQLite first, then analysed as a short
+episode of the current situation. After a restart the bot ingests the Telegram
+backlog instead of dropping it, rebuilds the picture from stored history, and
+notifies the owner only about the current outcome.
+
 ## Configure
 
 1. Copy `.env.example` to `.env`.
@@ -22,10 +27,15 @@ Python when no account is available:
 
 Never commit `.env` or Codex authentication files.
 
-`MESSAGE_BATCH_SECONDS` controls the per-chat collection window and defaults to
-20 seconds. Human messages received in the same monitored chat during that
-window, including messages from different people, are sent to Codex together as
-one turn. Separate chats always use separate batches.
+`MESSAGE_BATCH_SECONDS` controls the live per-chat collection window and
+defaults to 20 seconds. Human messages received in the same monitored chat
+during that window, including messages from different people, are analysed
+together as one episode. Separate chats always use separate batches.
+
+After downtime, `CATCHUP_IDLE_SECONDS` (2 by default) waits for Telegram's
+stored updates to land in SQLite, then catch-up processes the pending sequence.
+A large backlog is split into ordered episodes of `CATCHUP_EPISODE_SIZE`
+messages. Only the last episode may notify the owner.
 
 The globally installed `codex` command is optional for this project: the
 `openai-codex` package includes its compatible runtime. Authentication is still
@@ -37,25 +47,39 @@ required before a real suggestion can be generated.
 .\.venv\Scripts\python.exe -m agentbridge.main
 ```
 
-The SQLite mapping is created at `runtime/agentbridge.sqlite3`. Each monitored
-Telegram chat gets one stored Codex thread ID, which is resumed after restart.
+The SQLite mapping is created at `runtime/agentbridge.sqlite3`. It stores
+Telegram history, one Codex thread ID per monitored chat, compact `chat_state`,
+recommendations, rules, and memory.
 
-For predictable suggest-only operation, startup discards Telegram updates that
-accumulated while the application was offline. Successfully processed update
-IDs are stored in the same SQLite database, so Telegram retries are not sent to
-Codex twice. Messages authored by bot accounts are ignored.
+For predictable suggest-only operation, startup no longer drops Telegram
+updates. Successfully processed update IDs are stored in the same SQLite
+database, so Telegram retries are not sent to Codex twice. Messages authored by
+bot accounts are ignored.
 
 ## Owner learning
 
-Use a separate service group as `OWNER_CHAT_ID`. Any human member can reply to
-a suggestion with a correction in ordinary language. Codex shows how it
-understood the correction; **Да, применить** confirms it and **Нет, уточнить**
-asks for clarification. Rules apply to that client by default. Global scope
-requires explicit wording such as "for all clients".
+Use a separate service group as `OWNER_CHAT_ID`. The bot speaks there as a
+second pilot: it can propose a client reply, ask you one missing fact, or just
+point out a risk. It does not jump into ordinary conversation.
+
+The agent is invoked in the owner group when:
+
+- a person replies to a bot recommendation or question;
+- a person explicitly mentions/tags the bot, for example `@agent что сейчас
+  происходит с Татьяной?`.
+
+Any human member can reply to a suggestion with a correction in ordinary
+language. Codex shows how it understood the correction; **Да, применить**
+confirms it and **Нет, уточнить** asks for clarification. Rules apply to that
+client by default. Global scope requires explicit wording such as "for all
+clients".
 
 Use `/rules` in the owner group to inspect active rules and `/undo` to deactivate
 the most recently confirmed active rule. Corrected suggestions still go only to
 the owner group and are never sent to a client chat.
+
+If the bot asks a clarifying question, reply to that question. The answer is
+applied to the original client chat and may be offered as confirmable memory.
 
 ### Context memory
 

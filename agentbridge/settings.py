@@ -19,6 +19,8 @@ class Settings:
     codex_reasoning_effort: str = "medium"
     message_batch_seconds: float = 20.0
     delivery_retry_seconds: float = 30.0
+    catchup_idle_seconds: float = 2.0
+    catchup_episode_size: int = 40
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -47,4 +49,6 @@ class Settings:
             codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip(),
             message_batch_seconds=float(os.getenv("MESSAGE_BATCH_SECONDS", "20")),
             delivery_retry_seconds=float(os.getenv("DELIVERY_RETRY_SECONDS", "30")),
+            catchup_idle_seconds=float(os.getenv("CATCHUP_IDLE_SECONDS", "2")),
+            catchup_episode_size=int(os.getenv("CATCHUP_EPISODE_SIZE", "40")),
         )

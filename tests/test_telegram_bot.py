@@ -116,6 +116,19 @@ class FakeUpdate:
     update_id: int = 123
 
 
+@dataclass
+class PendingChatService:
+    suggestion: Suggestion
+    modes: list[str] = field(default_factory=list)
+
+    async def process_pending_chat(self, telegram_chat_id, *, mode="live"):
+        self.modes.append(mode)
+        return self.suggestion
+
+    async def handle_messages(self, telegram_chat_id, messages):
+        raise AssertionError("Live processing should use the durable pending-chat path")
+
+
 def _message_callback(application):
     return application.handlers[0][0].callback
 
@@ -295,3 +308,24 @@ async def test_failed_owner_delivery_is_retried_by_delivery_loop() -> None:
     assert len(bot.sent) == 1
     assert bot.sent[0]["chat_id"] == owner_chat_id
     assert service.pending is False
+
+
+@pytest.mark.asyncio
+async def test_live_pending_chat_path_still_sends_only_to_the_owner() -> None:
+    source_chat_id = -100123456
+    owner_chat_id = 7654321
+    service = PendingChatService(
+        Suggestion("Acme", "Alice", "Hello", "Greeting", "Hi", 4, source_chat_id)
+    )
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=owner_chat_id, message_service=service, batch_seconds=0,
+    )
+    bot = FakeBot()
+    await _message_callback(application)(
+        FakeUpdate(FakeMessage("Hello"), FakeChat(source_chat_id), FakeUser()),
+        FakeContext(bot),
+    )
+    await asyncio.sleep(0.01)
+    assert service.modes == ["live"]
+    assert [item["chat_id"] for item in bot.sent] == [owner_chat_id]
+    assert all(item["chat_id"] != source_chat_id for item in bot.sent)

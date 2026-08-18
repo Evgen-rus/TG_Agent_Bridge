@@ -6,13 +6,14 @@ import asyncio
 from collections.abc import Awaitable
 from dataclasses import dataclass
 import logging
+import time
 from typing import Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from agentbridge.application import IncomingMessage
+from agentbridge.application import IncomingMessage, MemoryProposal, QuestionReplyResult
 from .formatter import format_learning_proposal, format_memory_proposal, format_owner_message, format_rules
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,31 @@ async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
         logger.warning("event=telegram_transient_error operation=%s", operation)
 
 
+def _mentions_bot(message, bot) -> bool:
+    text = getattr(message, "text", None) or ""
+    names = {"agent"}
+    username = getattr(bot, "username", None)
+    if username:
+        names.add(str(username).casefold())
+    lowered = text.casefold()
+    if any(f"@{name}" in lowered for name in names):
+        return True
+    bot_id = getattr(bot, "id", None)
+    for entity in getattr(message, "entities", None) or []:
+        mentioned = getattr(entity, "user", None)
+        if mentioned is not None and bot_id is not None and getattr(mentioned, "id", None) == bot_id:
+            return True
+    return False
+
+
+def _telegram_date(message) -> str:
+    date = getattr(message, "date", None)
+    if date is None:
+        return ""
+    iso = getattr(date, "isoformat", None)
+    return iso() if callable(iso) else str(date)
+
+
 def create_telegram_application(
     *,
     token: str,
@@ -57,6 +83,8 @@ def create_telegram_application(
     message_service: IncomingMessageService,
     batch_seconds: float = 20.0,
     delivery_retry_seconds: float = 30.0,
+    catchup_idle_seconds: float = 0.0,
+    catchup_max_seconds: float = 30.0,
 ) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
@@ -67,6 +95,8 @@ def create_telegram_application(
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
     retry_task: asyncio.Task[None] | None = None
+    live_enabled = catchup_idle_seconds <= 0
+    last_ingest_at = time.monotonic()
 
     async def _send(bot, *, chat_id: int, text: str, reply_markup=None):
         kwargs = {"chat_id": chat_id, "text": text}
@@ -115,8 +145,35 @@ def create_telegram_application(
             await _retry_pending_deliveries(application.bot)
             await asyncio.sleep(delivery_retry_seconds)
 
+    async def _wait_for_ingest_idle() -> None:
+        if catchup_idle_seconds <= 0:
+            return
+        deadline = time.monotonic() + max(catchup_max_seconds, catchup_idle_seconds)
+        while time.monotonic() < deadline:
+            if time.monotonic() - last_ingest_at >= catchup_idle_seconds:
+                return
+            await asyncio.sleep(0.1)
+
+    async def _run_catchup(bot) -> None:
+        catchup = getattr(message_service, "catch_up", None)
+        if catchup is None:
+            return
+        pending_ids = getattr(message_service, "pending_client_chat_ids", None)
+        for _ in range(5):
+            suggestions = await catchup()
+            for suggestion in suggestions:
+                await _deliver_suggestion(bot, suggestion)
+            leftover = pending_ids() if pending_ids is not None else []
+            if not leftover:
+                return
+            await asyncio.sleep(0.05)
+
     async def _post_init(application: Application) -> None:
-        nonlocal retry_task
+        nonlocal retry_task, live_enabled, last_ingest_at
+        last_ingest_at = time.monotonic()
+        await _wait_for_ingest_idle()
+        await _run_catchup(application.bot)
+        live_enabled = True
         retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
 
     async def _post_stop(application: Application) -> None:
@@ -127,21 +184,68 @@ def create_telegram_application(
         await asyncio.gather(retry_task, return_exceptions=True)
         retry_task = None
 
+    def _ingest(update: Update, chat_id: int, is_owner_chat: bool) -> IncomingMessage:
+        nonlocal last_ingest_at
+        message = update.effective_message
+        sender = update.effective_user
+        reply = getattr(message, "reply_to_message", None) if message is not None else None
+        item = IncomingMessage(
+            sender_name=getattr(sender, "full_name", "") if sender else "",
+            text=getattr(message, "text", "") if message is not None else "",
+            update_id=update.update_id,
+            message_id=getattr(message, "message_id", None),
+            sender_id=getattr(sender, "id", None),
+            telegram_date=_telegram_date(message),
+            reply_to_message_id=getattr(reply, "message_id", None),
+        )
+        ingest = getattr(message_service, "ingest_telegram_message", None)
+        if ingest is not None and message is not None:
+            ingest(
+                update_id=update.update_id,
+                chat_id=chat_id,
+                message_id=item.message_id if item.message_id is not None else update.update_id,
+                sender_id=item.sender_id,
+                sender_name=item.sender_name,
+                telegram_date=item.telegram_date or "",
+                text=item.text,
+                reply_to_message_id=item.reply_to_message_id,
+                is_owner_chat=is_owner_chat,
+            )
+            last_ingest_at = time.monotonic()
+        return item
+
+    async def _analyze_chat(chat_id: int, messages: list[IncomingMessage], bot) -> None:
+        processor = getattr(message_service, "process_pending_chat", None)
+        try:
+            if processor is not None:
+                recommendation = await processor(chat_id, mode="live")
+            else:
+                recommendation = await message_service.handle_messages(chat_id, messages)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("event=client_batch_failed chat_id=%s", chat_id)
+            await _send(bot, chat_id=owner_chat_id, text=f"AgentBridge не смог подготовить рекомендацию. Чат ID: {chat_id}. Проверьте журнал приложения.")
+            return
+        if recommendation is not None:
+            await _deliver_suggestion(bot, recommendation)
+
     async def send_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await asyncio.sleep(batch_seconds)
             batch = pending_batches.pop(chat_id, None)
             if batch is None:
                 return
-            recommendation = await message_service.handle_messages(chat_id, batch.messages)
-            if recommendation is not None:
-                await _deliver_suggestion(context.bot, recommendation)
+            await _analyze_chat(chat_id, batch.messages, context.bot)
         except asyncio.CancelledError:
             raise
         except Exception:
             pending_batches.pop(chat_id, None)
             logger.exception("event=client_batch_failed chat_id=%s", chat_id)
             await _send(context.bot, chat_id=owner_chat_id, text=f"AgentBridge не смог подготовить рекомендацию. Чат ID: {chat_id}. Проверьте журнал приложения.")
+
+    async def _send_memory_proposal(bot, proposal: MemoryProposal) -> None:
+        await _send(bot, chat_id=owner_chat_id, text=format_memory_proposal(proposal), reply_markup=_memory_confirmation_keyboard(proposal.draft_id))
 
     async def owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         message = update.effective_message
@@ -151,15 +255,34 @@ def create_telegram_application(
             return False
         reply = getattr(message, "reply_to_message", None)
         reply_id = getattr(reply, "message_id", None)
-        if reply_id is None:
-            return True
-        replied_sender = getattr(reply, "from_user", None)
+        mentions = _mentions_bot(message, context.bot)
+        replied_sender = getattr(reply, "from_user", None) if reply is not None else None
         bot_id = getattr(context.bot, "id", None)
         replied_to_this_bot = bool(
             replied_sender is not None
             and getattr(replied_sender, "is_bot", False)
             and (bot_id is None or getattr(replied_sender, "id", None) == bot_id)
         )
+        if mentions:
+            question_handler = getattr(message_service, "handle_owner_question_reply", None)
+            if replied_to_this_bot and question_handler is not None and reply_id is not None:
+                result = await question_handler(
+                    owner_chat_id, reply_id, getattr(sender, "id", 0),
+                    getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+                )
+                if result is not None:
+                    await _handle_question_result(context.bot, result)
+                    return True
+            query = getattr(message_service, "handle_owner_query", None)
+            if query is None:
+                return True
+            logger.info("event=owner_query_received owner_message_id=%s update_id=%s", getattr(message, "message_id", None), update.update_id)
+            answer = await query(message.text, reply_to_message_id=reply_id, update_id=update.update_id)
+            if answer:
+                await _send(context.bot, chat_id=owner_chat_id, text=answer)
+            return True
+        if reply_id is None:
+            return True
         if not replied_to_this_bot:
             logger.info(
                 "event=owner_reply_ignored reason=not_bot_message owner_message_id=%s reply_to_message_id=%s",
@@ -170,6 +293,15 @@ def create_telegram_application(
             "event=owner_feedback_received owner_message_id=%s reply_to_message_id=%s author_id=%s update_id=%s",
             getattr(message, "message_id", None), reply_id, getattr(sender, "id", None), update.update_id,
         )
+        question_handler = getattr(message_service, "handle_owner_question_reply", None)
+        if question_handler is not None:
+            result = await question_handler(
+                owner_chat_id, reply_id, getattr(sender, "id", 0),
+                getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+            )
+            if result is not None:
+                await _handle_question_result(context.bot, result)
+                return True
         context_handler = getattr(message_service, "handle_owner_context", None)
         is_context_command = getattr(message_service, "is_memory_context_command", lambda _: False)
         if is_context_command(message.text):
@@ -183,10 +315,7 @@ def create_telegram_application(
                     text="Не удалось подготовить контекст. Для проектного контекста чат должен быть привязан к проекту; ответьте на актуальную рекомендацию бота.",
                 )
                 return True
-            await _send(
-                context.bot, chat_id=owner_chat_id, text=format_memory_proposal(proposal),
-                reply_markup=_memory_confirmation_keyboard(proposal.draft_id),
-            )
+            await _send_memory_proposal(context.bot, proposal)
             return True
         proposal = await message_service.clarify_feedback(reply_id, message.text, update.update_id)
         if proposal is None:
@@ -210,6 +339,12 @@ def create_telegram_application(
         await _send(context.bot, chat_id=owner_chat_id, text=format_learning_proposal(proposal), reply_markup=_confirmation_keyboard(proposal.draft_id))
         return True
 
+    async def _handle_question_result(bot, result: QuestionReplyResult) -> None:
+        if result.memory_proposal is not None:
+            await _send_memory_proposal(bot, result.memory_proposal)
+        if result.suggestion is not None:
+            await _deliver_suggestion(bot, result.suggestion)
+
     async def queue_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         chat = update.effective_chat
@@ -219,9 +354,12 @@ def create_telegram_application(
         if sender is not None and sender.is_bot:
             logger.info("event=telegram_message_ignored reason=bot chat_id=%s", chat.id)
             return
+        item = _ingest(update, chat.id, chat.id == owner_chat_id)
         if await owner_reply(update, context):
             return
-        item = IncomingMessage(getattr(sender, "full_name", "") if sender else "", message.text, update.update_id)
+        if not live_enabled:
+            logger.info("event=client_message_deferred_catchup chat_id=%s update_id=%s", chat.id, update.update_id)
+            return
         batch = pending_batches.get(chat.id)
         if batch is not None:
             batch.messages.append(item)
@@ -284,8 +422,3 @@ def create_telegram_application(
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("undo", undo_command))
     return application
-
-
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from agentbridge.application import Suggestion

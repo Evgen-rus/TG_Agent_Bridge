@@ -2,14 +2,29 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from agentbridge.agents.base import AgentAction
+from agentbridge.application import action_label
+
 
 def format_owner_message(suggestion: "Suggestion") -> str:
-    return (
-        f"Чат: {suggestion.chat_name}\n"
-        f"{suggestion.sender_name}:\n{suggestion.original_message}\n\n"
-        f"Ситуация:\n{suggestion.situation}\n\n"
-        f"Предлагаемый ответ:\n{suggestion.suggested_reply}\n\n"
-    )
+    action = suggestion.action or AgentAction.REPLY
+    parts = [
+        f"Чат: {suggestion.chat_name}",
+        f"Новый контекст:\n{suggestion.sender_name}:\n{suggestion.original_message}",
+        f"Ситуация:\n{suggestion.situation}",
+    ]
+    if suggestion.observation.strip():
+        parts.append(f"Наблюдение:\n{suggestion.observation.strip()}")
+    parts.append(f"Рекомендуемое действие: {action_label(action)}")
+    if action == AgentAction.ASK_OWNER and suggestion.owner_question.strip():
+        parts.append(f"Вопрос нам:\n{suggestion.owner_question.strip()}")
+    if suggestion.unknowns.strip() and action != AgentAction.ASK_OWNER:
+        parts.append(f"Чего не хватает:\n{suggestion.unknowns.strip()}")
+    if action == AgentAction.REPLY and suggestion.suggested_reply.strip():
+        parts.append(f"Предлагаемый ответ:\n{suggestion.suggested_reply}")
+    return "\n\n".join(parts) + "\n\n"
 
 
 def format_learning_proposal(proposal: "LearningProposal") -> str:
@@ -49,7 +64,6 @@ def format_rules(rules: list["RuleRecord"]) -> str:
     return "\n".join(lines)
 
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agentbridge.application import LearningProposal, MemoryProposal, Suggestion
     from agentbridge.storage.sqlite import RuleRecord
