@@ -54,6 +54,28 @@ def format_memory_proposal(proposal: "MemoryProposal") -> str:
     )
 
 
+def format_onboarding_notice(notice: "OnboardingNotice") -> str:
+    added = notice.added_by_name.strip() or "неизвестно кто"
+    return (
+        f"Новая группа без wiki:\n{notice.chat_title}\n"
+        f"ID: {notice.telegram_chat_id}\n"
+        f"Добавил/права: {added}\n\n"
+        "Бот уже админ, но этого чата ещё нет в AgentBridge. "
+        "Сообщения копятся и пока не анализируются.\n\n"
+        "Ответьте на это сообщение: кто это за клиент и какой контекст нужен."
+    )
+
+
+def format_onboarding_draft(proposal: "OnboardingDraftProposal") -> str:
+    return (
+        f"Черновик wiki для «{proposal.name}»\n"
+        f"Группа: {proposal.chat_title}\n"
+        f"ID: {proposal.telegram_chat_id}\n\n"
+        f"{proposal.wiki.strip()}\n\n"
+        "Сохранить этот чат и начать следить?"
+    )
+
+
 def format_rules(rules: list["RuleRecord"]) -> str:
     if not rules:
         return "Активных подтверждённых правил пока нет."
@@ -65,5 +87,5 @@ def format_rules(rules: list["RuleRecord"]) -> str:
 
 
 if TYPE_CHECKING:
-    from agentbridge.application import LearningProposal, MemoryProposal, Suggestion
+    from agentbridge.application import LearningProposal, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, Suggestion
     from agentbridge.storage.sqlite import RuleRecord

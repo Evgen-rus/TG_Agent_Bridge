@@ -118,6 +118,23 @@ class RuleRecord:
 
 
 @dataclass(frozen=True)
+class ChatOnboarding:
+    id: int
+    telegram_chat_id: int
+    chat_title: str
+    added_by_name: str
+    added_by_id: int | None
+    status: str
+    owner_notice_message_id: int | None = None
+    owner_brief: str = ""
+    draft_name: str = ""
+    draft_wiki: str = ""
+    draft_directory: str = ""
+    draft_message_id: int | None = None
+    clarification_prompt_message_id: int | None = None
+
+
+@dataclass(frozen=True)
 class MemoryDraft:
     id: int
     recommendation_id: int
@@ -297,6 +314,27 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_experience_chat
                     ON experience_entries(status, telegram_chat_id, id);
+                CREATE TABLE IF NOT EXISTS chat_onboardings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_chat_id INTEGER NOT NULL UNIQUE,
+                    chat_title TEXT NOT NULL,
+                    added_by_name TEXT NOT NULL DEFAULT '',
+                    added_by_id INTEGER,
+                    status TEXT NOT NULL,
+                    owner_notice_message_id INTEGER,
+                    owner_brief TEXT NOT NULL DEFAULT '',
+                    draft_name TEXT NOT NULL DEFAULT '',
+                    draft_wiki TEXT NOT NULL DEFAULT '',
+                    draft_directory TEXT NOT NULL DEFAULT '',
+                    draft_message_id INTEGER,
+                    clarification_prompt_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_onboarding_notice
+                    ON chat_onboardings(owner_notice_message_id);
+                CREATE INDEX IF NOT EXISTS idx_onboarding_draft_message
+                    ON chat_onboardings(draft_message_id);
                 """
             )
             self._upgrade_schema(connection)
@@ -898,6 +936,157 @@ class ChatThreadStore:
                 VALUES (?, ?, ?, ?, 'experience', ?, 'active', ?)""",
                 (telegram_chat_id, chat_name, situation, lesson, source_draft_id, _now()),
             )
+
+    def ensure_onboarding(
+        self,
+        telegram_chat_id: int,
+        chat_title: str,
+        added_by_name: str = "",
+        added_by_id: int | None = None,
+    ) -> ChatOnboarding:
+        now = _now()
+        title = chat_title.strip() or f"Чат {telegram_chat_id}"
+        added_name = added_by_name.strip()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO chat_onboardings
+                (telegram_chat_id, chat_title, added_by_name, added_by_id, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending_brief', ?, ?)
+                ON CONFLICT(telegram_chat_id) DO UPDATE SET
+                    chat_title=excluded.chat_title,
+                    added_by_name=CASE WHEN excluded.added_by_name='' THEN chat_onboardings.added_by_name ELSE excluded.added_by_name END,
+                    added_by_id=COALESCE(excluded.added_by_id, chat_onboardings.added_by_id),
+                    status=CASE WHEN chat_onboardings.status='confirmed' THEN chat_onboardings.status
+                                WHEN chat_onboardings.status='cancelled' THEN 'pending_brief'
+                                ELSE chat_onboardings.status END,
+                    owner_notice_message_id=CASE WHEN chat_onboardings.status='cancelled' THEN NULL
+                                                 ELSE chat_onboardings.owner_notice_message_id END,
+                    updated_at=excluded.updated_at""",
+                (telegram_chat_id, title, added_name, added_by_id, now, now),
+            )
+        record = self.get_onboarding(telegram_chat_id)
+        if record is None:
+            raise RuntimeError("Failed to persist chat onboarding")
+        return record
+
+    def get_onboarding(self, telegram_chat_id: int) -> ChatOnboarding | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_onboardings WHERE telegram_chat_id=?",
+                (telegram_chat_id,),
+            ).fetchone()
+        return None if row is None else self._onboarding(row)
+
+    def get_onboarding_by_id(self, onboarding_id: int) -> ChatOnboarding | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM chat_onboardings WHERE id=?", (onboarding_id,)).fetchone()
+        return None if row is None else self._onboarding(row)
+
+    def get_onboarding_by_owner_message(self, owner_message_id: int) -> ChatOnboarding | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM chat_onboardings
+                WHERE status IN ('pending_brief', 'pending_draft')
+                  AND (owner_notice_message_id=? OR draft_message_id=? OR clarification_prompt_message_id=?)
+                ORDER BY id DESC LIMIT 1""",
+                (owner_message_id, owner_message_id, owner_message_id),
+            ).fetchone()
+        return None if row is None else self._onboarding(row)
+
+    def has_open_onboarding(self, telegram_chat_id: int) -> bool:
+        record = self.get_onboarding(telegram_chat_id)
+        return record is not None and record.status in {"pending_brief", "pending_draft"}
+
+    def pending_onboarding_notices(self) -> list[ChatOnboarding]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM chat_onboardings
+                WHERE status IN ('pending_brief', 'pending_draft') AND owner_notice_message_id IS NULL
+                ORDER BY id""",
+            ).fetchall()
+        return [self._onboarding(row) for row in rows]
+
+    def attach_onboarding_notice(self, onboarding_id: int, owner_message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE chat_onboardings SET owner_notice_message_id=?, updated_at=? WHERE id=?",
+                (owner_message_id, _now(), onboarding_id),
+            )
+
+    def attach_onboarding_draft_message(self, onboarding_id: int, owner_message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE chat_onboardings SET draft_message_id=?, status='pending_draft', updated_at=?
+                WHERE id=? AND status IN ('pending_brief', 'pending_draft')""",
+                (owner_message_id, _now(), onboarding_id),
+            )
+
+    def save_onboarding_draft(
+        self, onboarding_id: int, *, owner_brief: str, draft_name: str, draft_wiki: str, draft_directory: str,
+    ) -> ChatOnboarding | None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE chat_onboardings
+                SET owner_brief=?, draft_name=?, draft_wiki=?, draft_directory=?, status='pending_draft', updated_at=?
+                WHERE id=? AND status IN ('pending_brief', 'pending_draft')""",
+                (owner_brief.strip(), draft_name.strip(), draft_wiki.strip(), draft_directory.strip(), _now(), onboarding_id),
+            )
+        return self.get_onboarding_by_id(onboarding_id)
+
+    def mark_onboarding_clarification(self, onboarding_id: int, prompt_message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE chat_onboardings
+                SET clarification_prompt_message_id=?, status='pending_brief', updated_at=?
+                WHERE id=? AND status IN ('pending_brief', 'pending_draft')""",
+                (prompt_message_id, _now(), onboarding_id),
+            )
+
+    def confirm_onboarding(self, onboarding_id: int) -> ChatOnboarding | None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE chat_onboardings SET status='confirmed', updated_at=?
+                WHERE id=? AND status='pending_draft'""",
+                (_now(), onboarding_id),
+            )
+        record = self.get_onboarding_by_id(onboarding_id)
+        if record is None or record.status != "confirmed":
+            return None
+        return record
+
+    def cancel_onboarding(self, telegram_chat_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE chat_onboardings SET status='cancelled', updated_at=?
+                WHERE telegram_chat_id=? AND status IN ('pending_brief', 'pending_draft')""",
+                (_now(), telegram_chat_id),
+            )
+
+    def release_held_messages(self, chat_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE telegram_messages SET processing_status='pending'
+                WHERE chat_id=? AND processing_status='held'""",
+                (chat_id,),
+            )
+
+    @staticmethod
+    def _onboarding(row: sqlite3.Row) -> ChatOnboarding:
+        return ChatOnboarding(
+            id=row["id"],
+            telegram_chat_id=row["telegram_chat_id"],
+            chat_title=row["chat_title"],
+            added_by_name=row["added_by_name"] or "",
+            added_by_id=row["added_by_id"],
+            status=row["status"],
+            owner_notice_message_id=row["owner_notice_message_id"],
+            owner_brief=row["owner_brief"] or "",
+            draft_name=row["draft_name"] or "",
+            draft_wiki=row["draft_wiki"] or "",
+            draft_directory=row["draft_directory"] or "",
+            draft_message_id=row["draft_message_id"],
+            clarification_prompt_message_id=row["clarification_prompt_message_id"],
+        )
 
     def recent_experience(self, telegram_chat_id: int, limit: int = 3) -> list[str]:
         with self._connect() as connection:

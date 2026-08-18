@@ -67,7 +67,12 @@ The agent is invoked in the owner group when:
 
 - a person replies to a bot recommendation or question;
 - a person explicitly mentions/tags the bot, for example `@agent что сейчас
-  происходит с Татьяной?`.
+  происходит с Татьяной?`;
+- a person replies to a “new group without wiki” card after the bot became
+  admin, or after the first message from a group where it was already admin.
+
+Telegram cannot list every group the bot is already in. A quiet group with no
+new messages stays undiscovered until someone writes or membership changes.
 
 Any human member can reply to a suggestion with a correction in ordinary
 language. Codex shows how it understood the correction; **Да, применить**

@@ -4,11 +4,12 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+from pathlib import Path
 import re
 
-from .agents.base import AgentAction, AgentProvider, FeedbackAnalysis
-from .chats.loader import ChatConfig, ChatRegistry
-from .storage.sqlite import ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
+from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis
+from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
+from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
 
 logger = logging.getLogger(__name__)
 _GLOBAL_WORDING = re.compile(r"\b(для\s+всех|всем\s+клиент|глобальн)", re.IGNORECASE)
@@ -87,6 +88,24 @@ class QuestionReplyResult:
     memory_proposal: MemoryProposal | None
 
 
+@dataclass(frozen=True)
+class OnboardingNotice:
+    onboarding_id: int
+    telegram_chat_id: int
+    chat_title: str
+    added_by_name: str
+    needs_delivery: bool
+
+
+@dataclass(frozen=True)
+class OnboardingDraftProposal:
+    onboarding_id: int
+    telegram_chat_id: int
+    chat_title: str
+    name: str
+    wiki: str
+
+
 class AgentBridgeApplication:
     def __init__(
         self,
@@ -95,13 +114,18 @@ class AgentBridgeApplication:
         provider: AgentProvider,
         owner_chat_id: int | None = None,
         episode_size: int = 40,
+        chats_dir: Path | None = None,
     ):
         self.registry = registry
         self.store = store
         self.provider = provider
         self.owner_chat_id = owner_chat_id
         self.episode_size = max(1, episode_size)
+        self.chats_dir = chats_dir
         self._chat_locks: dict[int, asyncio.Lock] = {}
+
+    def is_monitored_chat(self, telegram_chat_id: int) -> bool:
+        return self.registry.get(telegram_chat_id) is not None
 
     def is_update_processed(self, telegram_update_id: int) -> bool:
         return self.store.is_update_processed(telegram_update_id)
@@ -128,9 +152,13 @@ class AgentBridgeApplication:
         else:
             chat = self.registry.get(chat_id)
             if chat is None:
-                return False
-            role = "internal" if sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
-            status = "pending"
+                if not self.store.has_open_onboarding(chat_id):
+                    return False
+                role = "internal" if sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
+                status = "held"
+            else:
+                role = "internal" if sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
+                status = "pending"
         return self.store.ingest_telegram_message(
             update_id=update_id,
             chat_id=chat_id,
@@ -380,6 +408,119 @@ class AgentBridgeApplication:
     def pending_suggestions(self, owner_chat_id: int) -> list[Suggestion]:
         self.store.assign_unowned_pending_recommendations(owner_chat_id)
         return [self._suggestion_from_record(record) for record in self.store.pending_recommendations(owner_chat_id)]
+
+    def pending_onboarding_notices(self) -> list[OnboardingNotice]:
+        return [
+            OnboardingNotice(item.id, item.telegram_chat_id, item.chat_title, item.added_by_name, True)
+            for item in self.store.pending_onboarding_notices()
+        ]
+
+    def record_onboarding_notice(self, onboarding_id: int, owner_message_id: int) -> None:
+        self.store.attach_onboarding_notice(onboarding_id, owner_message_id)
+
+    def record_onboarding_draft_message(self, onboarding_id: int, owner_message_id: int) -> None:
+        self.store.attach_onboarding_draft_message(onboarding_id, owner_message_id)
+
+    def begin_unconfigured_chat(
+        self,
+        telegram_chat_id: int,
+        chat_title: str,
+        added_by_name: str = "",
+        added_by_id: int | None = None,
+        update_id: int | None = None,
+    ) -> OnboardingNotice | None:
+        if self.owner_chat_id is not None and telegram_chat_id == self.owner_chat_id:
+            return None
+        if self.registry.get(telegram_chat_id) is not None:
+            return None
+        existing = self.store.get_onboarding(telegram_chat_id)
+        record = self.store.ensure_onboarding(telegram_chat_id, chat_title, added_by_name, added_by_id)
+        if record.status == "confirmed":
+            return None
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        needs_delivery = record.owner_notice_message_id is None
+        if existing is not None and existing.status not in {"cancelled"} and not needs_delivery:
+            return OnboardingNotice(record.id, record.telegram_chat_id, record.chat_title, record.added_by_name, False)
+        logger.info(
+            "event=chat_onboarding_started chat_id=%s title=%r needs_delivery=%s",
+            telegram_chat_id, record.chat_title, needs_delivery,
+        )
+        return OnboardingNotice(record.id, record.telegram_chat_id, record.chat_title, record.added_by_name, needs_delivery)
+
+    def cancel_unconfigured_chat(self, telegram_chat_id: int) -> None:
+        self.store.cancel_onboarding(telegram_chat_id)
+
+    async def handle_onboarding_brief(
+        self, owner_chat_id: int, reply_to_message_id: int, author_name: str, brief: str, update_id: int | None = None,
+    ) -> OnboardingDraftProposal | None:
+        if update_id is not None and self.store.is_update_processed(update_id):
+            return None
+        record = self.store.get_onboarding_by_owner_message(reply_to_message_id)
+        if record is None:
+            return None
+        text = brief.strip()
+        if not text:
+            return None
+        drafter = getattr(self.provider, "draft_chat_onboarding", None)
+        if drafter is not None:
+            draft = await drafter(
+                group_title=record.chat_title, owner_brief=text, telegram_chat_id=record.telegram_chat_id,
+            )
+        else:
+            draft = _local_onboarding_draft(record.chat_title, text, record.telegram_chat_id)
+        name = draft.name.strip() or _name_from_brief(text) or record.chat_title
+        wiki = draft.wiki.strip() or text
+        slug = slugify_chat_name(draft.directory_slug or name, record.telegram_chat_id)
+        saved = self.store.save_onboarding_draft(
+            record.id, owner_brief=text, draft_name=name, draft_wiki=wiki, draft_directory=slug,
+        )
+        if saved is None:
+            return None
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        logger.info("event=chat_onboarding_drafted onboarding_id=%s name=%r", saved.id, saved.draft_name)
+        return OnboardingDraftProposal(saved.id, saved.telegram_chat_id, saved.chat_title, saved.draft_name, saved.draft_wiki)
+
+    def confirm_onboarding(self, onboarding_id: int) -> ChatConfig | None:
+        record = self.store.get_onboarding_by_id(onboarding_id)
+        if record is None or record.status != "pending_draft" or not record.draft_name.strip() or not record.draft_wiki.strip():
+            return None
+        if self.chats_dir is None:
+            logger.warning("event=chat_onboarding_blocked reason=no_chats_dir onboarding_id=%s", onboarding_id)
+            return None
+        existing = self.registry.get(record.telegram_chat_id)
+        if existing is None:
+            try:
+                existing = write_new_chat(
+                    self.chats_dir,
+                    telegram_chat_id=record.telegram_chat_id,
+                    name=record.draft_name,
+                    wiki=record.draft_wiki,
+                    directory_name=record.draft_directory,
+                )
+            except Exception:
+                logger.exception("event=chat_onboarding_write_failed onboarding_id=%s", onboarding_id)
+                return None
+        confirmed = self.store.confirm_onboarding(onboarding_id)
+        if confirmed is None:
+            return None
+        chat = self.registry.add(existing)
+        self.store.release_held_messages(chat.telegram_chat_id)
+        logger.info(
+            "event=chat_onboarding_confirmed chat_id=%s name=%r directory=%s",
+            chat.telegram_chat_id, chat.name, chat.directory,
+        )
+        return chat
+
+    def reject_onboarding(self, onboarding_id: int) -> ChatOnboarding | None:
+        record = self.store.get_onboarding_by_id(onboarding_id)
+        if record is None or record.status not in {"pending_brief", "pending_draft"}:
+            return None
+        return record
+
+    def mark_onboarding_clarification(self, onboarding_id: int, prompt_message_id: int) -> None:
+        self.store.mark_onboarding_clarification(onboarding_id, prompt_message_id)
 
     def is_owner_delivery_linked(self, recommendation_id: int, owner_chat_id: int) -> bool:
         record = self.store.get_recommendation(recommendation_id)
@@ -647,6 +788,17 @@ class AgentBridgeApplication:
     def _split_internal_messages(messages: list[IncomingMessage]) -> tuple[list[IncomingMessage], list[IncomingMessage]]:
         internal = [item for item in messages if item.sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS]
         return internal, [item for item in messages if item not in internal]
+
+
+def _name_from_brief(brief: str) -> str:
+    first = next((line.strip(" :-—") for line in brief.splitlines() if line.strip()), "")
+    return first[:80]
+
+
+def _local_onboarding_draft(group_title: str, owner_brief: str, telegram_chat_id: int) -> ChatOnboardingDraft:
+    name = _name_from_brief(owner_brief) or group_title or f"Чат {telegram_chat_id}"
+    wiki = "# Wiki клиентского чата\n\n## О чате\n\n" + owner_brief.strip() + "\n"
+    return ChatOnboardingDraft(name=name, wiki=wiki, directory_slug=slugify_chat_name(name, telegram_chat_id))
 
 
 def _from_stored(item: StoredMessage) -> IncomingMessage:

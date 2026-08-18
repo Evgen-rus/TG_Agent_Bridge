@@ -53,6 +53,13 @@ class FeedbackAnalysis:
     revision_instruction: str | None
 
 
+@dataclass(frozen=True)
+class ChatOnboardingDraft:
+    name: str
+    wiki: str
+    directory_slug: str = ""
+
+
 class AgentProvider(Protocol):
     async def suggest(
         self,

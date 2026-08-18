@@ -21,8 +21,16 @@ OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
   -> reply to a proactive question: fill the knowledge gap
   -> mention/tag of the bot: assistant query
+  -> reply to a new-group card: client brief, then confirm wiki draft
   -> ordinary human conversation is ignored
 ```
+
+If the bot becomes admin in an unknown group, or a message arrives from a
+group where it is already admin but there is no `chats/*/config.yaml`, the
+owner gets a card. Client messages are stored as `held` and are not sent to
+Codex until the owner confirms the wiki draft. Telegram does not list the
+bot's chats, so a silent already-admin group is discovered on the first
+visible message or membership update.
 
 Telegram updates accumulated while the process was offline are ingested first,
 then processed as catch-up episodes. `post_init` does not wait for catch-up:
@@ -99,7 +107,8 @@ client automatically.
 - Suggest-only: never reply automatically to a monitored/client chat.
 - One Telegram chat maps to one independent Codex thread, wiki, history, and
   `chat_state`.
-- Wiki is read-only at runtime.
+- Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
+  onboarding.
 - Bot-authored messages and commands do not invoke Codex.
 - Messages from configured internal LeadRecord participants are captured as
   local context and do not create a recommendation on their own.

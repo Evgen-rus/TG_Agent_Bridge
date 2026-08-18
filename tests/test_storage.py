@@ -54,6 +54,31 @@ def test_pending_recommendation_survives_restart_until_owner_delivery(tmp_path) 
     assert restarted_store.pending_recommendations(7654321) == []
 
 
+def test_chat_onboarding_survives_restart(tmp_path) -> None:
+    database_path = tmp_path / "runtime" / "agentbridge.sqlite3"
+    first = ChatThreadStore(database_path)
+    created = first.ensure_onboarding(-100999, "Новая группа", "Евгений Расюк", 42)
+    first.attach_onboarding_notice(created.id, 501)
+    first.ingest_telegram_message(
+        update_id=11, chat_id=-100999, message_id=101, sender_id=7,
+        sender_name="Alice", telegram_date="", text="Hello",
+        reply_to_message_id=None, role="client", processing_status="held",
+    )
+
+    restarted = ChatThreadStore(database_path)
+    record = restarted.get_onboarding(-100999)
+    assert record is not None
+    assert record.status == "pending_brief"
+    assert record.owner_notice_message_id == 501
+    assert restarted.has_open_onboarding(-100999) is True
+    restarted.save_onboarding_draft(record.id, owner_brief="Это Балтлиз", draft_name="Baltlease", draft_wiki="wiki", draft_directory="baltlease")
+    assert restarted.confirm_onboarding(record.id) is not None
+    restarted.release_held_messages(-100999)
+    pending = restarted.pending_messages(-100999)
+    assert len(pending) == 1
+    assert pending[0].text == "Hello"
+
+
 def test_confirmed_project_and_global_memory_are_scoped(tmp_path) -> None:
     store = ChatThreadStore(tmp_path / "runtime" / "agentbridge.sqlite3")
     first = store.create_recommendation(-1001, "First", "Alice", "Hello", "Greeting", "Hi")

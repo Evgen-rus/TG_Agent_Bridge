@@ -6,7 +6,7 @@ from pathlib import Path
 
 from openai_codex import Codex, Sandbox
 
-from .base import AgentAction, AgentReply, FeedbackAnalysis
+from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis
 
 _SUGGEST_SCHEMA = {
     "type": "object",
@@ -97,6 +97,22 @@ _OWNER_QUERY_INSTRUCTIONS = """Ты отвечаешь команде во вн�
 Длинное рассуждение используй на проверку фактов. Сам ответ команде короткий.
 Не предлагай отправлять это клиенту.
 """ + _OWNER_VOICE
+_ONBOARDING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "wiki": {"type": "string"},
+        "directory_slug": {"type": "string"},
+    },
+    "required": ["name", "wiki", "directory_slug"],
+    "additionalProperties": False,
+}
+_ONBOARDING_INSTRUCTIONS = """Ты готовишь карточку нового клиентского Telegram-чата для команды.
+Имя чата обязательно возьми из текста владельца, а не из названия группы, если владелец назвал клиента.
+wiki.md — стабильный контекст на русском: кто клиент, участники если названы, чем занимаемся, что обычно обсуждается.
+Пиши только то, что есть во вводе. Не выдумывай факты, цифры, договорённости и роли.
+directory_slug — латиница, строчные, слова через подчёркивание, без пути и пробелов.
+Не предлагай писать клиенту."""
 _CRITIQUE_INSTRUCTIONS = """Проверь предыдущий JSON-ответ как нейтральный аналитик. Исправь выдуманные факты, устаревшие рекомендации и слабые гипотезы, выданные как факты. Если более поздние сообщения закрыли вопрос — не предлагай reply на него. Не усиливай уверенность и не меняй action ради более острого тона. Голос команды может остаться в observation/owner_question, но смысл должен стать точнее. Верни тот же JSON schema."""
 
 
@@ -157,6 +173,28 @@ class CodexProvider:
             thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
             payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
         return str(payload["answer"]).strip()
+
+    async def draft_chat_onboarding(self, *, group_title: str, owner_brief: str, telegram_chat_id: int) -> ChatOnboardingDraft:
+        return await asyncio.to_thread(self._draft_chat_onboarding_sync, group_title, owner_brief, telegram_chat_id)
+
+    def _draft_chat_onboarding_sync(self, group_title: str, owner_brief: str, telegram_chat_id: int) -> ChatOnboardingDraft:
+        prompt = (
+            f"Название группы в Telegram: {group_title or '(нет)'}\n"
+            f"ID чата: {telegram_chat_id}\n\n"
+            f"Пояснение владельца, кто это за клиент:\n{owner_brief}"
+        )
+        with Codex() as codex:
+            thread = codex.thread_start(
+                model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                developer_instructions=_ONBOARDING_INSTRUCTIONS,
+                config={"model_reasoning_effort": self.reasoning_effort},
+            )
+            payload = self._run_json(thread, prompt, _ONBOARDING_SCHEMA)
+        return ChatOnboardingDraft(
+            name=str(payload.get("name") or "").strip() or owner_brief.strip().splitlines()[0][:80],
+            wiki=str(payload.get("wiki") or "").strip() or owner_brief.strip(),
+            directory_slug=str(payload.get("directory_slug") or "").strip(),
+        )
 
     def _run_json(self, thread, prompt: str, schema: dict) -> dict:
         result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)

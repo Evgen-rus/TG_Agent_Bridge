@@ -20,9 +20,12 @@ the architecture file when those contracts materially change.
 - Keep Telegram isolated from Codex through `AgentProvider`.
 - Keep one persistent Codex thread per monitored Telegram chat.
 - Load only that chat's `config.yaml` and `wiki.md`; never mix chat contexts.
-- Do not modify wiki files automatically.
-- Ignore bot-authored messages, Telegram commands, unknown chats, and already
-  processed update IDs.
+- Do not modify wiki files automatically, except creating `wiki.md` after the
+  owner confirms a new-chat onboarding draft.
+- Ignore bot-authored messages, Telegram commands, and already processed
+  update IDs. Unknown chats where the bot is not an admin are ignored.
+  Unknown chats where the bot is already an admin (or just became one) notify
+  the owner and hold messages until onboarding is confirmed.
 - Persist relevant Telegram updates before model processing. Do not mark an
   inbox row processed until the episode succeeds; a model failure must leave it
   pending.

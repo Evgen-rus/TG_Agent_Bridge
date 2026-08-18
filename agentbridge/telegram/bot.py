@@ -11,11 +11,20 @@ from typing import Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from agentbridge.application import IncomingMessage, MemoryProposal, QuestionReplyResult
-from .formatter import format_learning_proposal, format_memory_proposal, format_owner_message, format_rules
+from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, QuestionReplyResult
+from .formatter import (
+    format_learning_proposal,
+    format_memory_proposal,
+    format_onboarding_draft,
+    format_onboarding_notice,
+    format_owner_message,
+    format_rules,
+)
 
+_ADMIN_STATUSES = {"administrator", "creator"}
+_LEFT_STATUSES = {"left", "kicked"}
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +58,13 @@ async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
         await coro
     except NetworkError:
         logger.warning("event=telegram_transient_error operation=%s", operation)
+
+
+def _onboarding_keyboard(onboarding_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, сохранить", callback_data=f"onboard:yes:{onboarding_id}"),
+        InlineKeyboardButton("Нет, уточнить", callback_data=f"onboard:no:{onboarding_id}"),
+    ]])
 
 
 def _mentions_bot(message, bot) -> bool:
@@ -131,15 +147,24 @@ def create_telegram_application(
 
     async def _retry_pending_deliveries(bot) -> None:
         pending = getattr(message_service, "pending_suggestions", None)
-        if pending is None:
+        if pending is not None:
+            try:
+                suggestions = pending(owner_chat_id)
+            except Exception:
+                logger.exception("event=owner_delivery_scan_failed")
+                suggestions = []
+            for suggestion in suggestions:
+                await _deliver_suggestion(bot, suggestion)
+        notices = getattr(message_service, "pending_onboarding_notices", None)
+        if notices is None:
             return
         try:
-            suggestions = pending(owner_chat_id)
+            pending_notices = notices()
         except Exception:
-            logger.exception("event=owner_delivery_scan_failed")
+            logger.exception("event=onboarding_notice_scan_failed")
             return
-        for suggestion in suggestions:
-            await _deliver_suggestion(bot, suggestion)
+        for notice in pending_notices:
+            await _deliver_onboarding_notice(bot, notice)
 
     async def _delivery_retry_loop(application: Application) -> None:
         while True:
@@ -281,6 +306,96 @@ def create_telegram_application(
     async def _send_memory_proposal(bot, proposal: MemoryProposal) -> None:
         await _send(bot, chat_id=owner_chat_id, text=format_memory_proposal(proposal), reply_markup=_memory_confirmation_keyboard(proposal.draft_id))
 
+    async def _deliver_onboarding_notice(bot, notice: OnboardingNotice) -> None:
+        if not notice.needs_delivery:
+            return
+        sent = await _send(bot, chat_id=owner_chat_id, text=format_onboarding_notice(notice))
+        message_id = getattr(sent, "message_id", None)
+        recorder = getattr(message_service, "record_onboarding_notice", None)
+        if recorder is not None and message_id is not None:
+            recorder(notice.onboarding_id, message_id)
+
+    async def _deliver_onboarding_draft(bot, proposal: OnboardingDraftProposal) -> None:
+        sent = await _send(
+            bot,
+            chat_id=owner_chat_id,
+            text=format_onboarding_draft(proposal),
+            reply_markup=_onboarding_keyboard(proposal.onboarding_id),
+        )
+        message_id = getattr(sent, "message_id", None)
+        recorder = getattr(message_service, "record_onboarding_draft_message", None)
+        if recorder is not None and message_id is not None:
+            recorder(proposal.onboarding_id, message_id)
+
+    def _member_status(member) -> str:
+        return str(getattr(member, "status", "") or "").strip().casefold()
+
+    async def _bot_is_group_admin(bot, chat_id: int) -> bool:
+        bot_id = getattr(bot, "id", None)
+        getter = getattr(bot, "get_chat_member", None)
+        if bot_id is None or getter is None:
+            return False
+        try:
+            member = await getter(chat_id, bot_id)
+        except Exception:
+            logger.warning("event=telegram_admin_check_failed chat_id=%s", chat_id)
+            return False
+        return _member_status(member) in _ADMIN_STATUSES
+
+    async def _discover_unknown_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> OnboardingNotice | None:
+        starter = getattr(message_service, "begin_unconfigured_chat", None)
+        if starter is None:
+            return None
+        chat = update.effective_chat
+        if chat is None:
+            return None
+        if not await _bot_is_group_admin(context.bot, chat.id):
+            return None
+        title = getattr(chat, "title", None) or getattr(chat, "full_name", "") or str(chat.id)
+        sender = update.effective_user
+        return starter(
+            telegram_chat_id=chat.id,
+            chat_title=str(title),
+            added_by_name=getattr(sender, "full_name", "") if sender else "",
+            added_by_id=getattr(sender, "id", None) if sender else None,
+        )
+
+    async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        event = getattr(update, "my_chat_member", None)
+        if event is None:
+            return
+        already = getattr(message_service, "is_update_processed", None)
+        if already is not None and already(update.update_id):
+            return
+        chat = getattr(event, "chat", None) or update.effective_chat
+        if chat is None or chat.id == owner_chat_id:
+            return
+        status = _member_status(getattr(event, "new_chat_member", None))
+        if status in _LEFT_STATUSES:
+            cancel = getattr(message_service, "cancel_unconfigured_chat", None)
+            if cancel is not None:
+                cancel(chat.id)
+            marker = getattr(message_service, "mark_update_processed", None)
+            if marker is not None:
+                marker(update.update_id)
+            return
+        if status not in _ADMIN_STATUSES:
+            return
+        starter = getattr(message_service, "begin_unconfigured_chat", None)
+        if starter is None:
+            return
+        title = getattr(chat, "title", None) or getattr(chat, "full_name", "") or str(chat.id)
+        added = getattr(event, "from_user", None)
+        notice = starter(
+            telegram_chat_id=chat.id,
+            chat_title=str(title),
+            added_by_name=getattr(added, "full_name", "") if added else "",
+            added_by_id=getattr(added, "id", None) if added else None,
+            update_id=update.update_id,
+        )
+        if notice is not None and notice.needs_delivery:
+            await _deliver_onboarding_notice(context.bot, notice)
+
     async def owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         message = update.effective_message
         chat = update.effective_chat
@@ -297,6 +412,17 @@ def create_telegram_application(
             and getattr(replied_sender, "is_bot", False)
             and (bot_id is None or getattr(replied_sender, "id", None) == bot_id)
         )
+        if replied_to_this_bot and reply_id is not None:
+            onboard_brief = getattr(message_service, "handle_onboarding_brief", None)
+            if onboard_brief is not None:
+                draft = await onboard_brief(
+                    owner_chat_id, reply_id,
+                    getattr(sender, "full_name", "") or "Неизвестный владелец",
+                    message.text, update.update_id,
+                )
+                if draft is not None:
+                    await _deliver_onboarding_draft(context.bot, draft)
+                    return True
         if mentions:
             question_handler = getattr(message_service, "handle_owner_question_reply", None)
             if replied_to_this_bot and question_handler is not None and reply_id is not None:
@@ -392,6 +518,17 @@ def create_telegram_application(
         if already is not None and already(update.update_id):
             logger.info("event=telegram_update_ignored reason=already_processed update_id=%s", update.update_id)
             return
+        if chat.id != owner_chat_id:
+            monitored = getattr(message_service, "is_monitored_chat", None)
+            if monitored is not None and not monitored(chat.id):
+                notice = await _discover_unknown_chat(update, context)
+                if notice is None:
+                    logger.info("event=telegram_message_ignored reason=unknown_chat chat_id=%s", chat.id)
+                    return
+                _ingest(update, chat.id, False)
+                if notice.needs_delivery:
+                    await _deliver_onboarding_notice(context.bot, notice)
+                return
         item = _ingest(update, chat.id, chat.id == owner_chat_id)
         if await owner_reply(update, context):
             marker = getattr(message_service, "mark_update_processed", None)
@@ -419,6 +556,37 @@ def create_telegram_application(
             kind, action, raw_id = (query.data or "").split(":", 2)
             draft_id = int(raw_id)
         except (ValueError, AttributeError):
+            return
+        if kind == "onboard":
+            await _telegram_try("clear_confirmation_buttons", query.edit_message_reply_markup(reply_markup=None))
+            if action == "no":
+                rejected = getattr(message_service, "reject_onboarding", lambda _draft: None)(draft_id)
+                prompt = await _send(
+                    context.bot,
+                    chat_id=owner_chat_id,
+                    text="Что поправить в описании клиента? Ответьте на это сообщение.",
+                )
+                marker = getattr(message_service, "mark_onboarding_clarification", None)
+                if rejected is not None and marker is not None and prompt is not None and getattr(prompt, "message_id", None) is not None:
+                    marker(draft_id, prompt.message_id)
+                return
+            confirmer = getattr(message_service, "confirm_onboarding", None)
+            chat = confirmer(draft_id) if confirmer is not None else None
+            if chat is None:
+                await _send(context.bot, chat_id=owner_chat_id, text="Этот черновик уже обработан или больше недоступен.")
+                return
+            await _send(context.bot, chat_id=owner_chat_id, text=f"Чат «{chat.name}» сохранён. Разбираю накопленные сообщения.")
+            processor = getattr(message_service, "process_pending_chat", None)
+            if processor is None:
+                return
+            try:
+                suggestion = await processor(chat.telegram_chat_id, mode="catchup")
+            except Exception:
+                logger.exception("event=onboarding_catchup_failed chat_id=%s", chat.telegram_chat_id)
+                await _send(context.bot, chat_id=owner_chat_id, text=f"Чат сохранён, но разбор накопленных сообщений не удался. Чат ID: {chat.telegram_chat_id}.")
+                return
+            if suggestion is not None:
+                await _deliver_suggestion(context.bot, suggestion)
             return
         if kind == "memory":
             await _telegram_try("clear_confirmation_buttons", query.edit_message_reply_markup(reply_markup=None))
@@ -459,7 +627,8 @@ def create_telegram_application(
 
     application = Application.builder().token(token.strip()).post_init(_post_init).post_stop(_post_stop).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, queue_message))
-    application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^(learn|memory):(yes|no):\d+$"))
+    application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^(learn|memory|onboard):(yes|no):\d+$"))
+    application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("undo", undo_command))
     return application
