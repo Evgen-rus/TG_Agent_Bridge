@@ -10,6 +10,10 @@ runtime/
 chats/*
 !chats/.gitkeep
 
+# Pytest basetemp leftovers
+tmp/
+tmp_pytest/
+
 # Python
 __pycache__/
 *.py[cod]

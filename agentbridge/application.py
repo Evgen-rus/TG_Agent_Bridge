@@ -103,6 +103,12 @@ class AgentBridgeApplication:
         self.episode_size = max(1, episode_size)
         self._chat_locks: dict[int, asyncio.Lock] = {}
 
+    def is_update_processed(self, telegram_update_id: int) -> bool:
+        return self.store.is_update_processed(telegram_update_id)
+
+    def mark_update_processed(self, telegram_update_id: int) -> None:
+        self.store.mark_update_processed(telegram_update_id)
+
     def ingest_telegram_message(
         self,
         *,
@@ -234,8 +240,18 @@ class AgentBridgeApplication:
         pending = [item for item in self.store.pending_messages(telegram_chat_id) if item.update_id in update_ids]
         return self.store.claim_messages([item.id for item in pending])
 
-    async def _run_episode(self, chat: ChatConfig, messages: list[IncomingMessage], *, notify: bool) -> Suggestion | None:
-        internal, external = self._split_internal_messages(messages)
+    async def _run_episode(
+        self,
+        chat: ChatConfig,
+        messages: list[IncomingMessage],
+        *,
+        notify: bool,
+        ignore_internal_filter: bool = False,
+    ) -> Suggestion | None:
+        if ignore_internal_filter:
+            internal, external = [], messages
+        else:
+            internal, external = self._split_internal_messages(messages)
         for item in internal:
             self.store.record_internal_context(
                 chat.telegram_chat_id, chat.name, item.sender_name.strip() or "Внутренний участник", item.text.strip(),
@@ -253,7 +269,8 @@ class AgentBridgeApplication:
             )
         rules = self.store.active_rule_texts(chat.telegram_chat_id)
         thread_id = self.store.get_thread_id(chat.telegram_chat_id)
-        context_pack = self._context_pack(chat, episode=combined_message)
+        exclude_ids = {item.update_id for item in messages if item.update_id is not None}
+        context_pack = self._context_pack(chat, episode=combined_message, exclude_update_ids=exclude_ids)
         logger.info(
             "event=codex_suggest_start chat_id=%s chat=%r batch_size=%d rule_count=%d thread=%s notify=%s",
             chat.telegram_chat_id, chat.name, len(messages), len(rules), "resume" if thread_id else "new", notify,
@@ -322,9 +339,19 @@ class AgentBridgeApplication:
             sections.append("Недавний внутренний контекст (это не сообщение клиента):\n" + "\n".join(f"- {item}" for item in internal))
         return "\n\n".join(sections)
 
-    def _context_pack(self, chat: ChatConfig, *, episode: str = "") -> str:
+    def _context_pack(
+        self,
+        chat: ChatConfig,
+        *,
+        episode: str = "",
+        exclude_update_ids: set[int] | None = None,
+    ) -> str:
         state = self.store.get_chat_state(chat.telegram_chat_id)
-        recent = self.store.recent_messages(chat.telegram_chat_id)
+        skipped = exclude_update_ids or set()
+        recent = [
+            item for item in self.store.recent_messages(chat.telegram_chat_id)
+            if item.update_id not in skipped
+        ]
         experience = self.store.recent_experience(chat.telegram_chat_id)
         parts = [
             f"Wiki:\n{chat.wiki or '(пусто)'}",
@@ -484,27 +511,31 @@ class AgentBridgeApplication:
         chat = self.registry.get(question.telegram_chat_id)
         if chat is None:
             return None
-        self.store.answer_owner_question(question.id)
-        if update_id is not None:
-            self.store.mark_update_processed(update_id)
         state = self.store.get_chat_state(chat.telegram_chat_id)
         facts = list(state.get("facts") or [])
         facts.append(f"Уточнение владельца: {answer.strip()}")
         state["facts"] = facts
         self.store.save_chat_state(chat.telegram_chat_id, state)
+        lock = self._chat_locks.setdefault(chat.telegram_chat_id, asyncio.Lock())
+        async with lock:
+            suggestion = await self._run_episode(
+                chat,
+                [IncomingMessage(
+                    "Владелец",
+                    f"Уточнение владельца по вопросу «{question.question}»: {answer.strip()}",
+                )],
+                notify=True,
+                ignore_internal_filter=True,
+            )
+        self.store.answer_owner_question(question.id)
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
         memory_proposal = None
         if question.recommendation_id is not None:
             draft = self.store.create_memory_draft(
                 question.recommendation_id, author_user_id, author_name, answer.strip(), "chat", None,
             )
             memory_proposal = MemoryProposal(draft.id, chat.name, draft.content, draft.scope)
-        lock = self._chat_locks.setdefault(chat.telegram_chat_id, asyncio.Lock())
-        async with lock:
-            suggestion = await self._run_episode(
-                chat,
-                [IncomingMessage(author_name, f"Уточнение владельца по вопросу «{question.question}»: {answer.strip()}")],
-                notify=True,
-            )
         return QuestionReplyResult(suggestion, memory_proposal)
 
     async def clarify_feedback(self, prompt_message_id: int, feedback: str, update_id: int | None = None) -> LearningProposal | None:

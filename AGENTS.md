@@ -12,10 +12,6 @@ Read `ARCHITECTURE.md` before changing message flow, persistence, provider, or
 Telegram behavior. The current code and tests are the source of truth; update
 the architecture file when those contracts materially change.
 
-Read `ARCHITECTURE.md` before changing message flow, persistence, provider, or
-Telegram behavior. The current code and tests are the source of truth; update
-the architecture file when those contracts materially change.
-
 ## Required behavior
 
 - Never send an automatic reply to a client/monitored chat. The only outbound

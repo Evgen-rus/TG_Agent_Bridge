@@ -32,10 +32,11 @@ defaults to 20 seconds. Human messages received in the same monitored chat
 during that window, including messages from different people, are analysed
 together as one episode. Separate chats always use separate batches.
 
-After downtime, `CATCHUP_IDLE_SECONDS` (2 by default) waits for Telegram's
-stored updates to land in SQLite, then catch-up processes the pending sequence.
-A large backlog is split into ordered episodes of `CATCHUP_EPISODE_SIZE`
-messages. Only the last episode may notify the owner.
+After downtime, polling starts with live analysis off. Incoming backlog is
+saved to SQLite first. `CATCHUP_IDLE_SECONDS` (2 by default) waits until that
+stream goes quiet, then catch-up processes the pending sequence. A large
+backlog is split into ordered episodes of `CATCHUP_EPISODE_SIZE` messages.
+Only the last episode may notify the owner. Live debounce begins after catch-up.
 
 The globally installed `codex` command is optional for this project: the
 `openai-codex` package includes its compatible runtime. Authentication is still

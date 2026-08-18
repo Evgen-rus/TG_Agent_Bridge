@@ -58,13 +58,24 @@ async def test_ask_owner_creates_a_linked_question(tmp_path, chat_registry) -> N
     assert question.telegram_chat_id == -100123456
     assert "Тестовый период" in question.question
 
-    service = AgentBridgeApplication(chat_registry, store, ActionProvider(AgentReply("t", "Тест ещё действует", "Ок", action=AgentAction.REPLY)), 7654321)
-    answered = await service.handle_owner_question_reply(7654321, 9001, 42, "Owner", "Да, тест ещё действует")
+    service = AgentBridgeApplication(chat_registry, store, ActionProvider(AgentReply("t", "Тест ещё действует", "Ок, продолжаем", action=AgentAction.REPLY)), 7654321)
+    answered = await service.handle_owner_question_reply(
+        7654321, 9001, 42, "Евгений Расюк", "Да, тест ещё действует", update_id=701,
+    )
     assert answered is not None
+    assert answered.suggestion is not None
+    assert answered.suggestion.action == AgentAction.REPLY
+    assert answered.suggestion.suggested_reply == "Ок, продолжаем"
     assert answered.memory_proposal is not None
     assert answered.memory_proposal.scope == "chat"
     assert store.confirm_memory_draft(answered.memory_proposal.draft_id) is not None
     assert "Да, тест ещё действует" in store.active_memory_texts(-100123456, None)
+    assert store.is_update_processed(701) is True
+    repeat = await service.handle_owner_question_reply(
+        7654321, 9001, 42, "Евгений Расюк", "Да, тест ещё действует", update_id=701,
+    )
+    assert repeat is None
+    assert len(service.provider.calls) == 1
 
 
 @pytest.mark.asyncio

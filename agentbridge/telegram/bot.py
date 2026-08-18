@@ -95,6 +95,7 @@ def create_telegram_application(
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
     retry_task: asyncio.Task[None] | None = None
+    recovery_task: asyncio.Task[None] | None = None
     live_enabled = catchup_idle_seconds <= 0
     last_ingest_at = time.monotonic()
 
@@ -168,20 +169,53 @@ def create_telegram_application(
                 return
             await asyncio.sleep(0.05)
 
+    async def _wait_until_polling_ready(application: Application) -> None:
+        # post_init runs before start_polling; wait until Telegram can actually deliver backlog.
+        deadline = time.monotonic() + catchup_max_seconds
+        while time.monotonic() < deadline:
+            updater = getattr(application, "updater", None)
+            updater_running = bool(updater is not None and getattr(updater, "running", False))
+            if updater_running or getattr(application, "running", False):
+                nested = time.monotonic() + 5
+                while time.monotonic() < nested and not getattr(application, "running", False):
+                    if updater is not None and getattr(updater, "running", False) and getattr(application, "running", False):
+                        break
+                    await asyncio.sleep(0.05)
+                return
+            await asyncio.sleep(0.05)
+
+    async def _startup_recovery(application: Application) -> None:
+        nonlocal live_enabled
+        try:
+            await _wait_until_polling_ready(application)
+            await _wait_for_ingest_idle()
+            await _run_catchup(application.bot)
+        finally:
+            live_enabled = True
+        leftover = getattr(message_service, "pending_client_chat_ids", None)
+        if leftover is None:
+            return
+        for chat_id in leftover():
+            await _analyze_chat(chat_id, [], application.bot)
+
     async def _post_init(application: Application) -> None:
-        nonlocal retry_task, live_enabled, last_ingest_at
+        nonlocal retry_task, recovery_task, last_ingest_at, live_enabled
         last_ingest_at = time.monotonic()
-        await _wait_for_ingest_idle()
-        await _run_catchup(application.bot)
-        live_enabled = True
+        if catchup_idle_seconds > 0:
+            live_enabled = False
+            recovery_task = asyncio.create_task(_startup_recovery(application), name="agentbridge-startup-recovery")
+        else:
+            live_enabled = True
         retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
 
     async def _post_stop(application: Application) -> None:
-        nonlocal retry_task
-        if retry_task is None:
-            return
-        retry_task.cancel()
-        await asyncio.gather(retry_task, return_exceptions=True)
+        nonlocal retry_task, recovery_task
+        for task in (recovery_task, retry_task):
+            if task is None:
+                continue
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        recovery_task = None
         retry_task = None
 
     def _ingest(update: Update, chat_id: int, is_owner_chat: bool) -> IncomingMessage:
@@ -354,8 +388,15 @@ def create_telegram_application(
         if sender is not None and sender.is_bot:
             logger.info("event=telegram_message_ignored reason=bot chat_id=%s", chat.id)
             return
+        already = getattr(message_service, "is_update_processed", None)
+        if already is not None and already(update.update_id):
+            logger.info("event=telegram_update_ignored reason=already_processed update_id=%s", update.update_id)
+            return
         item = _ingest(update, chat.id, chat.id == owner_chat_id)
         if await owner_reply(update, context):
+            marker = getattr(message_service, "mark_update_processed", None)
+            if marker is not None:
+                marker(update.update_id)
             return
         if not live_enabled:
             logger.info("event=client_message_deferred_catchup chat_id=%s update_id=%s", chat.id, update.update_id)

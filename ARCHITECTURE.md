@@ -24,11 +24,14 @@ OWNER_CHAT_ID
   -> ordinary human conversation is ignored
 ```
 
-Telegram updates accumulated while the process was offline are ingested, then
-processed as catch-up episodes. The batching window is `MESSAGE_BATCH_SECONDS`
-(20 seconds by default). `CATCHUP_IDLE_SECONDS` waits for the startup backlog
-to land in SQLite before catch-up runs. Messages from different Telegram chats
-are never placed in one episode.
+Telegram updates accumulated while the process was offline are ingested first,
+then processed as catch-up episodes. `post_init` does not wait for catch-up:
+polling starts, backlog is stored, live analysis stays off until a short idle
+window after the last ingested update, then catch-up runs. Only the final
+episode may notify the owner. `MESSAGE_BATCH_SECONDS` (20 by default) is the
+live debounce. `CATCHUP_IDLE_SECONDS` is the startup quiet window.
+`CATCHUP_EPISODE_SIZE` splits a large backlog. Different chats never share an
+episode.
 
 A large backlog is split into ordered episodes (`CATCHUP_EPISODE_SIZE`). Only
 the final episode may notify the owner, so stale early questions do not create

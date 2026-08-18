@@ -348,21 +348,26 @@ class ChatThreadStore:
 
     def is_update_processed(self, telegram_update_id: int) -> bool:
         with self._connect() as connection:
-            inbox = connection.execute(
-                "SELECT processing_status FROM telegram_messages WHERE update_id=?",
-                (telegram_update_id,),
-            ).fetchone()
-            if inbox is not None:
-                return inbox["processing_status"] == "processed"
             row = connection.execute(
                 "SELECT 1 FROM processed_updates WHERE telegram_update_id = ?",
                 (telegram_update_id,),
             ).fetchone()
-        return row is not None
+            if row is not None:
+                return True
+            inbox = connection.execute(
+                "SELECT processing_status FROM telegram_messages WHERE update_id=?",
+                (telegram_update_id,),
+            ).fetchone()
+        return inbox is not None and inbox["processing_status"] == "processed"
 
     def mark_update_processed(self, telegram_update_id: int) -> None:
         with self._connect() as connection:
             connection.execute("INSERT OR IGNORE INTO processed_updates VALUES (?, ?)", (telegram_update_id, _now()))
+            connection.execute(
+                """UPDATE telegram_messages SET processing_status='processed'
+                WHERE update_id=? AND processing_status IN ('ignored', 'pending', 'processed')""",
+                (telegram_update_id,),
+            )
 
     def record_internal_context(self, telegram_chat_id: int, chat_name: str, sender_name: str, message_text: str) -> None:
         with self._connect() as connection:

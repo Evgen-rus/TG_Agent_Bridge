@@ -32,6 +32,7 @@ class FakeProvider:
                 "wiki": wiki,
                 "rules": rules,
                 "thread_id": thread_id,
+                **kwargs,
             }
         )
         return AgentReply(
@@ -137,3 +138,17 @@ async def test_confirmed_chat_memory_and_internal_context_are_sent_only_to_that_
     wiki = str(provider.calls[-1]["wiki"])
     assert "Клиенту нужен договор до запуска проекта." in wiki
     assert "Юрист уже получил реквизиты." in wiki
+
+
+@pytest.mark.asyncio
+async def test_current_episode_is_not_repeated_in_recent_history(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = FakeProvider()
+    service = AgentBridgeApplication(chat_registry, store, provider)
+    await service.handle_message(-100123456, "Alice", "Need the docs", update_id=11)
+    await service.handle_message(-100123456, "Alice", "And a timeline", update_id=12)
+    pack = str(provider.calls[-1]["context_pack"])
+    history, _, current = pack.partition("Текущий эпизод:")
+    assert "Need the docs" in history
+    assert "And a timeline" not in history
+    assert "And a timeline" in current

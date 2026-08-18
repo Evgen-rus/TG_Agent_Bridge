@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import time
 
 import pytest
 from telegram.error import NetworkError
@@ -329,3 +330,66 @@ async def test_live_pending_chat_path_still_sends_only_to_the_owner() -> None:
     assert service.modes == ["live"]
     assert [item["chat_id"] for item in bot.sent] == [owner_chat_id]
     assert all(item["chat_id"] != source_chat_id for item in bot.sent)
+
+
+@dataclass
+class CatchupLifecycleService:
+    catchups: list[str] = field(default_factory=list)
+    lives: list[str] = field(default_factory=list)
+    ingested: list[int] = field(default_factory=list)
+    catchup_gate: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def ingest_telegram_message(self, **kwargs):
+        self.ingested.append(kwargs["update_id"])
+        return True
+
+    async def catch_up(self):
+        await self.catchup_gate.wait()
+        self.catchups.append("run")
+        return []
+
+    def pending_client_chat_ids(self):
+        return []
+
+    async def process_pending_chat(self, telegram_chat_id, *, mode="live"):
+        self.lives.append(mode)
+        return None
+
+    async def handle_messages(self, telegram_chat_id, messages):
+        self.lives.append("handle")
+        return None
+
+
+@pytest.mark.asyncio
+async def test_startup_defers_live_until_after_polling_and_catchup() -> None:
+    service = CatchupLifecycleService()
+    application = create_telegram_application(
+        token="test-token",
+        owner_chat_id=7654321,
+        message_service=service,
+        batch_seconds=0,
+        catchup_idle_seconds=0.15,
+        delivery_retry_seconds=5,
+    )
+    bot = FakeBot()
+    application.bot = bot
+    application._running = True
+    callback = _message_callback(application)
+
+    await callback(FakeUpdate(FakeMessage("one"), FakeChat(-1001), FakeUser(), 201), FakeContext(bot))
+    await callback(FakeUpdate(FakeMessage("two"), FakeChat(-1001), FakeUser(), 202), FakeContext(bot))
+    assert service.ingested == [201, 202]
+    assert service.lives == []
+    assert service.catchups == []
+
+    started = time.monotonic()
+    await application.post_init(application)
+    assert time.monotonic() - started < 0.1
+    assert service.catchups == []
+    assert service.lives == []
+
+    service.catchup_gate.set()
+    await asyncio.sleep(0.25)
+    assert service.catchups == ["run"]
+    assert service.lives == []
+    await application.post_stop(application)

@@ -222,6 +222,34 @@ async def test_reply_to_human_in_owner_group_stays_ordinary_conversation() -> No
     assert bot.sent == []
 
 
+@dataclass
+class DedupingLearningService(FakeLearningService):
+    processed: set[int] = field(default_factory=set)
+
+    def is_update_processed(self, update_id: int) -> bool:
+        return update_id in self.processed
+
+    def mark_update_processed(self, update_id: int) -> None:
+        self.processed.add(update_id)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_owner_update_id_does_not_repeat_learning() -> None:
+    service = DedupingLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    update = FakeUpdate(
+        FakeMessage("Make it warmer", FakeReply(9001, FakeUser(777, "AgentBridge", True))),
+        FakeChat(7654321),
+        FakeUser(),
+        555,
+    )
+    await _text_callback(application)(update, FakeContext(bot))
+    await _text_callback(application)(update, FakeContext(bot))
+    assert len(service.feedback_calls) == 1
+    assert service.is_update_processed(555) is True
+
+
 def _yes_callback_update(*, owner_chat_id: int = 7654321, draft_id: int = 2, answer_error=None, edit_error=None) -> FakeCallbackUpdate:
     query = FakeCallbackQuery(
         data=f"learn:yes:{draft_id}",
