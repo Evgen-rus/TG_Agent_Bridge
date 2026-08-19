@@ -39,8 +39,8 @@ the architecture file when those contracts materially change.
 - Treat SQLite history and `chat_state` as the durable situation source. The
   Codex thread is continuity only.
 - Preserve the per-chat batching behavior and keep different chats independent.
-- In the owner chat, invoke the agent only on reply-to-bot or an explicit
-  mention/tag.
+- In the owner chat, invoke the agent on reply-to-bot, an explicit
+  mention/tag, or a global memory prefix (`Общий контекст:`).
 - Never log or commit secrets. Telegram tokens must remain redacted in logs.
 
 ## Change discipline

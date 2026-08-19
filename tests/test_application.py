@@ -143,6 +143,22 @@ async def test_confirmed_chat_memory_and_internal_context_are_sent_only_to_that_
 
 
 @pytest.mark.asyncio
+async def test_standalone_global_memory_does_not_need_a_client_chat(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = FakeProvider()
+    service = AgentBridgeApplication(chat_registry, store, provider)
+    proposal = await service.handle_owner_context(
+        7654321, None, 42, "Owner",
+        "Общий контекст: фраза про отдел маркетинга утверждена для робота.",
+    )
+    assert proposal is not None and proposal.scope == "global"
+    assert service.confirm_memory(proposal.draft_id) is not None
+    await service.handle_message(-100123456, "Alice", "What is the next step?")
+    pack = str(provider.calls[-1]["context_pack"])
+    assert "фраза про отдел маркетинга утверждена для робота" in pack
+
+
+@pytest.mark.asyncio
 async def test_current_episode_is_not_repeated_in_recent_history(tmp_path, chat_registry) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
     provider = FakeProvider()

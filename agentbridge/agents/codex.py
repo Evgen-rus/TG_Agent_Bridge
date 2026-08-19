@@ -10,8 +10,6 @@ from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis
 
 _STRING = {"type": "string"}
 _STRING_LIST = {"type": "array", "items": {"type": "string"}}
-# Codex/OpenAI требуют additionalProperties=false у каждого object.
-# type: ["object", "null"] этого не даёт — нужен anyOf с явной object-веткой.
 _CANDIDATE_STATE_PROPERTIES = {
     "summary": _STRING,
     "stage": _STRING,
@@ -27,19 +25,68 @@ _CANDIDATE_STATE_PROPERTIES = {
     "next_step": _STRING,
     "participants": _STRING_LIST,
 }
+
+
+def _nullable(schema: dict) -> dict:
+    # Официальный способ optional-поля: ключ обязателен, значение может быть null.
+    return {**schema, "type": [schema["type"], "null"]}
+
+
+def _schema_types(schema: dict) -> list[str]:
+    raw = schema.get("type")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    return [str(item) for item in raw]
+
+
+def validate_structured_output_schema(schema: dict, *, name: str = "schema") -> None:
+    """Codex output_schema идёт в OpenAI Structured Outputs: строгий subset JSON Schema."""
+    if not isinstance(schema, dict):
+        raise ValueError(f"{name}: schema must be an object")
+    if schema.get("anyOf"):
+        raise ValueError(f"{name}: root must be type=object, not anyOf")
+    types = _schema_types(schema)
+    if types and types != ["object"]:
+        raise ValueError(f"{name}: root must be type=object")
+    _validate_schema_node(schema, name)
+
+
+def _validate_schema_node(schema: object, path: str) -> None:
+    if not isinstance(schema, dict):
+        return
+    types = _schema_types(schema)
+    if "object" in types and len(types) > 1:
+        raise ValueError(
+            f"{path}: nullable object cannot use type=['object', 'null']; "
+            "use a required object with nullable fields, or anyOf with additionalProperties=false"
+        )
+    is_object = "object" in types or "properties" in schema
+    if is_object:
+        if schema.get("additionalProperties") is not False:
+            raise ValueError(f"{path}: additionalProperties must be false")
+        properties = schema.get("properties") or {}
+        required = schema.get("required")
+        missing = set(properties) - set(required or [])
+        extra = set(required or []) - set(properties)
+        if not isinstance(required, list) or missing or extra:
+            raise ValueError(
+                f"{path}: required must list every properties key; missing={sorted(missing)} extra={sorted(extra)}"
+            )
+        for key, child in properties.items():
+            _validate_schema_node(child, f"{path}.properties.{key}")
+    if "items" in schema:
+        _validate_schema_node(schema["items"], f"{path}.items")
+    for index, option in enumerate(schema.get("anyOf") or []):
+        _validate_schema_node(option, f"{path}.anyOf[{index}]")
+
+
 _CANDIDATE_STATE_SCHEMA = {
-    "anyOf": [
-        {
-            "type": "object",
-            "properties": {
-                key: {"anyOf": [schema, {"type": "null"}]}
-                for key, schema in _CANDIDATE_STATE_PROPERTIES.items()
-            },
-            "required": list(_CANDIDATE_STATE_PROPERTIES),
-            "additionalProperties": False,
-        },
-        {"type": "null"},
-    ]
+    "type": "object",
+    "properties": {key: _nullable(schema) for key, schema in _CANDIDATE_STATE_PROPERTIES.items()},
+    "required": list(_CANDIDATE_STATE_PROPERTIES),
+    "additionalProperties": False,
 }
 _SUGGEST_SCHEMA = {
     "type": "object",
@@ -58,6 +105,7 @@ _SUGGEST_SCHEMA = {
     "required": [
         "action", "situation", "suggested_reply", "observation", "unknowns",
         "owner_question", "should_notify", "confidence", "needs_critique",
+        "candidate_state",
     ],
     "additionalProperties": False,
 }
@@ -145,6 +193,13 @@ _ONBOARDING_SCHEMA = {
     "required": ["name", "wiki", "directory_slug"],
     "additionalProperties": False,
 }
+for _schema_name, _schema in (
+    ("suggest", _SUGGEST_SCHEMA),
+    ("feedback", _FEEDBACK_SCHEMA),
+    ("owner_query", _OWNER_QUERY_SCHEMA),
+    ("onboarding", _ONBOARDING_SCHEMA),
+):
+    validate_structured_output_schema(_schema, name=_schema_name)
 _ONBOARDING_INSTRUCTIONS = """Ты готовишь карточку нового клиентского Telegram-чата для команды.
 Имя чата обязательно возьми из текста владельца, а не из названия группы, если владелец назвал клиента.
 wiki.md — стабильный контекст на русском: кто клиент, участники если названы, чем занимаемся, что обычно обсуждается.

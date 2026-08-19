@@ -146,7 +146,7 @@ class ChatOnboarding:
 @dataclass(frozen=True)
 class MemoryDraft:
     id: int
-    recommendation_id: int
+    recommendation_id: int | None
     author_user_id: int
     author_name: str
     content: str
@@ -260,12 +260,13 @@ class ChatThreadStore:
                     ON internal_context_messages(telegram_chat_id, id DESC);
                 CREATE TABLE IF NOT EXISTS memory_drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    recommendation_id INTEGER NOT NULL,
+                    recommendation_id INTEGER,
                     author_user_id INTEGER NOT NULL,
                     author_name TEXT NOT NULL,
                     content TEXT NOT NULL,
                     scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
                     project_key TEXT,
+                    kind TEXT NOT NULL DEFAULT 'fact',
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -401,6 +402,40 @@ class ChatThreadStore:
             for name, definition in specs:
                 if name not in existing:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        ChatThreadStore._ensure_memory_drafts_allow_unlinked(connection)
+
+    @staticmethod
+    def _ensure_memory_drafts_allow_unlinked(connection: sqlite3.Connection) -> None:
+        info = list(connection.execute("PRAGMA table_info(memory_drafts)"))
+        if not info:
+            return
+        rec = next((row for row in info if row[1] == "recommendation_id"), None)
+        if rec is None or int(rec[3]) == 0:
+            return
+        connection.execute(
+            """CREATE TABLE memory_drafts_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recommendation_id INTEGER,
+                author_user_id INTEGER NOT NULL,
+                author_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
+                project_key TEXT,
+                kind TEXT NOT NULL DEFAULT 'fact',
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(recommendation_id) REFERENCES recommendations(id)
+            )"""
+        )
+        existing = [row[1] for row in info]
+        copied = [name for name in existing if name != "id"]
+        columns = ", ".join(["id", *copied])
+        connection.execute(
+            f"INSERT INTO memory_drafts_new ({columns}) SELECT {columns} FROM memory_drafts"
+        )
+        connection.execute("DROP TABLE memory_drafts")
+        connection.execute("ALTER TABLE memory_drafts_new RENAME TO memory_drafts")
 
     def get_thread_id(self, telegram_chat_id: int) -> str | None:
         with self._connect() as connection:
@@ -739,7 +774,7 @@ class ChatThreadStore:
         return rule
 
     def create_memory_draft(
-        self, recommendation_id: int, author_user_id: int, author_name: str,
+        self, recommendation_id: int | None, author_user_id: int, author_name: str,
         content: str, scope: str, project_key: str | None, kind: str = "fact",
     ) -> MemoryDraft:
         now = _now()
@@ -771,8 +806,11 @@ class ChatThreadStore:
         draft = self.get_memory_draft(draft_id)
         if draft is None or draft.status != "pending":
             return None
-        recommendation = self.get_recommendation(draft.recommendation_id)
-        if recommendation is None:
+        recommendation = (
+            self.get_recommendation(draft.recommendation_id)
+            if draft.recommendation_id is not None else None
+        )
+        if recommendation is None and draft.scope != "global":
             return None
         with self._connect() as connection:
             claimed = connection.execute(
@@ -781,7 +819,7 @@ class ChatThreadStore:
             )
             if claimed.rowcount != 1:
                 return None
-            chat_id = recommendation.telegram_chat_id if draft.scope == "chat" else None
+            chat_id = recommendation.telegram_chat_id if draft.scope == "chat" and recommendation is not None else None
             connection.execute(
                 """INSERT INTO memory_entries
                 (telegram_chat_id, project_key, content, scope, kind, author_user_id, author_name, source_draft_id, status, created_at)

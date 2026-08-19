@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from agentbridge.storage.sqlite import ChatThreadStore
 
 
@@ -117,3 +119,38 @@ def test_confirmed_project_and_global_memory_are_scoped(tmp_path) -> None:
     assert store.active_memory_texts(-1001, "pilot") == ["Project fact", "Global fact", "Local fact"]
     assert store.active_memory_texts(-1002, "pilot") == ["Project fact", "Global fact"]
     assert store.active_memory_texts(-1002, None) == ["Global fact"]
+
+
+def test_unlinked_global_memory_draft_can_be_confirmed(tmp_path) -> None:
+    store = ChatThreadStore(tmp_path / "runtime" / "agentbridge.sqlite3")
+    draft = store.create_memory_draft(None, 1, "Owner", "Утверждённая фраза для робота", "global", None)
+    assert draft.recommendation_id is None
+    assert store.confirm_memory_draft(draft.id) is not None
+    assert store.active_memory_texts(-1001, None) == ["Утверждённая фраза для робота"]
+    assert store.active_memory_texts(-1002, "pilot") == ["Утверждённая фраза для робота"]
+
+
+def test_legacy_memory_drafts_accept_unlinked_global(tmp_path) -> None:
+    path = tmp_path / "runtime" / "agentbridge.sqlite3"
+    path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE memory_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recommendation_id INTEGER NOT NULL,
+            author_user_id INTEGER NOT NULL,
+            author_name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
+            project_key TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    connection.commit()
+    connection.close()
+    store = ChatThreadStore(path)
+    draft = store.create_memory_draft(None, 1, "Owner", "Global from legacy db", "global", None)
+    assert store.confirm_memory_draft(draft.id) is not None
+    assert store.active_memory_texts(-1001, None) == ["Global from legacy db"]

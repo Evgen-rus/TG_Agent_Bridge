@@ -86,6 +86,21 @@ def _mentions_bot(message, bot) -> bool:
     return False
 
 
+def _plain_owner_text(text: str | None, bot) -> str:
+    """Снимает ведущий @тег бота, чтобы «Общий контекст:» работал и с тегом, и без."""
+    stripped = (text or "").strip()
+    names = ["agent"]
+    username = getattr(bot, "username", None)
+    if username:
+        names.append(str(username))
+    lowered = stripped.casefold()
+    for name in names:
+        marker = f"@{str(name).casefold()}"
+        if lowered.startswith(marker):
+            return stripped[len(marker):].strip()
+    return stripped
+
+
 def _telegram_date(message) -> str:
     date = getattr(message, "date", None)
     if date is None:
@@ -499,6 +514,23 @@ def create_telegram_application(
                     if draft is not None:
                         await _deliver_onboarding_draft(context.bot, draft)
                         return True
+        command_text = _plain_owner_text(message.text, context.bot)
+        is_global_command = getattr(message_service, "is_global_memory_command", lambda _: False)
+        if is_global_command(command_text):
+            # Префикс сам вызывает бота: тег не обязателен, клиентский чат не нужен.
+            context_handler = getattr(message_service, "handle_owner_context", None)
+            proposal = await context_handler(
+                owner_chat_id, reply_id if replied_to_this_bot else None, getattr(sender, "id", 0),
+                getattr(sender, "full_name", "") or "Неизвестный владелец", command_text, update.update_id,
+            ) if context_handler is not None else None
+            if proposal is None:
+                await _send(
+                    context.bot, chat_id=owner_chat_id,
+                    text="Напишите факт сразу после «Общий контекст:».",
+                )
+                return True
+            await _send_memory_proposal(context.bot, proposal)
+            return True
         if mentions:
             question_handler = getattr(message_service, "handle_owner_question_reply", None)
             if replied_to_this_bot and question_handler is not None and reply_id is not None:

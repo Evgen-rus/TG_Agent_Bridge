@@ -607,8 +607,13 @@ class AgentBridgeApplication:
         lowered = text.strip().casefold()
         return any(lowered.startswith(prefix) for prefix, _ in _MEMORY_PREFIXES)
 
+    @staticmethod
+    def is_global_memory_command(text: str) -> bool:
+        lowered = text.strip().casefold()
+        return any(lowered.startswith(prefix) for prefix, scope in _MEMORY_PREFIXES if scope == "global")
+
     async def handle_owner_context(
-        self, owner_chat_id: int, reply_to_message_id: int, author_user_id: int,
+        self, owner_chat_id: int, reply_to_message_id: int | None, author_user_id: int,
         author_name: str, text: str, update_id: int | None = None,
     ) -> MemoryProposal | None:
         if update_id is not None and self.store.is_update_processed(update_id):
@@ -617,9 +622,19 @@ class AgentBridgeApplication:
         if command is None:
             return None
         scope, content = command
-        recommendation = self.store.get_recommendation_by_owner_message(owner_chat_id, reply_to_message_id)
+        recommendation = (
+            self.store.get_recommendation_by_owner_message(owner_chat_id, reply_to_message_id)
+            if reply_to_message_id is not None else None
+        )
         if recommendation is None:
-            return None
+            if scope != "global":
+                return None
+            draft = self.store.create_memory_draft(
+                None, author_user_id, author_name, content, "global", None,
+            )
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return MemoryProposal(draft.id, "все чаты", draft.content, draft.scope)
         chat = self.registry.get(recommendation.telegram_chat_id)
         project_key = chat.memory_project if chat is not None else None
         if scope == "project" and not project_key:
@@ -644,6 +659,8 @@ class AgentBridgeApplication:
         draft = self.store.confirm_memory_draft(draft_id)
         if draft is None:
             return None
+        if draft.recommendation_id is None:
+            return MemoryProposal(draft.id, "все чаты", draft.content, draft.scope)
         recommendation = self.store.get_recommendation(draft.recommendation_id)
         return None if recommendation is None else MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
 

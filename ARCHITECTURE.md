@@ -21,6 +21,8 @@ OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
   -> reply to a proactive question: fill the knowledge gap
   -> mention/tag of the bot: assistant query
+  -> «Общий контекст: …» in the owner chat: confirmable global memory,
+     without a client chat or a reply to a recommendation
   -> reply to a “which chat?” clarification or to the last assistant answer:
      continue that query
   -> reply to a new-group card: client brief, then confirm wiki draft
@@ -137,7 +139,8 @@ client automatically.
 - A message is not marked processed until episode logic finishes. A model
   failure leaves the inbox row pending.
 - Tokens and credentials never appear unredacted in logs or tracked files.
-- Owner-group conversation invokes the agent only on reply-to-bot or an
-  explicit mention/tag; ordinary owner-group talk is ignored.
+- Owner-group conversation invokes the agent on reply-to-bot, an explicit
+  mention/tag, or a global memory prefix (`Общий контекст:`). Ordinary
+  owner-group talk is ignored.
 - `AgentProvider` is the only application-to-agent dependency; Telegram code
   must not depend on Codex SDK details.

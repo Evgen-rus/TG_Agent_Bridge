@@ -11,9 +11,13 @@ from agentbridge.agents.codex import (
     CodexProvider,
     _CANDIDATE_STATE_PROPERTIES,
     _CRITIQUE_INSTRUCTIONS,
+    _FEEDBACK_SCHEMA,
     _INSTRUCTIONS,
+    _ONBOARDING_SCHEMA,
     _OWNER_QUERY_INSTRUCTIONS,
+    _OWNER_QUERY_SCHEMA,
     _SUGGEST_SCHEMA,
+    validate_structured_output_schema,
 )
 from agentbridge.application import AgentBridgeApplication
 from agentbridge.storage.sqlite import ChatThreadStore
@@ -280,10 +284,33 @@ async def test_codex_critique_is_ephemeral_and_keeps_main_thread_id(fake_codex) 
     assert "thread-critique" not in fake_codex.resumes
 
 
-def test_suggest_schema_closes_candidate_state_object() -> None:
+def test_codex_output_schemas_match_structured_outputs_subset() -> None:
+    for schema in (_SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _ONBOARDING_SCHEMA):
+        validate_structured_output_schema(schema)
     field = _SUGGEST_SCHEMA["properties"]["candidate_state"]
-    object_branch = next(option for option in field["anyOf"] if option.get("type") == "object")
-    assert object_branch["additionalProperties"] is False
-    assert set(object_branch["required"]) == set(_CANDIDATE_STATE_PROPERTIES)
-    assert set(object_branch["properties"]) == set(_CANDIDATE_STATE_PROPERTIES)
-    assert {"type": "null"} in field["anyOf"]
+    assert field["additionalProperties"] is False
+    assert set(field["required"]) == set(_CANDIDATE_STATE_PROPERTIES)
+    assert field["properties"]["summary"]["type"] == ["string", "null"]
+    assert field["properties"]["facts"]["type"] == ["array", "null"]
+    assert set(_SUGGEST_SCHEMA["required"]) == set(_SUGGEST_SCHEMA["properties"])
+
+
+def test_structured_output_schema_rejects_the_errors_we_already_hit() -> None:
+    with pytest.raises(ValueError, match="type=\\['object', 'null'\\]"):
+        validate_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"candidate_state": {"type": ["object", "null"]}},
+                "required": ["candidate_state"],
+                "additionalProperties": False,
+            }
+        )
+    with pytest.raises(ValueError, match="Missing 'candidate_state'|missing="):
+        validate_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"action": {"type": "string"}, "candidate_state": {"type": "null"}},
+                "required": ["action"],
+                "additionalProperties": False,
+            }
+        )

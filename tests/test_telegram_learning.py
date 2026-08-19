@@ -90,9 +90,18 @@ class FakeLearningService:
     def is_memory_context_command(text: str) -> bool:
         return text.startswith("Контекст:")
 
+    @staticmethod
+    def is_global_memory_command(text: str) -> bool:
+        return text.casefold().startswith("общий контекст:")
+
     async def handle_owner_context(self, owner_chat_id, reply_to_message_id, author_user_id, author_name, text, update_id=None):
+        content = text.split(":", 1)[-1].strip() if ":" in text else text.strip()
+        if not content:
+            return None
         self.context_calls.append({"reply_to_message_id": reply_to_message_id, "text": text})
-        return MemoryProposal(8, "Acme", "Known fact", "chat")
+        scope = "global" if text.casefold().startswith("общий контекст:") else "chat"
+        chat_name = "все чаты" if scope == "global" else "Acme"
+        return MemoryProposal(8, chat_name, content, scope)
 
     def confirm_memory(self, draft_id: int):
         self.memory_confirm_calls.append(draft_id)
@@ -189,6 +198,58 @@ async def test_context_reply_to_bot_recommendation_creates_memory_confirmation()
     assert service.context_calls == [{"reply_to_message_id": 9001, "text": "Контекст: Клиент использует свой колл-центр."}]
     buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
     assert [button.callback_data for button in buttons] == ["memory:yes:8", "memory:no:8"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_global_context_does_not_need_reply_or_mention() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _text_callback(application)(
+        FakeUpdate(FakeMessage("Общий контекст: фраза про маркетинг утверждена."), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert service.context_calls == [{
+        "reply_to_message_id": None,
+        "text": "Общий контекст: фраза про маркетинг утверждена.",
+    }]
+    assert "для всех подключённых чатов" in bot.sent[0]["text"]
+    buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
+    assert [button.callback_data for button in buttons] == ["memory:yes:8", "memory:no:8"]
+
+
+@pytest.mark.asyncio
+async def test_mentioned_global_context_does_not_become_an_owner_query() -> None:
+    service = FakeLearningService()
+
+    async def unexpected_query(*args, **kwargs):
+        raise AssertionError("Global memory must not start an owner query")
+
+    service.handle_owner_query = unexpected_query
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _text_callback(application)(
+        FakeUpdate(FakeMessage("@agent Общий контекст: недозвон не отказ."), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert service.context_calls == [{
+        "reply_to_message_id": None,
+        "text": "Общий контекст: недозвон не отказ.",
+    }]
+    assert bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data == "memory:yes:8"
+
+
+@pytest.mark.asyncio
+async def test_empty_global_context_asks_for_the_fact() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _text_callback(application)(
+        FakeUpdate(FakeMessage("Общий контекст:"), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert service.context_calls == []
+    assert "после «Общий контекст:»" in bot.sent[0]["text"]
 
 
 @pytest.mark.asyncio

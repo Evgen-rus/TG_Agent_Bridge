@@ -103,6 +103,16 @@ confirmable memory entry:
 The bot asks for confirmation before saving the entry. Chat memory stays within
 that chat; project memory is available only to chats with the same
 `memory_project` in `config.yaml`; common memory is available everywhere.
+
+In the owner group you can add common memory without choosing a client. Write a
+new message (no reply and no @mention needed):
+
+```text
+Общий контекст: фраза про отдел маркетинга утверждена для робота.
+```
+
+The bot asks for confirmation, then stores the fact for every connected chat.
+`Контекст:` and `Контекст проекта:` still need a reply to a bot recommendation.
 Messages from the configured internal LeadRecord participants are not answered,
 but their recent text is retained as local context for later client messages.
 
