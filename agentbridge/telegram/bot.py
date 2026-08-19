@@ -7,6 +7,7 @@ from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 import time
 from typing import Protocol
 
@@ -15,6 +16,7 @@ from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
+from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, purge_expired_media
 from .formatter import (
     format_learning_proposal,
     format_memory_proposal,
@@ -23,6 +25,7 @@ from .formatter import (
     format_owner_message,
     format_rules,
 )
+from .media import describe_message_media, has_client_content, materialize_media_ref, message_text
 
 _ADMIN_STATUSES = {"administrator", "creator"}
 _LEFT_STATUSES = {"left", "kicked"}
@@ -118,6 +121,8 @@ def create_telegram_application(
     delivery_retry_seconds: float = 30.0,
     catchup_idle_seconds: float = 0.0,
     catchup_max_seconds: float = 30.0,
+    media_dir: Path | None = None,
+    media_ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS,
 ) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
@@ -227,6 +232,8 @@ def create_telegram_application(
                 return False
 
     async def _retry_pending_deliveries(bot) -> None:
+        if media_dir is not None:
+            purge_expired_media(media_dir, media_ttl_seconds)
         pending = getattr(message_service, "pending_suggestions", None)
         if pending is not None:
             try:
@@ -275,6 +282,9 @@ def create_telegram_application(
         if catchup is None:
             return
         pending_ids = getattr(message_service, "pending_client_chat_ids", None)
+        if pending_ids is not None:
+            for chat_id in pending_ids():
+                await _hydrate_chat_media(bot, chat_id)
         for _ in range(5):
             suggestions = await catchup()
             for suggestion in suggestions:
@@ -338,14 +348,20 @@ def create_telegram_application(
         message = update.effective_message
         sender = update.effective_user
         reply = getattr(message, "reply_to_message", None) if message is not None else None
+        media = describe_message_media(message)
         item = IncomingMessage(
             sender_name=getattr(sender, "full_name", "") if sender else "",
-            text=getattr(message, "text", "") if message is not None else "",
+            text=message_text(message),
             update_id=update.update_id,
             message_id=getattr(message, "message_id", None),
             sender_id=getattr(sender, "id", None),
             telegram_date=_telegram_date(message),
             reply_to_message_id=getattr(reply, "message_id", None),
+            media_kind=media.kind if media is not None else "",
+            telegram_file_id=media.file_id if media is not None else "",
+            media_mime=media.mime if media is not None else "",
+            media_filename=media.filename if media is not None else "",
+            media_group_id=media.media_group_id if media is not None else "",
         )
         ingest = getattr(message_service, "ingest_telegram_message", None)
         if ingest is not None and message is not None:
@@ -359,13 +375,36 @@ def create_telegram_application(
                 text=item.text,
                 reply_to_message_id=item.reply_to_message_id,
                 is_owner_chat=is_owner_chat,
+                media_kind=item.media_kind,
+                telegram_file_id=item.telegram_file_id,
+                media_mime=item.media_mime,
+                media_filename=item.media_filename,
+                media_group_id=item.media_group_id,
             )
             last_ingest_at = time.monotonic()
         return item
 
+    async def _hydrate_chat_media(bot, chat_id: int) -> None:
+        pending = getattr(message_service, "pending_media_downloads", None)
+        saver = getattr(message_service, "set_message_media_path", None)
+        if pending is None or saver is None or media_dir is None:
+            return
+        for row in pending(chat_id):
+            ref = MediaRef(
+                kind=row.media_kind or "document",
+                file_id=row.telegram_file_id,
+                filename=row.media_filename,
+                mime=row.media_mime,
+                media_group_id=row.media_group_id,
+            )
+            path = await materialize_media_ref(bot, ref, media_dir, row.chat_id, row.message_id)
+            if path is not None:
+                saver(row.id, str(path))
+
     async def _analyze_chat(chat_id: int, messages: list[IncomingMessage], bot) -> None:
         processor = getattr(message_service, "process_pending_chat", None)
         try:
+            await _hydrate_chat_media(bot, chat_id)
             if processor is not None:
                 recommendation = await processor(chat_id, mode="live")
             else:
@@ -627,7 +666,7 @@ def create_telegram_application(
     async def queue_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         chat = update.effective_chat
-        if message is None or chat is None or not message.text:
+        if message is None or chat is None or not has_client_content(message):
             return
         sender = update.effective_user
         if sender is not None and sender.is_bot:
@@ -637,23 +676,24 @@ def create_telegram_application(
         if already is not None and already(update.update_id):
             logger.info("event=telegram_update_ignored reason=already_processed update_id=%s", update.update_id)
             return
-        if chat.id != owner_chat_id:
-            monitored = getattr(message_service, "is_monitored_chat", None)
-            if monitored is not None and not monitored(chat.id):
-                notice = await _discover_unknown_chat(update, context)
-                if notice is None:
-                    logger.info("event=telegram_message_ignored reason=unknown_chat chat_id=%s", chat.id)
-                    return
-                _ingest(update, chat.id, False)
-                if notice.needs_delivery:
-                    await _deliver_onboarding_notice(context.bot, notice)
-                return
-        item = _ingest(update, chat.id, chat.id == owner_chat_id)
-        if await owner_reply(update, context):
-            marker = getattr(message_service, "mark_update_processed", None)
-            if marker is not None:
-                marker(update.update_id)
+        if chat.id == owner_chat_id:
+            _ingest(update, chat.id, True)
+            if await owner_reply(update, context):
+                marker = getattr(message_service, "mark_update_processed", None)
+                if marker is not None:
+                    marker(update.update_id)
             return
+        monitored = getattr(message_service, "is_monitored_chat", None)
+        if monitored is not None and not monitored(chat.id):
+            notice = await _discover_unknown_chat(update, context)
+            if notice is None:
+                logger.info("event=telegram_message_ignored reason=unknown_chat chat_id=%s", chat.id)
+                return
+            _ingest(update, chat.id, False)
+            if notice.needs_delivery:
+                await _deliver_onboarding_notice(context.bot, notice)
+            return
+        item = _ingest(update, chat.id, False)
         if not live_enabled:
             logger.info("event=client_message_deferred_catchup chat_id=%s update_id=%s", chat.id, update.update_id)
             return
@@ -699,6 +739,7 @@ def create_telegram_application(
             if processor is None:
                 return
             try:
+                await _hydrate_chat_media(context.bot, chat.telegram_chat_id)
                 suggestion = await processor(chat.telegram_chat_id, mode="catchup")
             except Exception:
                 logger.exception("event=onboarding_catchup_failed chat_id=%s", chat.telegram_chat_id)
@@ -745,7 +786,10 @@ def create_telegram_application(
         await _send(context.bot, chat_id=owner_chat_id, text=text)
 
     application = Application.builder().token(token.strip()).post_init(_post_init).post_stop(_post_stop).build()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, queue_message))
+    application.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+        queue_message,
+    ))
     application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^(learn|memory|onboard):(yes|no):\d+$"))
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))

@@ -34,6 +34,8 @@ def main() -> None:
         batch_seconds=settings.message_batch_seconds,
         delivery_retry_seconds=settings.delivery_retry_seconds,
         catchup_idle_seconds=settings.catchup_idle_seconds,
+        media_dir=settings.media_dir,
+        media_ttl_seconds=settings.media_ttl_seconds,
     )
     logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
     telegram_application.run_polling(

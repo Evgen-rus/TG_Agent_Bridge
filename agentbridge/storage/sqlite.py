@@ -71,6 +71,12 @@ class StoredMessage:
     reply_to_message_id: int | None
     role: str
     processing_status: str
+    media_kind: str = ""
+    media_path: str = ""
+    telegram_file_id: str = ""
+    media_mime: str = ""
+    media_filename: str = ""
+    media_group_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -394,6 +400,14 @@ class ChatThreadStore:
             "memory_entries": (("kind", "TEXT NOT NULL DEFAULT 'fact'"),),
             "chat_threads": (("prompt_version", "INTEGER"),),
             "owner_query_prompts": (("telegram_chat_id", "INTEGER"),),
+            "telegram_messages": (
+                ("media_kind", "TEXT NOT NULL DEFAULT ''"),
+                ("media_path", "TEXT NOT NULL DEFAULT ''"),
+                ("telegram_file_id", "TEXT NOT NULL DEFAULT ''"),
+                ("media_mime", "TEXT NOT NULL DEFAULT ''"),
+                ("media_filename", "TEXT NOT NULL DEFAULT ''"),
+                ("media_group_id", "TEXT NOT NULL DEFAULT ''"),
+            ),
         }
         for table, specs in columns.items():
             existing = {
@@ -880,19 +894,44 @@ class ChatThreadStore:
         reply_to_message_id: int | None,
         role: str,
         processing_status: str,
+        media_kind: str = "",
+        media_path: str = "",
+        telegram_file_id: str = "",
+        media_mime: str = "",
+        media_filename: str = "",
+        media_group_id: str = "",
     ) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO telegram_messages (
                     update_id, chat_id, message_id, sender_id, sender_name, telegram_date,
-                    text, reply_to_message_id, role, processing_status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    text, reply_to_message_id, role, processing_status, created_at,
+                    media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     update_id, chat_id, message_id, sender_id, sender_name, telegram_date,
                     text, reply_to_message_id, role, processing_status, _now(),
+                    media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id,
                 ),
             )
             return cursor.rowcount == 1
+
+    def set_media_path(self, message_id: int, media_path: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE telegram_messages SET media_path=? WHERE id=?",
+                (media_path, message_id),
+            )
+
+    def clear_media_paths(self, message_ids: list[int]) -> None:
+        if not message_ids:
+            return
+        placeholders = ",".join("?" * len(message_ids))
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE telegram_messages SET media_path='' WHERE id IN ({placeholders})",
+                message_ids,
+            )
 
     def reset_stale_processing(self) -> None:
         with self._connect() as connection:
@@ -978,11 +1017,18 @@ class ChatThreadStore:
 
     @staticmethod
     def _stored_message(row: sqlite3.Row) -> StoredMessage:
+        keys = set(row.keys())
         return StoredMessage(
             id=row["id"], update_id=row["update_id"], chat_id=row["chat_id"], message_id=row["message_id"],
             sender_id=row["sender_id"], sender_name=row["sender_name"], telegram_date=row["telegram_date"],
             text=row["text"], reply_to_message_id=row["reply_to_message_id"], role=row["role"],
             processing_status=row["processing_status"],
+            media_kind=str(row["media_kind"] or "") if "media_kind" in keys else "",
+            media_path=str(row["media_path"] or "") if "media_path" in keys else "",
+            telegram_file_id=str(row["telegram_file_id"] or "") if "telegram_file_id" in keys else "",
+            media_mime=str(row["media_mime"] or "") if "media_mime" in keys else "",
+            media_filename=str(row["media_filename"] or "") if "media_filename" in keys else "",
+            media_group_id=str(row["media_group_id"] or "") if "media_group_id" in keys else "",
         )
 
     def get_chat_state(self, telegram_chat_id: int) -> dict:

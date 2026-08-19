@@ -8,10 +8,12 @@ code and tests are authoritative when they differ from this summary.
 ```text
 Telegram long polling (drop_pending_updates=False)
   -> persist each relevant update in SQLite (durable inbox/history)
+  -> download current-episode photos/PDFs via saved file_id into runtime/media
   -> live debounce per chat, or catch-up after restart
   -> application: episode from stored messages, context pack, one model turn
-  -> AgentProvider
+  -> AgentProvider (images as LocalImageInput, other files as MentionInput)
   -> CodexProvider: start or resume the chat's Codex thread
+  -> delete local media copies; keep file_id in SQLite
   -> update chat_state
   -> telegram.formatter
   -> OWNER_CHAT_ID only
@@ -69,9 +71,12 @@ a series of outdated recommendations.
   `wiki.md` into a registry keyed by Telegram chat ID.
 - `agentbridge/knowledge.py`: compact shared knowledge pack loader (`core.md`
   plus an on-demand file index).
+- `agentbridge/media.py`: short-lived local copies of client photos/PDFs
+  (deleted after the episode, TTL 1 hour) plus labels for history.
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
   state, processed updates, pending/delivered recommendation links, learning
-  drafts, versioned rules, memory, owner questions, and experience.
+  drafts, versioned rules, memory, owner questions, experience, and Telegram
+  `file_id` metadata for client attachments.
 - `agentbridge/logging.py`: secret redaction and seven-day daily diagnostic
   file rotation.
 
@@ -137,7 +142,12 @@ client automatically.
   and the attached shared knowledge pack; raw client-chat context remains
   isolated. Shared cases are internal and must not be retold to another client.
 - A message is not marked processed until episode logic finishes. A model
-  failure leaves the inbox row pending.
+failure leaves the inbox row pending.
+- Client photos, PDFs, and media albums are analysed in that chat's Codex
+  thread. Local files are working copies only (deleted after a successful
+  episode, and anyway after `MEDIA_TTL_SECONDS`, default 1 hour). SQLite keeps
+  Telegram `file_id` so a later turn can re-download. The bot cannot scroll a
+  group's history like a user account.
 - Tokens and credentials never appear unredacted in logs or tracked files.
 - Owner-group conversation invokes the agent on reply-to-bot, an explicit
   mention/tag, or a global memory prefix (`Общий контекст:`). Ordinary

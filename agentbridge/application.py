@@ -7,9 +7,10 @@ import logging
 from pathlib import Path
 import re
 
-from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, OwnerQueryAnswer
+from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, MediaAttachment, OwnerQueryAnswer
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
 from .knowledge import load_knowledge_pack
+from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,12 @@ class IncomingMessage:
     sender_id: int | None = None
     telegram_date: str | None = None
     reply_to_message_id: int | None = None
+    media_kind: str = ""
+    media_path: str = ""
+    telegram_file_id: str = ""
+    media_mime: str = ""
+    media_filename: str = ""
+    media_group_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -160,6 +167,12 @@ class AgentBridgeApplication:
         text: str,
         reply_to_message_id: int | None,
         is_owner_chat: bool,
+        media_kind: str = "",
+        media_path: str = "",
+        telegram_file_id: str = "",
+        media_mime: str = "",
+        media_filename: str = "",
+        media_group_id: str = "",
     ) -> bool:
         if is_owner_chat:
             role = "owner"
@@ -185,7 +198,22 @@ class AgentBridgeApplication:
             reply_to_message_id=reply_to_message_id,
             role=role,
             processing_status=status,
+            media_kind=media_kind,
+            media_path=media_path,
+            telegram_file_id=telegram_file_id,
+            media_mime=media_mime,
+            media_filename=media_filename,
+            media_group_id=media_group_id,
         )
+
+    def pending_media_downloads(self, telegram_chat_id: int) -> list[StoredMessage]:
+        return [
+            item for item in self.store.pending_messages(telegram_chat_id)
+            if item.telegram_file_id and not media_file_ready(item.media_path)
+        ]
+
+    def set_message_media_path(self, message_id: int, media_path: str) -> None:
+        self.store.set_media_path(message_id, media_path)
 
     def pending_client_chat_ids(self) -> list[int]:
         return self.store.pending_chat_ids(self.registry.known_ids())
@@ -218,6 +246,7 @@ class AgentBridgeApplication:
                 try:
                     result = await self._run_episode(chat, [_from_stored(item) for item in claimed], notify=notify)
                     self.store.mark_messages_processed(claimed)
+                    self._discard_local_media(claimed)
                 except Exception:
                     self.store.release_messages([item.id for item in claimed])
                     raise
@@ -239,7 +268,8 @@ class AgentBridgeApplication:
                 self._ingest_incoming(telegram_chat_id, item)
             pending = [
                 item for item in messages
-                if item.text.strip() and (item.update_id is None or not self.store.is_update_processed(item.update_id))
+                if has_message_content(item.text, item.media_kind, item.telegram_file_id)
+                and (item.update_id is None or not self.store.is_update_processed(item.update_id))
             ]
             if not pending:
                 logger.info("event=client_batch_ignored reason=empty_or_duplicate chat_id=%s", telegram_chat_id)
@@ -249,10 +279,12 @@ class AgentBridgeApplication:
                 result = await self._run_episode(chat, pending, notify=True)
                 if claimed:
                     self.store.mark_messages_processed(claimed)
+                    self._discard_local_media(claimed)
                 else:
                     for item in pending:
                         if item.update_id is not None:
                             self.store.mark_update_processed(item.update_id)
+                    self._discard_incoming_media(pending)
             except Exception:
                 if claimed:
                     self.store.release_messages([item.id for item in claimed])
@@ -260,7 +292,7 @@ class AgentBridgeApplication:
             return result
 
     def _ingest_incoming(self, telegram_chat_id: int, item: IncomingMessage) -> None:
-        if item.update_id is None or not item.text.strip():
+        if item.update_id is None or not has_message_content(item.text, item.media_kind, item.telegram_file_id):
             return
         role = "internal" if item.sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
         self.store.ingest_telegram_message(
@@ -274,6 +306,12 @@ class AgentBridgeApplication:
             reply_to_message_id=item.reply_to_message_id,
             role=role,
             processing_status="pending",
+            media_kind=item.media_kind,
+            media_path=item.media_path,
+            telegram_file_id=item.telegram_file_id,
+            media_mime=item.media_mime,
+            media_filename=item.media_filename,
+            media_group_id=item.media_group_id,
         )
 
     def _claim_incoming(self, telegram_chat_id: int, messages: list[IncomingMessage]) -> list[StoredMessage]:
@@ -297,7 +335,8 @@ class AgentBridgeApplication:
             internal, external = self._split_internal_messages(messages)
         for item in internal:
             self.store.record_internal_context(
-                chat.telegram_chat_id, chat.name, item.sender_name.strip() or "Внутренний участник", item.text.strip(),
+                chat.telegram_chat_id, chat.name, item.sender_name.strip() or "Внутренний участник",
+                _episode_text(item),
             )
         if not external:
             logger.info("event=client_batch_context_only chat_id=%s count=%d", chat.telegram_chat_id, len(internal))
@@ -305,18 +344,20 @@ class AgentBridgeApplication:
         sender_names = list(dict.fromkeys(item.sender_name.strip() or "Неизвестный отправитель" for item in external))
         sender_name = sender_names[0] if len(sender_names) == 1 else ", ".join(sender_names)
         if len(messages) == 1:
-            combined_message = messages[0].text.strip()
+            combined_message = _episode_text(messages[0])
         else:
             combined_message = "\n".join(
-                f"{item.sender_name.strip() or 'Неизвестный отправитель'}: {item.text.strip()}" for item in messages
+                f"{item.sender_name.strip() or 'Неизвестный отправитель'}: {_episode_text(item)}" for item in messages
             )
         rules = self.store.active_rule_texts(chat.telegram_chat_id)
         thread_id = self._thread_id_for_provider(chat.telegram_chat_id)
         exclude_ids = {item.update_id for item in messages if item.update_id is not None}
         context_pack = self._context_pack(chat, episode=combined_message, exclude_update_ids=exclude_ids)
+        attachments = _episode_attachments(messages)
         logger.info(
-            "event=codex_suggest_start chat_id=%s chat=%r batch_size=%d rule_count=%d thread=%s notify=%s",
+            "event=codex_suggest_start chat_id=%s chat=%r batch_size=%d rule_count=%d thread=%s notify=%s attachments=%d",
             chat.telegram_chat_id, chat.name, len(messages), len(rules), "resume" if thread_id else "new", notify,
+            len(attachments),
         )
         suggest_kwargs = {
             "message": combined_message,
@@ -326,6 +367,7 @@ class AgentBridgeApplication:
             "rules": rules,
             "thread_id": thread_id,
             "context_pack": context_pack,
+            "attachments": attachments,
         }
         reply = await self.provider.suggest(**suggest_kwargs)
         reply = await self._maybe_critique(reply, suggest_kwargs)
@@ -385,6 +427,15 @@ class AgentBridgeApplication:
             prompt_version=getattr(self.provider, "prompt_version", None),
         )
 
+    def _discard_local_media(self, rows: list[StoredMessage]) -> None:
+        for row in rows:
+            delete_media_file(row.media_path)
+        self.store.clear_media_paths([row.id for row in rows])
+
+    def _discard_incoming_media(self, messages: list[IncomingMessage]) -> None:
+        for item in messages:
+            delete_media_file(item.media_path)
+
     def _apply_state_update(self, telegram_chat_id: int, candidate_state: dict | None, situation: str) -> None:
         current = self.store.get_chat_state(telegram_chat_id)
         merged = dict(current)
@@ -431,7 +482,10 @@ class AgentBridgeApplication:
             parts.append(shared)
         parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2))
         if recent:
-            history = "\n".join(f"{item.sender_name}: {item.text}" for item in recent)
+            history = "\n".join(
+                f"{item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
+                for item in recent
+            )
             parts.append("Недавняя история:\n" + history)
         if episode:
             parts.append("Текущий эпизод:\n" + episode)
@@ -969,7 +1023,40 @@ def _from_stored(item: StoredMessage) -> IncomingMessage:
         sender_id=item.sender_id,
         telegram_date=item.telegram_date,
         reply_to_message_id=item.reply_to_message_id,
+        media_kind=item.media_kind,
+        media_path=item.media_path,
+        telegram_file_id=item.telegram_file_id,
+        media_mime=item.media_mime,
+        media_filename=item.media_filename,
+        media_group_id=item.media_group_id,
     )
+
+
+def _episode_text(item: IncomingMessage) -> str:
+    body = (item.text or "").strip()
+    unavailable = bool(item.telegram_file_id or item.media_kind) and not media_file_ready(item.media_path)
+    if item.media_kind or item.media_filename:
+        label = media_label(item.media_kind, item.media_filename, unavailable=unavailable)
+        if body and label:
+            return f"{label} {body}"
+        return body or label
+    return body
+
+
+def _episode_attachments(messages: list[IncomingMessage]) -> tuple[MediaAttachment, ...]:
+    attachments = []
+    for item in messages:
+        if not media_file_ready(item.media_path):
+            continue
+        attachments.append(
+            MediaAttachment(
+                path=item.media_path,
+                kind=item.media_kind,
+                mime=item.media_mime,
+                filename=item.media_filename,
+            )
+        )
+    return tuple(attachments)
 
 
 def action_label(action: str) -> str:

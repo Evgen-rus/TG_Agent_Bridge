@@ -52,7 +52,10 @@ required before a real suggestion can be generated.
 
 The SQLite mapping is created at `runtime/agentbridge.sqlite3`. It stores
 Telegram history, one Codex thread ID per monitored chat, compact `chat_state`,
-recommendations, rules, and memory.
+recommendations, rules, and memory. Client photos and files are downloaded only
+for the current episode into `MEDIA_DIR` (default `runtime/media`), then deleted.
+`MEDIA_TTL_SECONDS` (3600) is the leftover-file safety net. Telegram `file_id`
+stays in SQLite so the bot can fetch the same file again if needed.
 
 For predictable suggest-only operation, startup no longer drops Telegram
 updates. Successfully processed update IDs are stored in the same SQLite

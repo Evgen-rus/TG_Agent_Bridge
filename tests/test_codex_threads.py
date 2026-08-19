@@ -173,7 +173,7 @@ class _FakeThread:
         self.payload = payload
         self.prompts: list[str] = []
 
-    def run(self, prompt: str, **kwargs) -> _FakeResult:
+    def run(self, prompt, **kwargs) -> _FakeResult:
         self.prompts.append(prompt)
         return _FakeResult(self.payload)
 
@@ -181,6 +181,7 @@ class _FakeThread:
 class _FakeCodex:
     starts: list[dict] = []
     resumes: list[str] = []
+    threads: list[_FakeThread] = []
     suggest_payload: dict = _suggest_payload()
     critique_payload: dict = _suggest_payload(action="observe", suggested_reply="", observation="Closed.")
     owner_payload: dict = {"answer": "Owner answer"}
@@ -194,21 +195,27 @@ class _FakeCodex:
     def thread_start(self, **kwargs) -> _FakeThread:
         self.starts.append(kwargs)
         if kwargs.get("developer_instructions") == _CRITIQUE_INSTRUCTIONS:
-            return _FakeThread("thread-critique", self.critique_payload)
-        if kwargs.get("developer_instructions") == _OWNER_QUERY_INSTRUCTIONS:
-            return _FakeThread("thread-owner", self.owner_payload)
-        return _FakeThread("thread-started", self.suggest_payload)
+            thread = _FakeThread("thread-critique", self.critique_payload)
+        elif kwargs.get("developer_instructions") == _OWNER_QUERY_INSTRUCTIONS:
+            thread = _FakeThread("thread-owner", self.owner_payload)
+        else:
+            thread = _FakeThread("thread-started", self.suggest_payload)
+        self.threads.append(thread)
+        return thread
 
     def thread_resume(self, thread_id: str, **kwargs) -> _FakeThread:
         self.resumes.append(thread_id)
         payload = self.owner_payload if thread_id == "thread-owner" else self.suggest_payload
-        return _FakeThread(thread_id, payload)
+        thread = _FakeThread(thread_id, payload)
+        self.threads.append(thread)
+        return thread
 
 
 @pytest.fixture
 def fake_codex(monkeypatch):
     _FakeCodex.starts = []
     _FakeCodex.resumes = []
+    _FakeCodex.threads = []
     monkeypatch.setattr("agentbridge.agents.codex.Codex", _FakeCodex)
     return _FakeCodex
 
@@ -282,6 +289,34 @@ async def test_codex_critique_is_ephemeral_and_keeps_main_thread_id(fake_codex) 
     assert fake_codex.resumes == []
     assert fake_codex.starts[-1]["developer_instructions"] == _CRITIQUE_INSTRUCTIONS
     assert "thread-critique" not in fake_codex.resumes
+
+
+@pytest.mark.asyncio
+async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_codex, tmp_path) -> None:
+    from openai_codex import LocalImageInput, MentionInput, TextInput
+
+    from agentbridge.agents.base import MediaAttachment
+
+    image = tmp_path / "shot.jpg"
+    pdf = tmp_path / "scan.pdf"
+    image.write_bytes(b"jpeg")
+    pdf.write_bytes(b"%PDF")
+    provider = CodexProvider()
+    first = await provider.suggest(
+        message="[фото]", sender_name="Alice", chat_name="Acme", wiki="wiki", rules=[], thread_id=None,
+        attachments=(MediaAttachment(str(image), "photo", "image/jpeg", "shot.jpg"),),
+    )
+    await provider.suggest(
+        message="[файл: scan.pdf]", sender_name="Alice", chat_name="Acme", wiki="wiki", rules=[],
+        thread_id=first.thread_id,
+        attachments=(MediaAttachment(str(pdf), "document", "application/pdf", "scan.pdf"),),
+    )
+    first_input = fake_codex.threads[0].prompts[0]
+    second_input = fake_codex.threads[1].prompts[0]
+    assert isinstance(first_input[0], TextInput)
+    assert any(isinstance(item, LocalImageInput) and item.path == str(image.resolve()) for item in first_input)
+    assert any(isinstance(item, MentionInput) and item.path == str(pdf.resolve()) for item in second_input)
+    assert fake_codex.resumes == ["thread-started"]
 
 
 def test_codex_output_schemas_match_structured_outputs_subset() -> None:

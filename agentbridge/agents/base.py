@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 
 class AgentAction:
@@ -66,6 +66,14 @@ class OwnerQueryAnswer:
     answer: str
 
 
+@dataclass(frozen=True)
+class MediaAttachment:
+    path: str
+    kind: str = ""
+    mime: str = ""
+    filename: str = ""
+
+
 class AgentProvider(Protocol):
     async def suggest(
         self,
@@ -77,6 +85,7 @@ class AgentProvider(Protocol):
         rules: list[str],
         thread_id: str | None,
         context_pack: str = "",
+        attachments: Sequence[MediaAttachment] = (),
     ) -> AgentReply: ...
 
     async def analyze_feedback(
@@ -101,6 +110,7 @@ class AgentProvider(Protocol):
         rules: list[str],
         thread_id: str,
         context_pack: str = "",
+        attachments: Sequence[MediaAttachment] = (),
     ) -> AgentReply: ...
 
     async def answer_owner_query(

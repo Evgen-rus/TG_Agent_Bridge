@@ -4,9 +4,10 @@ import asyncio
 import json
 from pathlib import Path
 
-from openai_codex import Codex, Sandbox
+from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
 
-from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, OwnerQueryAnswer
+from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, MediaAttachment, OwnerQueryAnswer
+from ..media import is_visual_media
 
 _STRING = {"type": "string"}
 _STRING_LIST = {"type": "array", "items": {"type": "string"}}
@@ -148,6 +149,7 @@ suggested_reply клиенту — обычный деловой текст бе
 Плохо: «Ну да, гениальный план, как всегда»; «Клиент опять несёт чушь»; казённое «Недостаточно информации», если можно назвать, какого факта не хватает."""
 _INSTRUCTIONS = """Ты помощник команды по рабочим Telegram-чатам. Режим только suggest: ничего не отправляй клиенту и не выполняй внешние действия.
 Источник правды — context pack: wiki чата, общие знания компании если они подключены, текущее состояние, недавняя история, текущий эпизод, подтверждённая память, правила и опыт. Codex thread — только continuity, не память.
+Вложения текущего хода (скриншоты, PDF и другие файлы клиента) относятся только к этому чату: прочитай их, если они переданы. Не выдумывай содержимое файла, которого нет во вводе.
 Wiki и подтверждённая память этого чата важнее общей методики, если они расходятся.
 Различай факты, гипотезы, договорённости и открытые вопросы. Не выдумывай недостающие факты. Если данных мало — признай неопределённость.
 В suggested_reply клиенту не раскрывай внутренние кейсы, названия и цифры других клиентов, устройство источников и внутренние гипотезы.
@@ -208,7 +210,7 @@ directory_slug — латиница, строчные, слова через п�
 Не предлагай писать клиенту."""
 _CRITIQUE_INSTRUCTIONS = """Проверь предыдущий JSON-ответ как нейтральный аналитик. Исправь выдуманные факты, устаревшие рекомендации и слабые гипотезы, выданные как факты. Если более поздние сообщения закрыли вопрос — не предлагай reply на него. Не усиливай уверенность и не меняй action ради более острого тона. Голос команды может остаться в observation/owner_question, но смысл должен стать точнее. Верни тот же JSON schema."""
 
-AGENT_PROMPT_VERSION = 3
+AGENT_PROMPT_VERSION = 4
 
 
 class CodexProvider:
@@ -221,16 +223,16 @@ class CodexProvider:
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
 
-    async def suggest(self, *, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "") -> AgentReply:
-        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, None, context_pack)
+    async def suggest(self, *, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "", attachments: tuple[MediaAttachment, ...] | list[MediaAttachment] = ()) -> AgentReply:
+        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, None, context_pack, tuple(attachments))
 
-    async def revise(self, *, feedback: str, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str, context_pack: str = "") -> AgentReply:
-        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, feedback, context_pack)
+    async def revise(self, *, feedback: str, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str, context_pack: str = "", attachments: tuple[MediaAttachment, ...] | list[MediaAttachment] = ()) -> AgentReply:
+        return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, feedback, context_pack, tuple(attachments))
 
-    async def critique(self, *, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "") -> AgentReply:
-        return await asyncio.to_thread(self._critique_sync, previous, message, sender_name, chat_name, wiki, rules, context_pack)
+    async def critique(self, *, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "", attachments: tuple[MediaAttachment, ...] | list[MediaAttachment] = ()) -> AgentReply:
+        return await asyncio.to_thread(self._critique_sync, previous, message, sender_name, chat_name, wiki, rules, context_pack, tuple(attachments))
 
-    def _suggest_sync(self, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, revision: str | None, context_pack: str = "") -> AgentReply:
+    def _suggest_sync(self, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, revision: str | None, context_pack: str = "", attachments: tuple[MediaAttachment, ...] = ()) -> AgentReply:
         pack = self._pack(wiki, rules, context_pack)
         prompt = f"Чат: {chat_name}\nОтправитель: {sender_name}\n\n{pack}\n\nСообщение:\n{message}"
         if revision:
@@ -243,11 +245,12 @@ class CodexProvider:
                     model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
                     developer_instructions=_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort},
                 )
-            payload = self._run_json(thread, prompt, _SUGGEST_SCHEMA)
+            payload = self._run_json(thread, _turn_input(prompt, attachments), _SUGGEST_SCHEMA)
             return _reply_from_payload(thread.id, payload)
 
     def _critique_sync(
         self, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], context_pack: str,
+        attachments: tuple[MediaAttachment, ...] = (),
     ) -> AgentReply:
         pack = self._pack(wiki, rules, context_pack)
         previous_json = json.dumps(
@@ -275,7 +278,7 @@ class CodexProvider:
                 developer_instructions=_CRITIQUE_INSTRUCTIONS,
                 config={"model_reasoning_effort": self.reasoning_effort},
             )
-            payload = self._run_json(thread, prompt, _SUGGEST_SCHEMA)
+            payload = self._run_json(thread, _turn_input(prompt, attachments), _SUGGEST_SCHEMA)
         return _reply_from_payload(previous.thread_id, payload)
 
     @staticmethod
@@ -343,7 +346,7 @@ class CodexProvider:
             directory_slug=str(payload.get("directory_slug") or "").strip(),
         )
 
-    def _run_json(self, thread, prompt: str, schema: dict) -> dict:
+    def _run_json(self, thread, prompt: RunInput, schema: dict) -> dict:
         result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
         if result.error is not None:
             raise RuntimeError(f"Codex turn failed: {result.error}")
@@ -353,6 +356,19 @@ class CodexProvider:
             return json.loads(result.final_response)
         except (json.JSONDecodeError, TypeError) as exc:
             raise RuntimeError("Codex returned an invalid structured response") from exc
+
+
+def _turn_input(prompt: str, attachments: tuple[MediaAttachment, ...] = ()) -> RunInput:
+    if not attachments:
+        return prompt
+    items: list = [TextInput(prompt)]
+    for item in attachments:
+        path = str(Path(item.path).resolve())
+        if is_visual_media(item.kind, item.mime, item.filename):
+            items.append(LocalImageInput(path=path))
+        else:
+            items.append(MentionInput(name=item.filename or Path(path).name, path=path))
+    return items
 
 
 def _reply_from_payload(thread_id: str, payload: dict) -> AgentReply:

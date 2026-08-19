@@ -22,6 +22,8 @@ class Settings:
     catchup_idle_seconds: float = 2.0
     catchup_episode_size: int = 40
     telegram_bootstrap_retries: int = 5
+    media_dir: Path = Path("runtime/media")
+    media_ttl_seconds: int = 3600
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -53,4 +55,6 @@ class Settings:
             catchup_idle_seconds=float(os.getenv("CATCHUP_IDLE_SECONDS", "2")),
             catchup_episode_size=int(os.getenv("CATCHUP_EPISODE_SIZE", "40")),
             telegram_bootstrap_retries=int(os.getenv("TELEGRAM_BOOTSTRAP_RETRIES", "5")),
+            media_dir=root / os.getenv("MEDIA_DIR", "runtime/media"),
+            media_ttl_seconds=int(os.getenv("MEDIA_TTL_SECONDS", "3600")),
         )
