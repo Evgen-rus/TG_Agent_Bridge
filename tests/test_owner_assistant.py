@@ -111,7 +111,7 @@ class ClarifyingAssistantService:
 
     async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
         self.query_calls.append({"text": text, "reply_to_message_id": reply_to_message_id, "update_id": update_id})
-        return OwnerQueryResult("Уточните, о каком чате речь. Сейчас подключены: [LR224] ОптоБель.", 11)
+        return OwnerQueryResult("Уточните, о каком чате речь. Сейчас подключены: [LR225] ОптоБель.", 11)
 
     def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
         self.attached.append((prompt_id, owner_message_id))
@@ -215,14 +215,14 @@ async def test_reply_to_which_chat_clarification_continues_the_query() -> None:
     assert "Уточните, о каком чате речь" in bot.sent[0]["text"]
     await _callback(application)(
         FakeUpdate(
-            FakeMessage("[LR224] ОптоБель", FakeReply(1001, FakeUser(777, "AgentBridge", True))),
+            FakeMessage("[LR225] ОптоБель", FakeReply(1001, FakeUser(777, "AgentBridge", True))),
             FakeChat(7654321),
             FakeUser(),
             202,
         ),
         context,
     )
-    assert service.continued == [{"reply_to_message_id": 1001, "text": "[LR224] ОптоБель"}]
+    assert service.continued == [{"reply_to_message_id": 1001, "text": "[LR225] ОптоБель"}]
     assert service.question_calls == []
     assert "методике дозвона" in bot.sent[-1]["text"]
 

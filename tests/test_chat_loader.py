@@ -40,10 +40,10 @@ def test_registry_selects_the_matching_chat_and_its_wiki(tmp_path) -> None:
 
 
 def test_find_by_name_matches_unique_short_client_name(tmp_path) -> None:
-    first = tmp_path / "lr224_optobel"
+    first = tmp_path / "lr225_optobel"
     first.mkdir()
     (first / "config.yaml").write_text(
-        "name: \"[LR224] ОптоБель\"\ntelegram_chat_id: -1001\nagent_provider: codex\n",
+        "name: \"[LR225] ОптоБель\"\ntelegram_chat_id: -1001\nagent_provider: codex\n",
         encoding="utf-8",
     )
     (first / "wiki.md").write_text("Optobel wiki", encoding="utf-8")
@@ -55,10 +55,10 @@ def test_find_by_name_matches_unique_short_client_name(tmp_path) -> None:
     )
     (second / "wiki.md").write_text("Lider wiki", encoding="utf-8")
     registry = ChatRegistry.load(tmp_path)
-    assert registry.find_by_name("[LR224] ОптоБель") is not None
-    assert registry.find_by_name("[LR224] ОптоБель").telegram_chat_id == -1001
+    assert registry.find_by_name("[LR225] ОптоБель") is not None
+    assert registry.find_by_name("[LR225] ОптоБель").telegram_chat_id == -1001
     assert registry.find_by_name("ОптоБель").telegram_chat_id == -1001
-    assert registry.find_by_name("LR224") is None
+    assert registry.find_by_name("LR224").telegram_chat_id == -1002
 
 
 def test_knowledge_pack_none_opts_out(tmp_path) -> None:

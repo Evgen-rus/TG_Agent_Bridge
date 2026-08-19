@@ -180,7 +180,7 @@ class QueryProvider(FakeProvider):
 @pytest.mark.asyncio
 async def test_owner_query_clarifies_chat_then_uses_original_question(tmp_path) -> None:
     optobel = ChatConfig(
-        -1001, "[LR224] ОптоБель", "codex", "Wiki Optobel", Path("chats/lr224_optobel"),
+        -1001, "[LR225] ОптоБель", "codex", "Wiki Optobel", Path("chats/lr225_optobel"),
     )
     other = ChatConfig(
         -1002, "[LR220] Риолюкс ЕКБ", "codex", "Wiki Rio", Path("chats/lr220"),
@@ -202,12 +202,12 @@ async def test_owner_query_clarifies_chat_then_uses_original_question(tmp_path) 
     assert first.prompt_id is not None
     assert "Уточните, о каком чате речь" in first.text
     service.attach_owner_query_prompt(first.prompt_id, 9001)
-    second = await service.continue_owner_query(9001, "[LR224] ОптоБель", update_id=502)
+    second = await service.continue_owner_query(9001, "[LR225] ОптоБель", update_id=502)
     assert isinstance(second, OwnerQueryResult)
-    assert second.text == "Для [LR224] ОптоБель: методика дозвона."
+    assert second.text == "Для [LR225] ОптоБель: методика дозвона."
     assert second.prompt_id is not None
     assert provider.questions[0]["question"] == "@spare_eyes_bot подскажи для клиента сообщение как дозваниваться"
-    assert provider.questions[0]["chat_name"] == "[LR224] ОптоБель"
+    assert provider.questions[0]["chat_name"] == "[LR225] ОптоБель"
     assert provider.questions[0]["thread_id"] is None
     service.attach_owner_query_prompt(second.prompt_id, 9002)
     third = await service.continue_owner_query(
@@ -215,7 +215,7 @@ async def test_owner_query_clarifies_chat_then_uses_original_question(tmp_path) 
     )
     assert isinstance(third, OwnerQueryResult)
     assert provider.questions[-1]["question"] == "а для тг можешь сделать чтобы красиво читалось"
-    assert provider.questions[-1]["chat_name"] == "[LR224] ОптоБель"
+    assert provider.questions[-1]["chat_name"] == "[LR225] ОптоБель"
     assert provider.questions[-1]["thread_id"] == "owner-thread-1"
     assert store.get_owner_query_thread_id(-1001) == "owner-thread-1"
 
