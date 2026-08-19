@@ -96,6 +96,32 @@ async def test_successful_episode_state_is_visible_to_the_next_turn(tmp_path, ch
 
 
 @pytest.mark.asyncio
+async def test_null_candidate_state_fields_do_not_wipe_existing_state(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    store.save_chat_state(-100123456, {"summary": "Old", "waiting_from_us": ["расчёт завтра"]})
+
+    class PartialProvider:
+        async def suggest(self, **kwargs) -> AgentReply:
+            return AgentReply(
+                thread_id=kwargs.get("thread_id") or "thread-1",
+                situation="Updated summary",
+                suggested_reply="Reply",
+                candidate_state={
+                    "summary": "Updated summary",
+                    "waiting_from_us": None,
+                    "facts": ["нужен расчёт"],
+                },
+            )
+
+    service = AgentBridgeApplication(chat_registry, store, PartialProvider())
+    await service.handle_message(-100123456, "Alice", "Need docs", update_id=81)
+    state = store.get_chat_state(-100123456)
+    assert state["summary"] == "Updated summary"
+    assert state["waiting_from_us"] == ["расчёт завтра"]
+    assert state["facts"] == ["нужен расчёт"]
+
+
+@pytest.mark.asyncio
 async def test_large_backlog_is_processed_in_order_and_notifies_once(tmp_path, chat_registry) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
     provider = RecordingProvider()

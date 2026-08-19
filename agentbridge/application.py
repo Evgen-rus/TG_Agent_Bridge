@@ -390,7 +390,8 @@ class AgentBridgeApplication:
         merged = dict(current)
         if isinstance(candidate_state, dict):
             for key, value in candidate_state.items():
-                if key in DEFAULT_CHAT_STATE:
+                # null в схеме значит «поле не менялось», пустой список/строка — явная очистка.
+                if key in DEFAULT_CHAT_STATE and value is not None:
                     merged[key] = value
         if situation.strip() and not (isinstance(candidate_state, dict) and candidate_state.get("summary")):
             merged["summary"] = situation.strip()

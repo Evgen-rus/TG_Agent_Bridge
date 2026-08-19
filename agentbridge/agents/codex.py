@@ -8,6 +8,39 @@ from openai_codex import Codex, Sandbox
 
 from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, OwnerQueryAnswer
 
+_STRING = {"type": "string"}
+_STRING_LIST = {"type": "array", "items": {"type": "string"}}
+# Codex/OpenAI требуют additionalProperties=false у каждого object.
+# type: ["object", "null"] этого не даёт — нужен anyOf с явной object-веткой.
+_CANDIDATE_STATE_PROPERTIES = {
+    "summary": _STRING,
+    "stage": _STRING,
+    "facts": _STRING_LIST,
+    "decisions": _STRING_LIST,
+    "agreements": _STRING_LIST,
+    "commitments": _STRING_LIST,
+    "waiting_from_client": _STRING_LIST,
+    "waiting_from_us": _STRING_LIST,
+    "open_questions": _STRING_LIST,
+    "risks": _STRING_LIST,
+    "unknowns": _STRING_LIST,
+    "next_step": _STRING,
+    "participants": _STRING_LIST,
+}
+_CANDIDATE_STATE_SCHEMA = {
+    "anyOf": [
+        {
+            "type": "object",
+            "properties": {
+                key: {"anyOf": [schema, {"type": "null"}]}
+                for key, schema in _CANDIDATE_STATE_PROPERTIES.items()
+            },
+            "required": list(_CANDIDATE_STATE_PROPERTIES),
+            "additionalProperties": False,
+        },
+        {"type": "null"},
+    ]
+}
 _SUGGEST_SCHEMA = {
     "type": "object",
     "properties": {
@@ -20,7 +53,7 @@ _SUGGEST_SCHEMA = {
         "should_notify": {"type": "boolean"},
         "confidence": {"type": "number"},
         "needs_critique": {"type": "boolean"},
-        "candidate_state": {"type": ["object", "null"]},
+        "candidate_state": _CANDIDATE_STATE_SCHEMA,
     },
     "required": [
         "action", "situation", "suggested_reply", "observation", "unknowns",

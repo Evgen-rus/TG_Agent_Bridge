@@ -9,9 +9,11 @@ from agentbridge.agents.base import AgentAction, AgentReply
 from agentbridge.agents.codex import (
     AGENT_PROMPT_VERSION,
     CodexProvider,
+    _CANDIDATE_STATE_PROPERTIES,
     _CRITIQUE_INSTRUCTIONS,
     _INSTRUCTIONS,
     _OWNER_QUERY_INSTRUCTIONS,
+    _SUGGEST_SCHEMA,
 )
 from agentbridge.application import AgentBridgeApplication
 from agentbridge.storage.sqlite import ChatThreadStore
@@ -276,3 +278,12 @@ async def test_codex_critique_is_ephemeral_and_keeps_main_thread_id(fake_codex) 
     assert fake_codex.resumes == []
     assert fake_codex.starts[-1]["developer_instructions"] == _CRITIQUE_INSTRUCTIONS
     assert "thread-critique" not in fake_codex.resumes
+
+
+def test_suggest_schema_closes_candidate_state_object() -> None:
+    field = _SUGGEST_SCHEMA["properties"]["candidate_state"]
+    object_branch = next(option for option in field["anyOf"] if option.get("type") == "object")
+    assert object_branch["additionalProperties"] is False
+    assert set(object_branch["required"]) == set(_CANDIDATE_STATE_PROPERTIES)
+    assert set(object_branch["properties"]) == set(_CANDIDATE_STATE_PROPERTIES)
+    assert {"type": "null"} in field["anyOf"]
