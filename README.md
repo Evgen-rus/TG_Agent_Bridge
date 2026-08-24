@@ -13,11 +13,13 @@ notifies the owner only about the current outcome.
 
 1. Copy `.env.example` to `.env`.
 2. Set `TELEGRAM_BOT_TOKEN` and `OWNER_CHAT_ID`.
-3. Copy `chats/example` to a meaningful directory, set the monitored numeric
+3. For voice message transcription set `OPENAI_API_KEY`; `TRANSCRIPTION_MODEL`
+   defaults to `gpt-4o-mini-transcribe`.
+4. Copy `chats/example` to a meaningful directory, set the monitored numeric
    `telegram_chat_id`, and replace `wiki.md` with that chat's stable context.
    Loaded chats receive the compact `knowledge/leadgenbureau` pack by default.
    Set `knowledge_pack: none` to opt out. Only `core.md` is injected each turn.
-4. Remove the example directory or change its placeholder chat ID.
+5. Remove the example directory or change its placeholder chat ID.
 
 Codex defaults to `gpt-5.6-luna` with reasoning effort `xhigh`. The official
 Python SDK reuses existing Codex authentication. To start browser login from
@@ -56,6 +58,19 @@ recommendations, rules, and memory. Client photos and files are downloaded only
 for the current episode into `MEDIA_DIR` (default `runtime/media`), then deleted.
 `MEDIA_TTL_SECONDS` (3600) is the leftover-file safety net. Telegram `file_id`
 stays in SQLite so the bot can fetch the same file again if needed.
+
+Voice messages are supported. Each incoming voice note is stored first, then
+transcribed in the background with `TRANSCRIPTION_MODEL` (requires
+`OPENAI_API_KEY`) while the per-chat batch window runs; the transcript is saved
+to SQLite and sent to Codex as `[голосовое] текст` instead of an audio file.
+If transcription fails or hears no speech, a placeholder text is used so the
+batch is never blocked. Without `OPENAI_API_KEY` voice notes stay pending as
+plain attachments and everything else works as before.
+
+A voice note sent by the owner in the owner chat (typically as a reply to a bot
+recommendation) is transcribed on the fly and then handled exactly like typed
+text: feedback and question answers work over voice. A standalone owner voice
+note invokes the assistant when its transcript begins with `Рик` or `Агент`.
 
 For predictable suggest-only operation, startup no longer drops Telegram
 updates. Successfully processed update IDs are stored in the same SQLite

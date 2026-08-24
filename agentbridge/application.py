@@ -215,6 +215,17 @@ class AgentBridgeApplication:
     def set_message_media_path(self, message_id: int, media_path: str) -> None:
         self.store.set_media_path(message_id, media_path)
 
+    def pending_voice_messages(self, telegram_chat_id: int) -> list[StoredMessage]:
+        return [
+            item for item in self.store.pending_messages(telegram_chat_id)
+            if (item.media_kind or "").casefold() == "voice" and item.telegram_file_id
+            and not (item.text or "").strip()
+        ]
+
+    def save_voice_transcript(self, update_id: int, transcript: str) -> None:
+        """Пишет чистый транскрипт; метку [голосовое] добавит _episode_text/media_label."""
+        self.store.set_message_text(update_id, transcript.strip())
+
     def pending_client_chat_ids(self) -> list[int]:
         return self.store.pending_chat_ids(self.registry.known_ids())
 
@@ -1047,6 +1058,9 @@ def _episode_attachments(messages: list[IncomingMessage]) -> tuple[MediaAttachme
     attachments = []
     for item in messages:
         if not media_file_ready(item.media_path):
+            continue
+        # Голосовой передаём транскриптом в тексте; аудиофайл модели не нужен.
+        if (item.media_kind or "").casefold() == "voice":
             continue
         attachments.append(
             MediaAttachment(

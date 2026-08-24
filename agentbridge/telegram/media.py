@@ -31,6 +31,18 @@ def describe_message_media(message) -> MediaRef | None:
                 file_size=getattr(best, "file_size", None),
                 media_group_id=group_id,
             )
+    voice = getattr(message, "voice", None)
+    if voice is not None:
+        file_id = str(getattr(voice, "file_id", "") or "")
+        if file_id:
+            return MediaRef(
+                kind="voice",
+                file_id=file_id,
+                filename="voice.ogg",
+                mime=str(getattr(voice, "mime_type", "") or "audio/ogg"),
+                file_size=getattr(voice, "file_size", None),
+                media_group_id=group_id,
+            )
     document = getattr(message, "document", None)
     if document is not None:
         file_id = str(getattr(document, "file_id", "") or "")

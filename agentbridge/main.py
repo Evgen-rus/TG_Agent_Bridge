@@ -36,6 +36,8 @@ def main() -> None:
         catchup_idle_seconds=settings.catchup_idle_seconds,
         media_dir=settings.media_dir,
         media_ttl_seconds=settings.media_ttl_seconds,
+        openai_api_key=settings.openai_api_key,
+        transcription_model=settings.transcription_model,
         polling_hard_timeout_seconds=settings.telegram_poll_hard_timeout_seconds,
         polling_watchdog_seconds=settings.telegram_poll_watchdog_seconds,
         polling_stall_seconds=settings.telegram_poll_stall_seconds,

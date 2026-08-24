@@ -46,6 +46,8 @@ def media_label(kind: str, filename: str = "", *, unavailable: bool = False) -> 
     suffix = ", файл недоступен" if unavailable else ""
     if (kind or "").strip().casefold() == "photo":
         return f"[фото{suffix}]"
+    if (kind or "").strip().casefold() == "voice":
+        return f"[голосовое{suffix}]"
     name = (filename or "").strip()
     if name:
         return f"[файл: {name}{suffix}]"

@@ -16,7 +16,8 @@ from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
-from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, purge_expired_media
+from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, purge_expired_media
+from agentbridge.transcribe import TranscriptionError, transcribe_audio_file
 from .formatter import (
     format_learning_proposal,
     format_memory_proposal,
@@ -42,6 +43,53 @@ class IncomingMessageService(Protocol):
 class _PendingBatch:
     messages: list[IncomingMessage]
     task: asyncio.Task[None]
+
+
+async def transcribe_pending_voice_messages(
+    message_service,
+    bot,
+    *,
+    media_dir: Path | None,
+    api_key: str,
+    model: str,
+    telegram_chat_id: int,
+) -> None:
+    """Транскрибирует pending-голосовые чата, записывая текст в SQLite по update_id.
+
+    Ошибка API или пустой аудиосигнал фиксируются плейсхолдером: сообщение не должно
+    вечно блокировать батч чата. Локальная копия аудио остаётся до конца эпизода -
+    её удалит стандартный _discard_local_media вместе с прочими вложениями.
+    """
+    finder = getattr(message_service, "pending_voice_messages", None)
+    saver = getattr(message_service, "save_voice_transcript", None)
+    if finder is None or saver is None or not api_key.strip():
+        return
+    downloader = getattr(message_service, "pending_media_downloads", None)
+    path_saver = getattr(message_service, "set_message_media_path", None)
+    for row in finder(telegram_chat_id):
+        path: Path | None = None
+        if media_dir is not None and downloader is not None and path_saver is not None:
+            ref = MediaRef(kind="voice", file_id=row.telegram_file_id, filename="voice.ogg", mime="audio/ogg")
+            path = await materialize_media_ref(bot, ref, media_dir, row.chat_id, row.message_id)
+            if path is not None:
+                path_saver(row.id, str(path))
+        if path is None:
+            # Скачать не удалось - оставляем на следующую попытку (батч/рестарт).
+            logger.warning("event=voice_transcribe_failed reason=no_local_file update_id=%s", row.update_id)
+            continue
+        try:
+            transcript = await transcribe_audio_file(path, api_key=api_key, model=model)
+        except TranscriptionError as exc:
+            logger.error("event=voice_transcribe_failed reason=%s update_id=%s", exc, row.update_id)
+            transcript = ""
+        except Exception:
+            logger.exception("event=voice_transcribe_failed reason=unexpected update_id=%s", row.update_id)
+            transcript = ""
+        if transcript.strip():
+            saver(row.update_id, transcript)
+        else:
+            # Пустой аудиофайл, шум или сбой API: плейсхолдер вместо вечного ожидания.
+            saver(row.update_id, "не удалось распознать речь")
 
 
 def _confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
@@ -90,6 +138,29 @@ def _mentions_bot(message, bot) -> bool:
     return False
 
 
+def _mentions_bot_from_text(text: str | None, bot) -> bool:
+    """Находит текстовый тег или обращение в начале голосового транскрипта."""
+    if not text:
+        return False
+    names = {"agent"}
+    username = getattr(bot, "username", None)
+    if username:
+        names.add(str(username).casefold())
+    lowered = text.casefold().strip()
+    if any(f"@{name}" in lowered for name in names):
+        return True
+    spoken_names = {"агент", "рик"}
+    if username:
+        spoken_names.add(str(username).casefold().replace("_", " "))
+    for name in spoken_names:
+        if not lowered.startswith(name):
+            continue
+        tail = lowered[len(name):]
+        if not tail or not tail[0].isalnum():
+            return True
+    return False
+
+
 def _plain_owner_text(text: str | None, bot) -> str:
     """Снимает ведущий @тег бота, чтобы «Общий контекст:» работал и с тегом, и без."""
     stripped = (text or "").strip()
@@ -124,6 +195,8 @@ def create_telegram_application(
     catchup_max_seconds: float = 30.0,
     media_dir: Path | None = None,
     media_ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS,
+    openai_api_key: str = "",
+    transcription_model: str = "gpt-4o-mini-transcribe",
     polling_hard_timeout_seconds: float = 30.0,
     polling_watchdog_seconds: float = 15.0,
     polling_stall_seconds: float = 90.0,
@@ -149,6 +222,7 @@ def create_telegram_application(
     )
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
+    voice_tasks: dict[int, set[asyncio.Task[None]]] = {}
     retry_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     watchdog_task: asyncio.Task[None] | None = None
@@ -213,13 +287,18 @@ def create_telegram_application(
         if prompt_id is not None and attach is not None and message_id is not None:
             attach(prompt_id, message_id)
 
-    async def _try_continue_owner_query(bot, update: Update, reply_id: int | None) -> bool:
+    async def _try_continue_owner_query(
+        bot,
+        update: Update,
+        reply_id: int | None,
+        owner_text: str | None,
+    ) -> bool:
         handler = getattr(message_service, "continue_owner_query", None)
         message = update.effective_message
-        if handler is None or reply_id is None or message is None or not message.text:
+        if handler is None or reply_id is None or message is None or not owner_text:
             return False
         async with _typing(bot, owner_chat_id):
-            result = await handler(reply_id, message.text, update.update_id)
+            result = await handler(reply_id, owner_text, update.update_id)
             if result is None:
                 return False
             await _deliver_owner_query(bot, result)
@@ -302,6 +381,7 @@ def create_telegram_application(
         pending_ids = getattr(message_service, "pending_client_chat_ids", None)
         if pending_ids is not None:
             for chat_id in pending_ids():
+                await _transcribe_pending_voice(chat_id, bot)
                 await _hydrate_chat_media(bot, chat_id)
         for _ in range(5):
             suggestions = await catchup()
@@ -421,9 +501,76 @@ def create_telegram_application(
             if path is not None:
                 saver(row.id, str(path))
 
+    def _track_voice_task(chat_id: int, task: asyncio.Task[None]) -> None:
+        voice_tasks.setdefault(chat_id, set()).add(task)
+        task.add_done_callback(lambda done: voice_tasks.get(chat_id, set()).discard(done))
+
+    async def _transcribe_pending_voice(chat_id: int, bot) -> None:
+        await transcribe_pending_voice_messages(
+            message_service, bot,
+            media_dir=media_dir, api_key=openai_api_key, model=transcription_model,
+            telegram_chat_id=chat_id,
+        )
+
+    async def _transcribe_owner_voice(message, bot) -> str:
+        """Скачивает голосовое владельца и возвращает распознанный текст ('' при сбое)."""
+        voice = getattr(message, "voice", None)
+        file_id = str(getattr(voice, "file_id", "") or "")
+        if not openai_api_key.strip():
+            await _send(
+                bot, chat_id=owner_chat_id,
+                text="Голосовые не разобрать: не задан OPENAI_API_KEY. Напишите текстом.",
+            )
+            return ""
+        if media_dir is None or not file_id:
+            return ""
+        ref = MediaRef(kind="voice", file_id=file_id, filename="voice.ogg", mime="audio/ogg")
+        path = await materialize_media_ref(
+            bot, ref, media_dir, owner_chat_id, int(getattr(message, "message_id", 0) or 0),
+        )
+        if path is None:
+            logger.warning("event=owner_voice_failed reason=no_local_file")
+            await _send(
+                bot, chat_id=owner_chat_id,
+                text="Не смог скачать голосовое. Попробуйте ещё раз или напишите текстом.",
+            )
+            return ""
+        try:
+            transcript = await transcribe_audio_file(path, api_key=openai_api_key, model=transcription_model)
+        except Exception:
+            logger.exception("event=owner_voice_failed reason=transcription_error")
+            transcript = ""
+        finally:
+            delete_media_file(path)
+        if not transcript.strip():
+            logger.warning("event=owner_voice_failed reason=empty_transcript")
+            await _send(
+                bot, chat_id=owner_chat_id,
+                text="Речи в записи не услышал. Повторите или напишите текстом.",
+            )
+            return ""
+        logger.info("event=owner_voice_transcribed chars=%d", len(transcript))
+        return transcript
+
+    async def _wait_voice_tasks(chat_id: int) -> None:
+        tasks = [task for task in voice_tasks.get(chat_id, set()) if not task.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _voice_worker(chat_id: int, bot, update_id: int) -> None:
+        """Фоновая транскрибация одного голосового; результат пишется в SQLite."""
+        try:
+            await _transcribe_pending_voice(chat_id, bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("event=voice_worker_failed chat_id=%s update_id=%s", chat_id, update_id)
+
     async def _analyze_chat(chat_id: int, messages: list[IncomingMessage], bot) -> None:
         processor = getattr(message_service, "process_pending_chat", None)
         try:
+            await _wait_voice_tasks(chat_id)
+            await _transcribe_pending_voice(chat_id, bot)
             await _hydrate_chat_media(bot, chat_id)
             if processor is not None:
                 recommendation = await processor(chat_id, mode="live")
@@ -549,11 +696,25 @@ def create_telegram_application(
         message = update.effective_message
         chat = update.effective_chat
         sender = update.effective_user
-        if message is None or chat is None or chat.id != owner_chat_id or not message.text:
+        if message is None or chat is None or chat.id != owner_chat_id:
+            return False
+        is_voice = getattr(message, "voice", None) is not None and not message.text
+        if not message.text and not is_voice:
             return False
         reply = getattr(message, "reply_to_message", None)
         reply_id = getattr(reply, "message_id", None)
-        mentions = _mentions_bot(message, context.bot)
+        # python-telegram-bot делает Message неизменяемым, поэтому транскрипт
+        # живёт в локальной переменной, а не в message.text.
+        owner_text = message.text
+        if is_voice:
+            async with _typing(context.bot, owner_chat_id):
+                transcript = await _transcribe_owner_voice(message, context.bot)
+            if not transcript:
+                return True
+            owner_text = transcript
+            mentions = _mentions_bot_from_text(owner_text, context.bot)
+        else:
+            mentions = _mentions_bot(message, context.bot)
         replied_sender = getattr(reply, "from_user", None) if reply is not None else None
         bot_id = getattr(context.bot, "id", None)
         replied_to_this_bot = bool(
@@ -568,12 +729,12 @@ def create_telegram_application(
                     draft = await onboard_brief(
                         owner_chat_id, reply_id,
                         getattr(sender, "full_name", "") or "Неизвестный владелец",
-                        message.text, update.update_id,
+                        owner_text, update.update_id,
                     )
                     if draft is not None:
                         await _deliver_onboarding_draft(context.bot, draft)
                         return True
-        command_text = _plain_owner_text(message.text, context.bot)
+        command_text = _plain_owner_text(owner_text, context.bot)
         is_global_command = getattr(message_service, "is_global_memory_command", lambda _: False)
         if is_global_command(command_text):
             # Префикс сам вызывает бота: тег не обязателен, клиентский чат не нужен.
@@ -596,19 +757,21 @@ def create_telegram_application(
                 async with _typing(context.bot, owner_chat_id):
                     result = await question_handler(
                         owner_chat_id, reply_id, getattr(sender, "id", 0),
-                        getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+                        getattr(sender, "full_name", "") or "Неизвестный владелец", owner_text, update.update_id,
                     )
                     if result is not None:
                         await _handle_question_result(context.bot, result)
                         return True
-            if replied_to_this_bot and await _try_continue_owner_query(context.bot, update, reply_id):
+            if replied_to_this_bot and await _try_continue_owner_query(
+                context.bot, update, reply_id, owner_text,
+            ):
                 return True
             query = getattr(message_service, "handle_owner_query", None)
             if query is None:
                 return True
             logger.info("event=owner_query_received owner_message_id=%s update_id=%s", getattr(message, "message_id", None), update.update_id)
             async with _typing(context.bot, owner_chat_id):
-                answer = await query(message.text, reply_to_message_id=reply_id, update_id=update.update_id)
+                answer = await query(owner_text, reply_to_message_id=reply_id, update_id=update.update_id)
                 await _deliver_owner_query(context.bot, answer)
             return True
         if reply_id is None:
@@ -632,19 +795,19 @@ def create_telegram_application(
             async with _typing(context.bot, owner_chat_id):
                 result = await question_handler(
                     owner_chat_id, reply_id, getattr(sender, "id", 0),
-                    getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+                    getattr(sender, "full_name", "") or "Неизвестный владелец", owner_text, update.update_id,
                 )
                 if result is not None:
                     await _handle_question_result(context.bot, result)
                     return True
-        if await _try_continue_owner_query(context.bot, update, reply_id):
+        if await _try_continue_owner_query(context.bot, update, reply_id, owner_text):
             return True
         context_handler = getattr(message_service, "handle_owner_context", None)
         is_context_command = getattr(message_service, "is_memory_context_command", lambda _: False)
-        if is_context_command(message.text):
+        if is_context_command(owner_text):
             proposal = await context_handler(
                 owner_chat_id, reply_id, getattr(sender, "id", 0),
-                getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id,
+                getattr(sender, "full_name", "") or "Неизвестный владелец", owner_text, update.update_id,
             ) if context_handler is not None else None
             if proposal is None:
                 await _send(
@@ -655,10 +818,10 @@ def create_telegram_application(
             await _send_memory_proposal(context.bot, proposal)
             return True
         async with _typing(context.bot, owner_chat_id):
-            proposal = await message_service.clarify_feedback(reply_id, message.text, update.update_id)
+            proposal = await message_service.clarify_feedback(reply_id, owner_text, update.update_id)
             if proposal is None:
                 proposal = await message_service.handle_owner_feedback(
-                    owner_chat_id, reply_id, getattr(sender, "id", 0), getattr(sender, "full_name", "") or "Неизвестный владелец", message.text, update.update_id
+                    owner_chat_id, reply_id, getattr(sender, "id", 0), getattr(sender, "full_name", "") or "Неизвестный владелец", owner_text, update.update_id
                 )
             if proposal is None:
                 logger.info(
@@ -714,6 +877,12 @@ def create_telegram_application(
                 await _deliver_onboarding_notice(context.bot, notice)
             return
         item = _ingest(update, chat.id, False)
+        if (item.media_kind or "").casefold() == "voice":
+            # Транскрибация идёт параллельно окну батча; send_batch дождётся её.
+            task = asyncio.create_task(
+                _voice_worker(chat.id, context.bot, item.update_id), name="agentbridge-voice-transcribe",
+            )
+            _track_voice_task(chat.id, task)
         if not live_enabled:
             logger.info("event=client_message_deferred_catchup chat_id=%s update_id=%s", chat.id, update.update_id)
             return
@@ -815,7 +984,7 @@ def create_telegram_application(
         .build()
     )
     application.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.Document.ALL) & ~filters.COMMAND,
         queue_message,
     ))
     application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^(learn|memory|onboard):(yes|no):\d+$"))

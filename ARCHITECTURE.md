@@ -10,6 +10,8 @@ Telegram long polling (drop_pending_updates=False)
   -> hard-deadline getUpdates transport + monotonic polling heartbeat
   -> watchdog restarts a stalled updater, or fails the process if recovery fails
   -> persist each relevant update in SQLite (durable inbox/history)
+  -> transcribe voice notes in the background (TRANSCRIPTION_MODEL via
+     AgentBridge.transcribe, transcript stored by update_id in SQLite)
   -> download current-episode photos/PDFs via saved file_id into runtime/media
   -> live debounce per chat, or catch-up after restart
   -> application: episode from stored messages, context pack, one model turn
@@ -84,6 +86,8 @@ a series of outdated recommendations.
   plus an on-demand file index).
 - `agentbridge/media.py`: short-lived local copies of client photos/PDFs
   (deleted after the episode, TTL 1 hour) plus labels for history.
+- `agentbridge/transcribe.py`: OpenAI speech-to-text call used for client voice
+  notes; the configured `TRANSCRIPTION_MODEL` is the only transcription model.
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
   state, processed updates, pending/delivered recommendation links, learning
   drafts, versioned rules, memory, owner questions, experience, and Telegram
@@ -162,9 +166,16 @@ failure leaves the inbox row pending.
   episode, and anyway after `MEDIA_TTL_SECONDS`, default 1 hour). SQLite keeps
   Telegram `file_id` so a later turn can re-download. The bot cannot scroll a
   group's history like a user account.
+- Voice notes follow the same persist-first path: the row is stored before any
+  model work, then transcribed in the background during the batch window (or at
+  catch-up after restart). The transcript is stored by `update_id`; Codex sees
+  `[голосовое] текст`, never the audio file. API failure or silence becomes a
+  placeholder so a batch is never blocked; without `OPENAI_API_KEY` voice rows
+  simply stay pending. Owner-chat voice notes are transcribed on the fly and
+  then processed as ordinary owner text (feedback, answers, mention queries).
 - Tokens and credentials never appear unredacted in logs or tracked files.
 - Owner-group conversation invokes the agent on reply-to-bot, an explicit
-  mention/tag, or a global memory prefix (`Общий контекст:`). Ordinary
-  owner-group talk is ignored.
+  mention/tag, a voice transcript beginning with `Рик` or `Агент`, or a global
+  memory prefix (`Общий контекст:`). Ordinary owner-group talk is ignored.
 - `AgentProvider` is the only application-to-agent dependency; Telegram code
   must not depend on Codex SDK details.

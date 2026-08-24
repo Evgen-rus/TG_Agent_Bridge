@@ -28,6 +28,8 @@ class Settings:
     telegram_poll_restart_timeout_seconds: float = 30.0
     media_dir: Path = Path("runtime/media")
     media_ttl_seconds: int = 3600
+    openai_api_key: str = ""
+    transcription_model: str = "gpt-4o-mini-transcribe"
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -65,4 +67,6 @@ class Settings:
             telegram_poll_restart_timeout_seconds=float(os.getenv("TELEGRAM_POLL_RESTART_TIMEOUT_SECONDS", "30")),
             media_dir=root / os.getenv("MEDIA_DIR", "runtime/media"),
             media_ttl_seconds=int(os.getenv("MEDIA_TTL_SECONDS", "3600")),
+            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+            transcription_model=os.getenv("TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip(),
         )

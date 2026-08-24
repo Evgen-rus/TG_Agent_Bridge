@@ -923,6 +923,16 @@ class ChatThreadStore:
                 (media_path, message_id),
             )
 
+    def set_message_text(self, update_id: int, text: str) -> bool:
+        """Записывает распознанный текст голосового; только пока сообщение pending."""
+        with self._connect() as connection:
+            result = connection.execute(
+                """UPDATE telegram_messages SET text=? WHERE update_id=?
+                AND processing_status='pending'""",
+                (text, update_id),
+            )
+        return result.rowcount == 1
+
     def clear_media_paths(self, message_ids: list[int]) -> None:
         if not message_ids:
             return

@@ -13,6 +13,7 @@ chats/*
 # Pytest basetemp leftovers
 tmp/
 tmp_pytest/
+.pytest_tmp_run/
 
 # Python
 __pycache__/
