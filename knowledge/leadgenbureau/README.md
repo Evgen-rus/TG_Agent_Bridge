@@ -8,7 +8,7 @@
 ## Слои
 
 - `core.md` — короткий слой, который AgentBridge подмешивает в каждый ход чата с пакетом `leadgenbureau`.
-- `product.md`, `operations.md`, `analytics.md`, `playbooks.md`, `glossary.md` — shared: можно опираться при ответе клиенту, не раскрывая внутреннюю кухню.
+- `product.md`, `operations.md`, `analytics.md`, `playbooks.md`, `glossary.md` — shared: можно опираться при ответе клиенту, не раскрывая внутреннюю кухню. В `product.md` — форматы работы, позиционирование и процессы запуска.
 - `cases.md`, `needs_review.md` — internal: для reasoning. Не называть другому клиенту чужие компании, цифры и подробности.
 - Wiki конкретного чата — кто клиент, участники, его правила. Она важнее общей методики, если они расходятся.
 
