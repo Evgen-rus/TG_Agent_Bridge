@@ -36,6 +36,11 @@ def main() -> None:
         catchup_idle_seconds=settings.catchup_idle_seconds,
         media_dir=settings.media_dir,
         media_ttl_seconds=settings.media_ttl_seconds,
+        polling_hard_timeout_seconds=settings.telegram_poll_hard_timeout_seconds,
+        polling_watchdog_seconds=settings.telegram_poll_watchdog_seconds,
+        polling_stall_seconds=settings.telegram_poll_stall_seconds,
+        polling_restart_timeout_seconds=settings.telegram_poll_restart_timeout_seconds,
+        polling_bootstrap_retries=settings.telegram_bootstrap_retries,
     )
     logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
     telegram_application.run_polling(
@@ -43,6 +48,9 @@ def main() -> None:
         drop_pending_updates=False,
         bootstrap_retries=settings.telegram_bootstrap_retries,
     )
+    fatal_polling_reason = telegram_application.bot_data.get("agentbridge_polling_fatal")
+    if fatal_polling_reason:
+        raise RuntimeError(f"Telegram polling watchdog stopped AgentBridge: {fatal_polling_reason}")
 
 
 if __name__ == "__main__":

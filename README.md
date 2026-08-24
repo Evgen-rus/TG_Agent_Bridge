@@ -127,6 +127,18 @@ the defaults.
 Startup `getMe` retries `TELEGRAM_BOOTSTRAP_RETRIES` times (5 by default) if
 Telegram times out through a proxy. `0` keeps the old fail-fast behaviour.
 
+Long polling has a separate liveness guard. Every `getUpdates` call updates a
+monotonic heartbeat, including empty responses from quiet chats.
+`TELEGRAM_POLL_HARD_TIMEOUT_SECONDS` (30 by default) cancels a single stuck
+request. The watchdog checks every `TELEGRAM_POLL_WATCHDOG_SECONDS` (15) and,
+after `TELEGRAM_POLL_STALL_SECONDS` (90) without polling progress, restarts the
+Telegram updater without dropping pending updates. A restart has
+`TELEGRAM_POLL_RESTART_TIMEOUT_SECONDS` (30) to finish. If recovery fails, the
+process exits with an error instead of remaining falsely healthy; run it under
+a supervisor configured to restart failed processes. Healthy polling is logged
+at most once every five minutes, while stalls and restarts are logged
+immediately.
+
 Recommendations are written to SQLite before Telegram delivery. If Telegram is
 temporarily unavailable, delivery is retried every `DELIVERY_RETRY_SECONDS`
 seconds and pending recommendations are retried again after application restart.

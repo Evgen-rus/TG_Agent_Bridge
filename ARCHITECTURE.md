@@ -7,6 +7,8 @@ code and tests are authoritative when they differ from this summary.
 
 ```text
 Telegram long polling (drop_pending_updates=False)
+  -> hard-deadline getUpdates transport + monotonic polling heartbeat
+  -> watchdog restarts a stalled updater, or fails the process if recovery fails
   -> persist each relevant update in SQLite (durable inbox/history)
   -> download current-episode photos/PDFs via saved file_id into runtime/media
   -> live debounce per chat, or catch-up after restart
@@ -51,6 +53,15 @@ episode may notify the owner. `MESSAGE_BATCH_SECONDS` (20 by default) is the
 live debounce. `CATCHUP_IDLE_SECONDS` is the startup quiet window.
 `CATCHUP_EPISODE_SIZE` splits a large backlog. Different chats never share an
 episode.
+
+Polling liveness is independent of message traffic: every completed or failed
+`getUpdates` attempt advances a monotonic heartbeat, including empty responses.
+A hard request deadline prevents a single HTTP call from waiting forever. If
+the heartbeat becomes stale, the in-process watchdog stops and restarts the
+Updater with `drop_pending_updates=False`. If that bounded recovery fails, it
+requests application shutdown and `main` exits non-zero so an external
+supervisor can restart the whole process. The SQLite last-message time is not a
+health signal because all monitored chats may legitimately be quiet.
 
 A large backlog is split into ordered episodes (`CATCHUP_EPISODE_SIZE`). Only
 the final episode may notify the owner, so stale early questions do not create
@@ -143,6 +154,9 @@ client automatically.
   isolated. Shared cases are internal and must not be retold to another client.
 - A message is not marked processed until episode logic finishes. A model
 failure leaves the inbox row pending.
+- A live Python process is not considered proof of Telegram polling health;
+  `getUpdates` heartbeat progress is monitored independently and stale polling
+  is recovered without dropping Telegram backlog.
 - Client photos, PDFs, and media albums are analysed in that chat's Codex
   thread. Local files are working copies only (deleted after a successful
   episode, and anyway after `MEDIA_TTL_SECONDS`, default 1 hour). SQLite keeps

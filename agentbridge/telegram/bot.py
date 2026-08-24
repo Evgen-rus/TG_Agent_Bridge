@@ -26,6 +26,7 @@ from .formatter import (
     format_rules,
 )
 from .media import describe_message_media, has_client_content, materialize_media_ref, message_text
+from .polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
 
 _ADMIN_STATUSES = {"administrator", "creator"}
 _LEFT_STATUSES = {"left", "kicked"}
@@ -123,6 +124,11 @@ def create_telegram_application(
     catchup_max_seconds: float = 30.0,
     media_dir: Path | None = None,
     media_ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS,
+    polling_hard_timeout_seconds: float = 30.0,
+    polling_watchdog_seconds: float = 15.0,
+    polling_stall_seconds: float = 90.0,
+    polling_restart_timeout_seconds: float = 30.0,
+    polling_bootstrap_retries: int = 5,
 ) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
@@ -130,10 +136,22 @@ def create_telegram_application(
         raise ValueError("Message batch interval must not be negative.")
     if delivery_retry_seconds <= 0:
         raise ValueError("Delivery retry interval must be positive.")
+    if polling_stall_seconds <= polling_hard_timeout_seconds:
+        raise ValueError("Telegram polling stall threshold must exceed the hard polling timeout.")
+    heartbeat = PollingHeartbeat()
+    watchdog = PollingWatchdog(
+        heartbeat=heartbeat,
+        check_interval_seconds=polling_watchdog_seconds,
+        stall_seconds=polling_stall_seconds,
+        restart_timeout_seconds=polling_restart_timeout_seconds,
+        allowed_updates=("message", "callback_query", "my_chat_member"),
+        bootstrap_retries=polling_bootstrap_retries,
+    )
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
     retry_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
+    watchdog_task: asyncio.Task[None] | None = None
     live_enabled = catchup_idle_seconds <= 0
     last_ingest_at = time.monotonic()
 
@@ -324,7 +342,7 @@ def create_telegram_application(
             await _analyze_chat(chat_id, [], application.bot)
 
     async def _post_init(application: Application) -> None:
-        nonlocal retry_task, recovery_task, last_ingest_at, live_enabled
+        nonlocal retry_task, recovery_task, watchdog_task, last_ingest_at, live_enabled
         last_ingest_at = time.monotonic()
         if catchup_idle_seconds > 0:
             live_enabled = False
@@ -332,16 +350,18 @@ def create_telegram_application(
         else:
             live_enabled = True
         retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
+        watchdog_task = asyncio.create_task(watchdog.run(application), name="agentbridge-polling-watchdog")
 
     async def _post_stop(application: Application) -> None:
-        nonlocal retry_task, recovery_task
-        for task in (recovery_task, retry_task):
+        nonlocal retry_task, recovery_task, watchdog_task
+        for task in (recovery_task, retry_task, watchdog_task):
             if task is None:
                 continue
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         recovery_task = None
         retry_task = None
+        watchdog_task = None
 
     def _ingest(update: Update, chat_id: int, is_owner_chat: bool) -> IncomingMessage:
         nonlocal last_ingest_at
@@ -785,7 +805,15 @@ def create_telegram_application(
         text = "Активных правил для отмены нет." if rule is None else f"Последнее правило отменено:\n{rule.rule_text}"
         await _send(context.bot, chat_id=owner_chat_id, text=text)
 
-    application = Application.builder().token(token.strip()).post_init(_post_init).post_stop(_post_stop).build()
+    polling_request = HeartbeatHTTPXRequest(heartbeat, polling_hard_timeout_seconds)
+    application = (
+        Application.builder()
+        .token(token.strip())
+        .get_updates_request(polling_request)
+        .post_init(_post_init)
+        .post_stop(_post_stop)
+        .build()
+    )
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
         queue_message,

@@ -22,6 +22,10 @@ class Settings:
     catchup_idle_seconds: float = 2.0
     catchup_episode_size: int = 40
     telegram_bootstrap_retries: int = 5
+    telegram_poll_hard_timeout_seconds: float = 30.0
+    telegram_poll_watchdog_seconds: float = 15.0
+    telegram_poll_stall_seconds: float = 90.0
+    telegram_poll_restart_timeout_seconds: float = 30.0
     media_dir: Path = Path("runtime/media")
     media_ttl_seconds: int = 3600
 
@@ -55,6 +59,10 @@ class Settings:
             catchup_idle_seconds=float(os.getenv("CATCHUP_IDLE_SECONDS", "2")),
             catchup_episode_size=int(os.getenv("CATCHUP_EPISODE_SIZE", "40")),
             telegram_bootstrap_retries=int(os.getenv("TELEGRAM_BOOTSTRAP_RETRIES", "5")),
+            telegram_poll_hard_timeout_seconds=float(os.getenv("TELEGRAM_POLL_HARD_TIMEOUT_SECONDS", "30")),
+            telegram_poll_watchdog_seconds=float(os.getenv("TELEGRAM_POLL_WATCHDOG_SECONDS", "15")),
+            telegram_poll_stall_seconds=float(os.getenv("TELEGRAM_POLL_STALL_SECONDS", "90")),
+            telegram_poll_restart_timeout_seconds=float(os.getenv("TELEGRAM_POLL_RESTART_TIMEOUT_SECONDS", "30")),
             media_dir=root / os.getenv("MEDIA_DIR", "runtime/media"),
             media_ttl_seconds=int(os.getenv("MEDIA_TTL_SECONDS", "3600")),
         )
