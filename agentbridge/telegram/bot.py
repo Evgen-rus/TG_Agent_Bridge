@@ -123,12 +123,7 @@ def _onboarding_keyboard(onboarding_id: int) -> InlineKeyboardMarkup:
 
 def _mentions_bot(message, bot) -> bool:
     text = getattr(message, "text", None) or ""
-    names = {"agent"}
-    username = getattr(bot, "username", None)
-    if username:
-        names.add(str(username).casefold())
-    lowered = text.casefold()
-    if any(f"@{name}" in lowered for name in names):
+    if _mentions_bot_from_text(text, bot):
         return True
     bot_id = getattr(bot, "id", None)
     for entity in getattr(message, "entities", None) or []:
@@ -223,6 +218,7 @@ def create_telegram_application(
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
     voice_tasks: dict[int, set[asyncio.Task[None]]] = {}
+    owner_voice_retry_targets: dict[int, int] = {}
     retry_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     watchdog_task: asyncio.Task[None] | None = None
@@ -512,14 +508,24 @@ def create_telegram_application(
             telegram_chat_id=chat_id,
         )
 
-    async def _transcribe_owner_voice(message, bot) -> str:
+    async def _send_owner_voice_error(bot, text: str, reply_target_id: int | None) -> None:
+        sent = await _send(bot, chat_id=owner_chat_id, text=text)
+        error_message_id = getattr(sent, "message_id", None)
+        if reply_target_id is None or error_message_id is None:
+            return
+        owner_voice_retry_targets[int(error_message_id)] = reply_target_id
+        while len(owner_voice_retry_targets) > 100:
+            owner_voice_retry_targets.pop(next(iter(owner_voice_retry_targets)))
+
+    async def _transcribe_owner_voice(message, bot, reply_target_id: int | None) -> str:
         """Скачивает голосовое владельца и возвращает распознанный текст ('' при сбое)."""
         voice = getattr(message, "voice", None)
         file_id = str(getattr(voice, "file_id", "") or "")
         if not openai_api_key.strip():
-            await _send(
-                bot, chat_id=owner_chat_id,
-                text="Голосовые не разобрать: не задан OPENAI_API_KEY. Напишите текстом.",
+            await _send_owner_voice_error(
+                bot,
+                "Голосовые не разобрать: не задан OPENAI_API_KEY. Напишите текстом.",
+                reply_target_id,
             )
             return ""
         if media_dir is None or not file_id:
@@ -530,9 +536,10 @@ def create_telegram_application(
         )
         if path is None:
             logger.warning("event=owner_voice_failed reason=no_local_file")
-            await _send(
-                bot, chat_id=owner_chat_id,
-                text="Не смог скачать голосовое. Попробуйте ещё раз или напишите текстом.",
+            await _send_owner_voice_error(
+                bot,
+                "Не смог скачать голосовое. Повторите запись ответом на это сообщение или напишите текстом.",
+                reply_target_id,
             )
             return ""
         try:
@@ -544,9 +551,10 @@ def create_telegram_application(
             delete_media_file(path)
         if not transcript.strip():
             logger.warning("event=owner_voice_failed reason=empty_transcript")
-            await _send(
-                bot, chat_id=owner_chat_id,
-                text="Речи в записи не услышал. Повторите или напишите текстом.",
+            await _send_owner_voice_error(
+                bot,
+                "Речи в записи не услышал. Повторите запись ответом на это сообщение или напишите текстом.",
+                reply_target_id,
             )
             return ""
         logger.info("event=owner_voice_transcribed chars=%d", len(transcript))
@@ -702,13 +710,14 @@ def create_telegram_application(
         if not message.text and not is_voice:
             return False
         reply = getattr(message, "reply_to_message", None)
-        reply_id = getattr(reply, "message_id", None)
+        raw_reply_id = getattr(reply, "message_id", None)
+        reply_id = owner_voice_retry_targets.pop(raw_reply_id, raw_reply_id)
         # python-telegram-bot делает Message неизменяемым, поэтому транскрипт
         # живёт в локальной переменной, а не в message.text.
         owner_text = message.text
         if is_voice:
             async with _typing(context.bot, owner_chat_id):
-                transcript = await _transcribe_owner_voice(message, context.bot)
+                transcript = await _transcribe_owner_voice(message, context.bot, reply_id)
             if not transcript:
                 return True
             owner_text = transcript

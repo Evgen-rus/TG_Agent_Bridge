@@ -164,6 +164,22 @@ async def test_owner_mention_asks_the_assistant() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owner_rick_prefix_asks_the_assistant_without_telegram_tag() -> None:
+    service = OwnerAssistantService()
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321,
+        message_service=service, batch_seconds=0,
+    )
+    bot = FakeBot()
+    await _callback(application)(
+        FakeUpdate(FakeMessage("Рик, привет"), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert service.query_calls[0]["text"] == "Рик, привет"
+    assert "ждём расчёт" in bot.sent[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_reply_to_bot_mention_is_an_owner_query() -> None:
     service = OwnerAssistantService()
     application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)

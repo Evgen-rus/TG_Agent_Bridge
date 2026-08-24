@@ -177,5 +177,8 @@ failure leaves the inbox row pending.
 - Owner-group conversation invokes the agent on reply-to-bot, an explicit
   mention/tag, a voice transcript beginning with `Рик` or `Агент`, or a global
   memory prefix (`Общий контекст:`). Ordinary owner-group talk is ignored.
+  Telegram media downloads use bounded retries. If an owner voice download
+  still fails, its error message temporarily retains the original reply target
+  so an immediate voice retry continues the intended bot-message chain.
 - `AgentProvider` is the only application-to-agent dependency; Telegram code
   must not depend on Codex SDK details.

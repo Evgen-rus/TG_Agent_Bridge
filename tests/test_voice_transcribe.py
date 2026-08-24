@@ -409,18 +409,32 @@ async def test_owner_voice_reply_continues_owner_query_with_transcript(
 
     service = QueryContinuationService()
 
+    class RetryOwnerBot(FakeOwnerBot):
+        get_file_calls: int = 0
+
+        async def get_file(self, file_id: str):
+            self.get_file_calls += 1
+            if self.get_file_calls <= 3:
+                raise RuntimeError("temporary Telegram download failure")
+            return FakeTelegramFile(self.downloads)
+
     async def fake_transcribe(path, *, api_key: str, model: str) -> str:
         return "уточни следующий шаг по этому чату"
+
+    async def no_retry_delay(_seconds: float) -> None:
+        return None
 
     monkeypatch.setattr(
         "agentbridge.telegram.bot.transcribe_audio_file", fake_transcribe,
     )
+    monkeypatch.setattr("agentbridge.telegram.media.asyncio.sleep", no_retry_delay)
     application = create_telegram_application(
         token="test-token", owner_chat_id=7654321, message_service=service,
         batch_seconds=0, media_dir=tmp_path / "media", openai_api_key="k",
     )
-    bot = FakeOwnerBot()
+    bot = RetryOwnerBot()
     callback = application.handlers[0][0].callback
+    # Первая попытка исчерпывает Telegram-retry и создаёт служебное сообщение.
     await callback(
         FakeUpdate(
             OwnerVoiceMessage(
@@ -431,11 +445,25 @@ async def test_owner_voice_reply_continues_owner_query_with_transcript(
         ),
         type("Ctx", (), {"bot": bot})(),
     )
+    assert service.continued == []
+    assert any("Не смог скачать голосовое" in item["text"] for item in bot.sent)
+
+    # Повтор ответом на ошибку восстанавливает исходную привязку к сообщению 9002.
+    await callback(
+        FakeUpdate(
+            OwnerVoiceMessage(
+                voice=FakeVoice(file_id="owner-query-voice-retry"),
+                reply_to_message=FakeOwnerReply(9501, FakeBotUser()),
+            ),
+            FakeChat(7654321), FakeUser(), 615,
+        ),
+        type("Ctx", (), {"bot": bot})(),
+    )
 
     assert service.continued == [{
         "reply": 9002,
         "text": "уточни следующий шаг по этому чату",
-        "update_id": 614,
+        "update_id": 615,
     }]
     assert any("Продолжаю внутренний запрос" in item["text"] for item in bot.sent)
 

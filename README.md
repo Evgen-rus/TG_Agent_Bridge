@@ -71,6 +71,9 @@ A voice note sent by the owner in the owner chat (typically as a reply to a bot
 recommendation) is transcribed on the fly and then handled exactly like typed
 text: feedback and question answers work over voice. A standalone owner voice
 note invokes the assistant when its transcript begins with `Рик` or `Агент`.
+The same leading names invoke it in an ordinary owner text message. Telegram
+media downloads use bounded retries; replying to a voice-download error keeps
+the original bot-message link for the repeated voice note.
 
 For predictable suggest-only operation, startup no longer drops Telegram
 updates. Successfully processed update IDs are stored in the same SQLite

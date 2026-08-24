@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -62,19 +63,34 @@ def has_client_content(message) -> bool:
     return bool(message_text(message) or describe_message_media(message))
 
 
-async def download_telegram_file(bot, file_id: str, dest: Path) -> Path | None:
+async def download_telegram_file(
+    bot,
+    file_id: str,
+    dest: Path,
+    *,
+    attempts: int = 3,
+) -> Path | None:
     if not file_id or bot is None:
         return None
     dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        telegram_file = await bot.get_file(file_id)
-        await telegram_file.download_to_drive(custom_path=str(dest))
-    except Exception:
-        logger.warning("event=media_download_failed file_id_present=1 dest=%s", dest)
-        return None
-    if not dest.is_file() or dest.stat().st_size <= 0:
-        return None
-    return dest
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            telegram_file = await bot.get_file(file_id)
+            await telegram_file.download_to_drive(custom_path=str(dest))
+            if dest.is_file() and dest.stat().st_size > 0:
+                return dest
+            reason = "empty_file"
+        except Exception as exc:
+            reason = type(exc).__name__
+        dest.unlink(missing_ok=True)
+        logger.warning(
+            "event=media_download_retry file_id_present=1 attempt=%s max_attempts=%s reason=%s dest=%s",
+            attempt, max(1, attempts), reason, dest,
+        )
+        if attempt < max(1, attempts):
+            await asyncio.sleep(0.25 * attempt)
+    logger.warning("event=media_download_failed file_id_present=1 dest=%s", dest)
+    return None
 
 
 async def materialize_media_ref(bot, ref: MediaRef, root: Path, chat_id: int, message_id: int) -> Path | None:
