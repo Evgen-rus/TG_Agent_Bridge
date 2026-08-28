@@ -760,12 +760,12 @@ class AgentBridgeApplication:
         if chat is None and len(self.registry) == 1:
             chat = self.registry.all_chats()[0]
         if chat is None:
-            names = ", ".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
+            names = "\n\n".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
             prompt_id = self.store.create_owner_query_prompt(text)
             if update_id is not None:
                 self.store.mark_update_processed(update_id)
             return OwnerQueryResult(
-                f"Уточните, о каком чате речь. Сейчас подключены: {names}.",
+                f"Уточните, о каком чате речь. Сейчас подключены:\n\n{names}",
                 prompt_id,
             )
         answer = await self._answer_owner_query_for_chat(chat, text)
@@ -807,11 +807,11 @@ class AgentBridgeApplication:
             return self._follow_up_query_result(chat, text, answer)
         chat = self.registry.find_by_name(text)
         if chat is None:
-            names = ", ".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
+            names = "\n\n".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
             if update_id is not None:
                 self.store.mark_update_processed(update_id)
             return OwnerQueryResult(
-                f"Не нашёл такой чат. Напишите имя ещё раз. Сейчас подключены: {names}.",
+                f"Не нашёл такой чат. Напишите имя ещё раз. Сейчас подключены:\n\n{names}",
                 prompt.id,
             )
         self.store.answer_owner_query_prompt(prompt.id)

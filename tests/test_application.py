@@ -216,8 +216,14 @@ async def test_owner_query_clarifies_chat_then_uses_original_question(tmp_path) 
     )
     assert isinstance(first, OwnerQueryResult)
     assert first.prompt_id is not None
-    assert "Уточните, о каком чате речь" in first.text
+    names = "[LR225] ОптоБель\n\n[LR220] Риолюкс ЕКБ"
+    assert first.text == f"Уточните, о каком чате речь. Сейчас подключены:\n\n{names}"
     service.attach_owner_query_prompt(first.prompt_id, 9001)
+    retry = await service.continue_owner_query(9001, "Несуществующий чат", update_id=500)
+    assert isinstance(retry, OwnerQueryResult)
+    assert retry.text == f"Не нашёл такой чат. Напишите имя ещё раз. Сейчас подключены:\n\n{names}"
+    assert retry.prompt_id == first.prompt_id
+    assert provider.questions == []
     second = await service.continue_owner_query(9001, "[LR225] ОптоБель", update_id=502)
     assert isinstance(second, OwnerQueryResult)
     assert second.text == "Для [LR225] ОптоБель: методика дозвона."
