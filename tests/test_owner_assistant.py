@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from telegram.error import TimedOut
 
-from agentbridge.application import MemoryProposal, OwnerQueryResult, QuestionReplyResult, Suggestion
+from agentbridge.agents.base import AgentReply, FeedbackAnalysis, OwnerQueryAnswer
+from agentbridge.application import AgentBridgeApplication, MemoryProposal, OwnerQueryResult, QuestionReplyResult, Suggestion
+from agentbridge.storage.sqlite import ChatThreadStore
 from agentbridge.telegram.bot import create_telegram_application
+from agentbridge.telegram.formatter import split_owner_message
 
 
 @dataclass
@@ -259,3 +265,113 @@ async def test_owner_query_telegram_timeout_does_not_crash_handler() -> None:
     )
     assert service.query_calls
     assert bot.sent == []
+
+
+class MultipartBot(FakeBot):
+    def __init__(self, fail_at=0):
+        super().__init__()
+        self.fail_at = fail_at
+        self.attempts = 0
+
+    async def send_message(self, **kwargs):
+        assert len(kwargs["text"].encode("utf-16-le")) // 2 <= 4096
+        self.attempts += 1
+        if self.attempts == self.fail_at:
+            raise TimedOut("temporary timeout")
+        return await super().send_message(**kwargs)
+
+
+async def _deliver_pending(application, bot):
+    application.bot = bot
+    await application.post_init(application)
+    try:
+        await asyncio.sleep(0.04)
+    finally:
+        await application.post_stop(application)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_part", [0, 1, -1], ids=["first", "middle", "last"])
+async def test_long_query_resumes_delivery_and_reply_to_any_part_continues_thread(
+    tmp_path, chat_registry, reply_part,
+) -> None:
+    path = tmp_path / "query.sqlite3"
+    answer = "Большой ответ владельцу 🚀\n" * 450
+    provider = SimpleNamespace(answer_owner_query=AsyncMock(side_effect=[
+        OwnerQueryAnswer("owner-thread", answer), OwnerQueryAnswer("owner-thread", "Продолжаем"),
+    ]))
+    service = AgentBridgeApplication(chat_registry, ChatThreadStore(path), provider, 7654321)
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service)
+    bot = MultipartBot(fail_at=2)
+    await _callback(application)(
+        FakeUpdate(FakeMessage("Рик, как дела у Acme?"), FakeChat(7654321), FakeUser(), 601), FakeContext(bot),
+    )
+    assert len(bot.sent) == 1
+    assert len(service.pending_owner_query_deliveries()) == 1
+
+    service = AgentBridgeApplication(chat_registry, ChatThreadStore(path), provider, 7654321)
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service)
+    await _deliver_pending(application, bot)
+    expected = split_owner_message(answer)
+    assert [item["text"] for item in bot.sent] == expected
+    assert service.pending_owner_query_deliveries() == []
+    assert provider.answer_owner_query.await_count == 1
+    part_ids = list(range(1001, 1001 + len(expected)))
+    await _callback(application)(
+        FakeUpdate(
+            FakeMessage("А какой следующий шаг?", FakeReply(part_ids[reply_part], FakeUser(777, "Рик", True))),
+            FakeChat(7654321), FakeUser(), 602,
+        ), FakeContext(bot),
+    )
+    assert bot.sent[-1]["text"] == "Продолжаем"
+    assert provider.answer_owner_query.await_count == 2
+    assert provider.answer_owner_query.call_args.kwargs["thread_id"] == "owner-thread"
+    assert all(item["chat_id"] == 7654321 for item in bot.sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["reply", "ask_owner"])
+async def test_reply_to_first_recommendation_part_preserves_feedback_and_question_paths(
+    tmp_path, chat_registry, action,
+) -> None:
+    store = ChatThreadStore(tmp_path / "reply.sqlite3")
+    recommendation_id = store.create_recommendation(
+        telegram_chat_id=-100123456, chat_name="Acme Support", sender_name="Alice",
+        original_message="Контекст\n" * 1100, situation="Нужен срок", suggested_reply="Ответ",
+        owner_chat_id=7654321, action=action, owner_question="Какой срок?",
+    )
+    if action == "ask_owner":
+        store.create_owner_question(-100123456, "Какой срок?", recommendation_id)
+    provider = SimpleNamespace(
+        suggest=AsyncMock(return_value=AgentReply("client-thread", "Срок известен", "Завтра")),
+        analyze_feedback=AsyncMock(return_value=FeedbackAnalysis(
+            "Подробное понимание поправки.\n" * 350, None, None, "client", False, None,
+        )),
+    )
+    service = AgentBridgeApplication(chat_registry, store, provider, 7654321)
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service)
+    bot = MultipartBot()
+    await _deliver_pending(application, bot)
+    recommendation_parts = len(bot.sent)
+    assert recommendation_parts > 1
+    update = FakeUpdate(
+        FakeMessage("Срок завтра", FakeReply(1001, FakeUser(777, "Рик", True))),
+        FakeChat(7654321), FakeUser(), 701,
+    )
+    await _callback(application)(update, FakeContext(bot))
+    if action == "ask_owner":
+        assert provider.suggest.await_count == 1
+        assert provider.analyze_feedback.await_count == 0
+        assert "Срок завтра" in provider.suggest.call_args.kwargs["message"]
+    else:
+        assert provider.analyze_feedback.await_count == 1
+        assert provider.analyze_feedback.call_args.kwargs["original_message"] == "Контекст\n" * 1100
+        # A long learning proposal is also split; only its final part has buttons.
+        proposal_parts = bot.sent[recommendation_parts:]
+        assert len(proposal_parts) > 1
+        assert all("reply_markup" not in part for part in proposal_parts[:-1])
+        assert proposal_parts[-1]["reply_markup"].inline_keyboard[0][0].callback_data.startswith("learn:yes:")
+    before_duplicate = len(bot.sent)
+    await _callback(application)(update, FakeContext(bot))
+    assert len(bot.sent) == before_duplicate
+    assert all(item["chat_id"] == 7654321 for item in bot.sent)

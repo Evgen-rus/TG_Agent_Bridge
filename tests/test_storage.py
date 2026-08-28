@@ -80,6 +80,26 @@ def test_pending_recommendation_survives_restart_until_owner_delivery(tmp_path) 
     assert restarted_store.pending_recommendations(7654321) == []
 
 
+def test_delivery_parts_survive_restart_and_resolve_only_within_owner_chat(tmp_path) -> None:
+    path = tmp_path / "parts.sqlite3"
+    store = ChatThreadStore(path)
+    assert store.prepare_owner_delivery_parts(42, "recommendation:88", ["первая", "вторая"]) == [
+        ("первая", None), ("вторая", None),
+    ]
+    store.record_owner_delivery_part(42, "recommendation:88", 0, 101)
+    restarted = ChatThreadStore(path)
+    # Retries must use the frozen text even if formatting code has changed.
+    assert restarted.prepare_owner_delivery_parts(42, "recommendation:88", ["changed"]) == [
+        ("первая", 101), ("вторая", None),
+    ]
+    assert restarted.resolve_owner_reply(42, 101) == 101
+    restarted.record_owner_delivery_part(42, "recommendation:88", 1, 102)
+    assert restarted.resolve_owner_reply(42, 101) == 102
+    assert restarted.resolve_owner_reply(42, 102) == 102
+    assert restarted.resolve_owner_reply(43, 101) == 101
+    assert restarted.resolve_owner_reply(42, 999) == 999
+
+
 def test_chat_onboarding_survives_restart(tmp_path) -> None:
     database_path = tmp_path / "runtime" / "agentbridge.sqlite3"
     first = ChatThreadStore(database_path)

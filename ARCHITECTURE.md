@@ -128,8 +128,19 @@ local context.
 
 Recommendations are persisted before owner delivery. A missing owner message ID
 means the recommendation is pending; the Telegram adapter retries pending rows
-periodically and on startup. This is at-least-once delivery, so a crash between
-Telegram acceptance and SQLite acknowledgement can produce a duplicate.
+periodically and on startup. All owner text is split losslessly into numbered
+parts when needed to fit Telegram's 4096-character limit (with a conservative
+UTF-16 budget including part headers). Confirmation buttons appear only on the
+last part. SQLite `owner_delivery_parts` freezes the split and records each
+accepted part. Recommendation and owner-query retries, including after restart,
+skip acknowledged parts and mark the whole delivery complete only after its
+final part. Replies to any part of a completed message are resolved to the final
+message ID, preserving recommendation, ASK_OWNER, and query-continuation links.
+Other multi-part owner notices use the same reply mapping; only existing durable
+delivery queues are retried automatically. This is at-least-once delivery: a crash
+between Telegram acceptance and SQLite acknowledgement can duplicate that part.
+Telegram BadRequest rejections are logged separately from network/time-out errors,
+without logging raw exception text that could contain credentials.
 
 A newer rule with the same semantic conflict key supersedes the old version.
 Global scope also requires explicit global wording in the owner's feedback.

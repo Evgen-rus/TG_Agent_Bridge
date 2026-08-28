@@ -346,6 +346,15 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_owner_query_deliveries_pending
                     ON owner_query_deliveries(owner_message_id);
+                CREATE TABLE IF NOT EXISTS owner_delivery_parts (
+                    owner_chat_id INTEGER NOT NULL,
+                    delivery_key TEXT NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    owner_message_id INTEGER,
+                    PRIMARY KEY(owner_chat_id, delivery_key, part_index),
+                    UNIQUE(owner_chat_id, owner_message_id)
+                );
                 CREATE TABLE IF NOT EXISTS experience_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_chat_id INTEGER,
@@ -610,6 +619,51 @@ class ChatThreadStore:
                 (owner_chat_id,),
             ).fetchall()
         return [self._recommendation(row) for row in rows]
+
+    def prepare_owner_delivery_parts(
+        self, owner_chat_id: int, delivery_key: str, texts: list[str],
+    ) -> list[tuple[str, int | None]]:
+        """Freeze the original split, including across retries/code upgrades."""
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM owner_delivery_parts WHERE owner_chat_id=? AND delivery_key=? LIMIT 1",
+                (owner_chat_id, delivery_key),
+            ).fetchone()
+            if exists is None:
+                connection.executemany(
+                    "INSERT INTO owner_delivery_parts (owner_chat_id, delivery_key, part_index, text) VALUES (?, ?, ?, ?)",
+                    [(owner_chat_id, delivery_key, index, text) for index, text in enumerate(texts)],
+                )
+            rows = connection.execute(
+                "SELECT text, owner_message_id FROM owner_delivery_parts WHERE owner_chat_id=? AND delivery_key=? ORDER BY part_index",
+                (owner_chat_id, delivery_key),
+            ).fetchall()
+        return [(row["text"], row["owner_message_id"]) for row in rows]
+
+    def record_owner_delivery_part(
+        self, owner_chat_id: int, delivery_key: str, part_index: int, owner_message_id: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE owner_delivery_parts SET owner_message_id=?
+                WHERE owner_chat_id=? AND delivery_key=? AND part_index=? AND owner_message_id IS NULL""",
+                (owner_message_id, owner_chat_id, delivery_key, part_index),
+            )
+
+    def resolve_owner_reply(self, owner_chat_id: int, owner_message_id: int) -> int:
+        """All parts of a completed send refer to its final, linked message."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT owner_message_id FROM owner_delivery_parts
+                WHERE owner_chat_id=? AND delivery_key=(
+                    SELECT delivery_key FROM owner_delivery_parts
+                    WHERE owner_chat_id=? AND owner_message_id=?
+                ) ORDER BY part_index""",
+                (owner_chat_id, owner_chat_id, owner_message_id),
+            ).fetchall()
+        if rows and all(row["owner_message_id"] is not None for row in rows):
+            return rows[-1]["owner_message_id"]
+        return owner_message_id
 
     def attach_owner_message(self, recommendation_id: int, owner_chat_id: int, owner_message_id: int) -> None:
         with self._connect() as connection:

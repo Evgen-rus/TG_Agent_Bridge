@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import time
+from types import SimpleNamespace
 
 import pytest
-from telegram.error import NetworkError
+from telegram.error import BadRequest, NetworkError
 
-from agentbridge.application import Suggestion
+from agentbridge.application import AgentBridgeApplication, Suggestion
+from agentbridge.storage.sqlite import ChatThreadStore
 from agentbridge.telegram.bot import create_telegram_application
+from agentbridge.telegram.formatter import format_owner_message, split_owner_message
 
 
 @dataclass
@@ -309,6 +312,108 @@ async def test_failed_owner_delivery_is_retried_by_delivery_loop() -> None:
     assert len(bot.sent) == 1
     assert bot.sent[0]["chat_id"] == owner_chat_id
     assert service.pending is False
+
+
+class LimitedBot(RetryingBot):
+    def __init__(self, fail_at=0):
+        super().__init__(failures_remaining=0)
+        self.attempts = 0
+        self.fail_at = fail_at
+
+    async def send_message(self, *, chat_id, text):
+        self.attempts += 1
+        if len(text.encode("utf-16-le")) // 2 > 4096:
+            raise BadRequest("Message is too long")
+        if self.attempts == self.fail_at:
+            raise NetworkError("temporary failure between parts")
+        return await super().send_message(chat_id=chat_id, text=text)
+
+
+async def _run_delivery_scan(service, bot):
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=service,
+    )
+    application.bot = bot
+    await application.post_init(application)
+    try:
+        await asyncio.sleep(0.04)
+    finally:
+        await application.post_stop(application)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [2, 3])
+async def test_multipart_recommendation_resumes_after_restart_without_repeating_parts(
+    tmp_path, chat_registry, fail_at,
+) -> None:
+    path = tmp_path / "deliveries.sqlite3"
+    store = ChatThreadStore(path)
+    recommendation_id = store.create_recommendation(
+        telegram_chat_id=-100123456, chat_name="Acme", sender_name="Alice",
+        original_message="Большое сообщение 🚀\n" * 500,
+        situation="Не хватает данных", suggested_reply="", owner_chat_id=7654321,
+        action="ask_owner", owner_question="Какой срок?",
+    )
+    store.create_owner_question(-100123456, "Какой срок?", recommendation_id)
+    service = AgentBridgeApplication(chat_registry, store, SimpleNamespace(), 7654321)
+    original = format_owner_message(service.pending_suggestions(7654321)[0])
+    expected = split_owner_message(original)
+    bot = LimitedBot(fail_at=fail_at)
+
+    await _run_delivery_scan(service, bot)
+    assert len(bot.sent) == fail_at - 1
+    assert store.get_recommendation(recommendation_id).owner_message_id is None
+    assert [row.id for row in store.pending_recommendations(7654321)] == [recommendation_id]
+
+    restarted = ChatThreadStore(path)
+    service = AgentBridgeApplication(chat_registry, restarted, SimpleNamespace(), 7654321)
+    await _run_delivery_scan(service, bot)
+    assert [item["text"] for item in bot.sent] == expected
+    assert all(item["chat_id"] == 7654321 for item in bot.sent)
+    assert restarted.pending_recommendations(7654321) == []
+    final_id = 9000 + len(expected)
+    for message_id in range(9001, final_id + 1):
+        canonical_id = service.resolve_owner_reply(7654321, message_id)
+        assert restarted.get_recommendation_by_owner_message(7654321, canonical_id).id == recommendation_id
+        assert restarted.get_owner_question_by_message(canonical_id).recommendation_id == recommendation_id
+    await _run_delivery_scan(service, bot)
+    assert len(bot.sent) == len(expected)
+
+
+@pytest.mark.asyncio
+async def test_all_parts_sent_before_crash_are_not_resent_when_final_link_is_missing(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "deliveries.sqlite3")
+    recommendation_id = store.create_recommendation(
+        telegram_chat_id=-100123456, chat_name="Acme", sender_name="Alice",
+        original_message="я" * 8000, situation="Ситуация", suggested_reply="Ответ", owner_chat_id=7654321,
+    )
+    service = AgentBridgeApplication(chat_registry, store, SimpleNamespace(), 7654321)
+    parts = split_owner_message(format_owner_message(service.pending_suggestions(7654321)[0]))
+    key = f"recommendation:{recommendation_id}"
+    store.prepare_owner_delivery_parts(7654321, key, parts)
+    for index in range(len(parts)):
+        store.record_owner_delivery_part(7654321, key, index, 8000 + index)
+    bot = LimitedBot()
+    await _run_delivery_scan(service, bot)
+    assert bot.sent == []
+    assert store.get_recommendation(recommendation_id).owner_message_id == 8000 + len(parts) - 1
+
+
+@pytest.mark.asyncio
+async def test_bad_request_is_not_reported_as_network_failure_or_leaked(caplog) -> None:
+    secret = "123456789:abcdefghijklmnopqrstuvwxyz0123456789"
+
+    class RejectingBot:
+        async def send_message(self, **kwargs):
+            raise BadRequest(f"Message is too long https://api.telegram.org/bot{secret}/sendMessage")
+
+    service = PersistentDeliveryService(Suggestion("Acme", "Alice", "hello", "test", "reply", 12))
+    await _run_delivery_scan(service, RejectingBot())
+    assert service.pending
+    assert "reason=telegram_bad_request" in caplog.text
+    assert "reason=message_too_long" in caplog.text
+    assert "telegram_network_error" not in caplog.text
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -4,8 +4,42 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from telegram.constants import MessageLimit
+
 from agentbridge.agents.base import AgentAction
 from agentbridge.application import action_label
+
+
+def split_owner_message(text: str) -> list[str]:
+    """Split literal text losslessly, reserving room for numbered part headers.
+
+    Count UTF-16 units conservatively so astral emoji also fit Telegram limits.
+    Prefer a newline or a word boundary, but also support long unbroken text.
+    """
+    limit = int(MessageLimit.MAX_TEXT_LENGTH)
+    if len(text.encode("utf-16-le")) // 2 <= limit:
+        return [text]
+    # The number of parts cannot exceed the number of source characters.
+    budget = limit - len(f"Часть {len(text)}/{len(text)}\n\n")
+    chunks = []
+    start = 0
+    while start < len(text):
+        end, units = start, 0
+        while end < len(text):
+            width = 2 if ord(text[end]) > 0xFFFF else 1
+            if units + width > budget:
+                break
+            units += width
+            end += 1
+        if end < len(text):
+            for separator in ("\n", " "):
+                boundary = text.rfind(separator, start + (end - start) // 2, end)
+                if boundary >= 0:
+                    end = boundary + 1
+                    break
+        chunks.append(text[start:end])
+        start = end
+    return [f"Часть {index}/{len(chunks)}\n\n{chunk}" for index, chunk in enumerate(chunks, 1)]
 
 
 def format_owner_message(suggestion: "Suggestion") -> str:

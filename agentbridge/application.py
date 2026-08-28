@@ -515,6 +515,15 @@ class AgentBridgeApplication:
         # Только compact core и список файлов, не вся база. Wiki чата важнее общей методики.
         return load_knowledge_pack(self.knowledge_dir, chat.knowledge_pack)
 
+    def prepare_owner_delivery_parts(self, owner_chat_id: int, delivery_key: str, texts: list[str]) -> list[tuple[str, int | None]]:
+        return self.store.prepare_owner_delivery_parts(owner_chat_id, delivery_key, texts)
+
+    def record_owner_delivery_part(self, owner_chat_id: int, delivery_key: str, part_index: int, owner_message_id: int) -> None:
+        self.store.record_owner_delivery_part(owner_chat_id, delivery_key, part_index, owner_message_id)
+
+    def resolve_owner_reply(self, owner_chat_id: int, owner_message_id: int) -> int:
+        return self.store.resolve_owner_reply(owner_chat_id, owner_message_id)
+
     def record_owner_delivery(self, recommendation_id: int, owner_chat_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_message(recommendation_id, owner_chat_id, owner_message_id)
         logger.info("event=owner_delivery_linked recommendation_id=%s owner_message_id=%s", recommendation_id, owner_message_id)

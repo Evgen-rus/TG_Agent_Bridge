@@ -9,10 +9,12 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import time
+from types import SimpleNamespace
 from typing import Protocol
+from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import NetworkError
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
@@ -25,6 +27,7 @@ from .formatter import (
     format_onboarding_notice,
     format_owner_message,
     format_rules,
+    split_owner_message,
 )
 from .media import describe_message_media, has_client_content, materialize_media_ref, message_text
 from .polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
@@ -217,6 +220,7 @@ def create_telegram_application(
     )
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
+    send_lock = asyncio.Lock()
     voice_tasks: dict[int, set[asyncio.Task[None]]] = {}
     owner_voice_retry_targets: dict[int, int] = {}
     retry_task: asyncio.Task[None] | None = None
@@ -225,11 +229,42 @@ def create_telegram_application(
     live_enabled = catchup_idle_seconds <= 0
     last_ingest_at = time.monotonic()
 
-    async def _send(bot, *, chat_id: int, text: str, reply_markup=None):
-        kwargs = {"chat_id": chat_id, "text": text}
-        if reply_markup is not None:
-            kwargs["reply_markup"] = reply_markup
-        return await bot.send_message(**kwargs)
+    async def _send(bot, *, chat_id: int, text: str, reply_markup=None, delivery_key: str | None = None):
+        if chat_id != owner_chat_id:
+            raise ValueError("Outbound messages must target the owner chat")
+        async with send_lock:
+            texts = split_owner_message(text)
+            prepare = getattr(message_service, "prepare_owner_delivery_parts", None)
+            record = getattr(message_service, "record_owner_delivery_part", None)
+            durable = prepare is not None and record is not None and (delivery_key is not None or len(texts) > 1)
+            key = delivery_key or f"message:{uuid4().hex}"
+            parts = prepare(chat_id, key, texts) if durable else [(part, None) for part in texts]
+            sent = None
+            for index, (part, message_id) in enumerate(parts):
+                if message_id is not None:
+                    sent = SimpleNamespace(message_id=message_id)
+                    continue
+                kwargs = {"chat_id": chat_id, "text": part}
+                if reply_markup is not None and index == len(parts) - 1:
+                    kwargs["reply_markup"] = reply_markup
+                try:
+                    sent = await bot.send_message(**kwargs)
+                except BadRequest as exc:
+                    # Fixed labels only: Telegram exceptions can contain URLs/tokens.
+                    reason = "message_too_long" if "message is too long" in str(exc).lower() else "bad_request"
+                    logger.warning(
+                        "event=telegram_send_rejected reason=%s error_type=%s part=%s/%s text_chars=%s",
+                        reason, type(exc).__name__, index + 1, len(parts), len(part),
+                    )
+                    raise
+                message_id = getattr(sent, "message_id", None)
+                if durable:
+                    if message_id is None:
+                        raise RuntimeError("Telegram send returned no message ID")
+                    record(chat_id, key, index, message_id)
+                if len(parts) > 1:
+                    logger.info("event=owner_delivery_part_sent part=%s/%s owner_message_id=%s", index + 1, len(parts), message_id)
+            return sent
 
     async def _send_typing(bot, chat_id: int) -> None:
         send_action = getattr(bot, "send_chat_action", None)
@@ -268,9 +303,15 @@ def create_telegram_application(
         if delivery_id is None and save is not None:
             delivery_id = save(text, prompt_id)
         try:
-            sent = await _send(bot, chat_id=owner_chat_id, text=text)
-        except NetworkError:
-            logger.warning("event=owner_query_delivery_pending reason=telegram_network_error")
+            sent = await _send(
+                bot, chat_id=owner_chat_id, text=text,
+                delivery_key=f"owner-query:{delivery_id}" if delivery_id is not None else None,
+            )
+        except BadRequest:
+            logger.warning("event=owner_query_delivery_pending reason=telegram_bad_request")
+            return
+        except NetworkError as exc:
+            logger.warning("event=owner_query_delivery_pending reason=telegram_network_error error_type=%s", type(exc).__name__)
             return
         except Exception:
             logger.exception("event=owner_query_delivery_pending reason=delivery_error")
@@ -308,7 +349,10 @@ def create_telegram_application(
                     logger.info("event=owner_delivery_already_linked recommendation_id=%s", suggestion.recommendation_id)
                     return True
             try:
-                sent = await _send(bot, chat_id=owner_chat_id, text=format_owner_message(suggestion))
+                sent = await _send(
+                    bot, chat_id=owner_chat_id, text=format_owner_message(suggestion),
+                    delivery_key=f"recommendation:{suggestion.recommendation_id}" if suggestion.recommendation_id else None,
+                )
                 message_id = getattr(sent, "message_id", None)
                 if message_id is None:
                     logger.warning("event=owner_delivery_pending reason=no_message_id recommendation_id=%s", suggestion.recommendation_id)
@@ -317,8 +361,11 @@ def create_telegram_application(
                     message_service.record_owner_delivery(recommendation_id=suggestion.recommendation_id, owner_chat_id=owner_chat_id, owner_message_id=message_id)
                 logger.info("event=owner_suggestion_sent recommendation_id=%s owner_message_id=%s", suggestion.recommendation_id, message_id)
                 return True
-            except NetworkError:
-                logger.warning("event=owner_delivery_pending reason=telegram_network_error recommendation_id=%s", suggestion.recommendation_id)
+            except BadRequest:
+                logger.warning("event=owner_delivery_pending reason=telegram_bad_request recommendation_id=%s", suggestion.recommendation_id)
+                return False
+            except NetworkError as exc:
+                logger.warning("event=owner_delivery_pending reason=telegram_network_error error_type=%s recommendation_id=%s", type(exc).__name__, suggestion.recommendation_id)
                 return False
             except Exception:
                 logger.exception("event=owner_delivery_pending reason=delivery_error recommendation_id=%s", suggestion.recommendation_id)
@@ -613,7 +660,10 @@ def create_telegram_application(
     async def _deliver_onboarding_notice(bot, notice: OnboardingNotice) -> None:
         if not notice.needs_delivery:
             return
-        sent = await _send(bot, chat_id=owner_chat_id, text=format_onboarding_notice(notice))
+        sent = await _send(
+            bot, chat_id=owner_chat_id, text=format_onboarding_notice(notice),
+            delivery_key=f"onboarding-notice:{notice.onboarding_id}",
+        )
         message_id = getattr(sent, "message_id", None)
         recorder = getattr(message_service, "record_onboarding_notice", None)
         if recorder is not None and message_id is not None:
@@ -712,6 +762,9 @@ def create_telegram_application(
         reply = getattr(message, "reply_to_message", None)
         raw_reply_id = getattr(reply, "message_id", None)
         reply_id = owner_voice_retry_targets.pop(raw_reply_id, raw_reply_id)
+        resolve_reply = getattr(message_service, "resolve_owner_reply", None)
+        if reply_id is not None and resolve_reply is not None:
+            reply_id = resolve_reply(owner_chat_id, reply_id)
         # python-telegram-bot делает Message неизменяемым, поэтому транскрипт
         # живёт в локальной переменной, а не в message.text.
         owner_text = message.text
