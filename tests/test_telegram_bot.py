@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 from telegram.error import BadRequest, NetworkError
+from telegram import BotCommandScopeChat, BotCommandScopeDefault
 
 from agentbridge.application import AgentBridgeApplication, Suggestion
 from agentbridge.storage.sqlite import ChatThreadStore
-from agentbridge.telegram.bot import create_telegram_application
+from agentbridge.telegram.bot import create_telegram_application, register_owner_command_menu
 from agentbridge.telegram.formatter import format_owner_message, split_owner_message
 
 
@@ -498,3 +499,41 @@ async def test_startup_defers_live_until_after_polling_and_catchup() -> None:
     assert service.catchups == ["run"]
     assert service.lives == []
     await application.post_stop(application)
+
+
+@dataclass
+class CommandMenuBot:
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def set_my_commands(self, commands, scope=None):
+        self.calls.append({"commands": list(commands), "scope": scope})
+
+
+@dataclass
+class FailingCommandMenuBot:
+    async def set_my_commands(self, commands, scope=None):
+        raise NetworkError("temporary Telegram outage")
+
+
+@pytest.mark.asyncio
+async def test_owner_command_menu_is_scoped_to_owner_chat_only() -> None:
+    bot = CommandMenuBot()
+
+    await register_owner_command_menu(bot, 7654321)
+
+    assert len(bot.calls) == 2
+    default_call, owner_call = bot.calls
+    assert default_call["commands"] == []
+    assert isinstance(default_call["scope"], BotCommandScopeDefault)
+    assert [(item.command, item.description) for item in owner_call["commands"]] == [
+        ("rules", "Показать активные правила"),
+        ("undo", "Отменить последнее правило"),
+    ]
+    assert isinstance(owner_call["scope"], BotCommandScopeChat)
+    assert owner_call["scope"].chat_id == 7654321
+
+
+@pytest.mark.asyncio
+async def test_owner_command_menu_failure_does_not_raise() -> None:
+    await register_owner_command_menu(FailingCommandMenuBot(), 7654321)
+    await register_owner_command_menu(FakeBot(), 7654321)

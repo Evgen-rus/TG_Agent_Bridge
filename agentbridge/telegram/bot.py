@@ -13,8 +13,8 @@ from types import SimpleNamespace
 from typing import Protocol
 from uuid import uuid4
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, NetworkError
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
@@ -35,6 +35,10 @@ from .polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
 _ADMIN_STATUSES = {"administrator", "creator"}
 _LEFT_STATUSES = {"left", "kicked"}
 _TYPING_REFRESH_SECONDS = 4.0
+_OWNER_BOT_COMMANDS = (
+    BotCommand("rules", "Показать активные правила"),
+    BotCommand("undo", "Отменить последнее правило"),
+)
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +119,19 @@ async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
         await coro
     except NetworkError:
         logger.warning("event=telegram_transient_error operation=%s", operation)
+
+
+async def register_owner_command_menu(bot, owner_chat_id: int) -> None:
+    """Показывает /rules и /undo только в owner-чате; в остальных чатах меню пустое."""
+    setter = getattr(bot, "set_my_commands", None)
+    if setter is None:
+        return
+    try:
+        # Сначала сбрасываем глобальный список, чтобы команды не всплыли в клиентских чатах.
+        await setter((), scope=BotCommandScopeDefault())
+        await setter(_OWNER_BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=owner_chat_id))
+    except TelegramError:
+        logger.warning("event=telegram_transient_error operation=set_my_commands")
 
 
 def _onboarding_keyboard(onboarding_id: int) -> InlineKeyboardMarkup:
@@ -466,6 +483,7 @@ def create_telegram_application(
 
     async def _post_init(application: Application) -> None:
         nonlocal retry_task, recovery_task, watchdog_task, last_ingest_at, live_enabled
+        await register_owner_command_menu(application.bot, owner_chat_id)
         last_ingest_at = time.monotonic()
         if catchup_idle_seconds > 0:
             live_enabled = False

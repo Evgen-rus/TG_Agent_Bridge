@@ -32,6 +32,7 @@ OWNER_CHAT_ID
   -> reply to a “which chat?” clarification or to the last assistant answer:
      continue that query
   -> reply to a new-group card: client brief, then confirm wiki draft
+  -> /rules and /undo from the owner-chat command menu only
   -> ordinary human conversation is ignored
 ```
 

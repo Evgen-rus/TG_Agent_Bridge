@@ -114,8 +114,10 @@ client by default. Global scope requires explicit wording such as "for all
 clients".
 
 Use `/rules` in the owner group to inspect active rules and `/undo` to deactivate
-the most recently confirmed active rule. Corrected suggestions still go only to
-the owner group and are never sent to a client chat.
+the most recently confirmed active rule. After startup those two commands appear
+only in the owner chat Telegram command menu (the `/` list, or the Menu button
+in a private owner chat). Client chats do not get this menu. Corrected
+suggestions still go only to the owner group and are never sent to a client chat.
 
 If the bot asks a clarifying question, reply to that question. The answer is
 applied to the original client chat and may be offered as confirmable memory.
