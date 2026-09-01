@@ -265,6 +265,26 @@ async def test_owner_query_threads_are_per_chat_and_isolated_from_client_thread(
 
 
 @pytest.mark.asyncio
+async def test_owner_query_uses_dedicated_owner_provider(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    client_provider = QueryProvider()
+    owner_provider = QueryProvider(prompt_version=9)
+    service = AgentBridgeApplication(
+        chat_registry,
+        store,
+        client_provider,
+        owner_provider=owner_provider,
+    )
+
+    result = await service.handle_owner_query("Что происходит в Acme Support?")
+
+    assert isinstance(result, OwnerQueryResult)
+    assert client_provider.questions == []
+    assert owner_provider.questions[0]["chat_name"] == "Acme Support"
+    assert store.get_owner_query_thread_prompt_version(-100123456) == 9
+
+
+@pytest.mark.asyncio
 async def test_stale_owner_query_prompt_version_starts_new_thread(tmp_path, chat_registry) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
     store.save_owner_query_thread(

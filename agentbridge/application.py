@@ -131,10 +131,12 @@ class AgentBridgeApplication:
         episode_size: int = 40,
         chats_dir: Path | None = None,
         knowledge_dir: Path | None = None,
+        owner_provider: AgentProvider | None = None,
     ):
         self.registry = registry
         self.store = store
         self.provider = provider
+        self.owner_provider = owner_provider or provider
         self.owner_chat_id = owner_chat_id
         self.episode_size = max(1, episode_size)
         self.chats_dir = chats_dir
@@ -585,7 +587,7 @@ class AgentBridgeApplication:
         text = brief.strip()
         if not text:
             return None
-        drafter = getattr(self.provider, "draft_chat_onboarding", None)
+        drafter = getattr(self.owner_provider, "draft_chat_onboarding", None)
         if drafter is not None:
             draft = await drafter(
                 group_title=record.chat_title, owner_brief=text, telegram_chat_id=record.telegram_chat_id,
@@ -661,7 +663,7 @@ class AgentBridgeApplication:
             return None
         rules = self.store.active_rule_texts(recommendation.telegram_chat_id)
         logger.info("event=feedback_analysis_start recommendation_id=%s author_id=%s", recommendation.id, author_user_id)
-        analysis = await self.provider.analyze_feedback(
+        analysis = await self.owner_provider.analyze_feedback(
             feedback=feedback, chat_name=recommendation.chat_name, original_message=recommendation.original_message,
             situation=recommendation.situation, suggested_reply=recommendation.suggested_reply, rules=rules,
         )
@@ -825,7 +827,7 @@ class AgentBridgeApplication:
         return OwnerQueryResult(answer, prompt_id)
 
     async def _answer_owner_query_for_chat(self, chat: ChatConfig, question: str) -> str:
-        answerer = getattr(self.provider, "answer_owner_query", None)
+        answerer = getattr(self.owner_provider, "answer_owner_query", None)
         pack = self._context_pack(chat)
         if answerer is not None:
             thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
@@ -838,7 +840,7 @@ class AgentBridgeApplication:
                     chat.name,
                     result.thread_id,
                     chat.agent_provider,
-                    prompt_version=getattr(self.provider, "prompt_version", None),
+                    prompt_version=getattr(self.owner_provider, "prompt_version", None),
                 )
                 return result.answer
             return str(result)
@@ -848,7 +850,7 @@ class AgentBridgeApplication:
         thread_id = self.store.get_owner_query_thread_id(telegram_chat_id)
         if not thread_id:
             return None
-        current = getattr(self.provider, "prompt_version", None)
+        current = getattr(self.owner_provider, "prompt_version", None)
         if current is None:
             return thread_id
         saved = self.store.get_owner_query_thread_prompt_version(telegram_chat_id)
@@ -921,7 +923,7 @@ class AgentBridgeApplication:
         if recommendation is None:
             return None
         combined_feedback = f"Первоначальное замечание:\n{draft.feedback}\n\nУточнение владельца:\n{feedback}"
-        analysis = await self.provider.analyze_feedback(
+        analysis = await self.owner_provider.analyze_feedback(
             feedback=combined_feedback, chat_name=recommendation.chat_name, original_message=recommendation.original_message,
             situation=recommendation.situation, suggested_reply=recommendation.suggested_reply,
             rules=self.store.active_rule_texts(recommendation.telegram_chat_id),

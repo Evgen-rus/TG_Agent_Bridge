@@ -38,7 +38,12 @@ OWNER_CHAT_ID
 Each monitored chat has two isolated persistent Codex threads: the client
 thread handles client-message recommendations, while the owner-query thread
 continues the team's internal questions about that chat. Both receive a fresh
-context pack on every turn; neither thread is a durable source of truth.
+context pack on every turn; neither thread is a durable source of truth. The
+two paths use separately configured `CodexProvider` instances: `CODEX_MODEL` /
+`CODEX_REASONING_EFFORT` for client work and `OWNER_CODEX_MODEL` /
+`OWNER_CODEX_REASONING_EFFORT` for internal Owner queries, feedback analysis,
+and onboarding drafts. Regenerating a client recommendation after confirmed
+feedback still uses the client provider.
 
 If the bot becomes admin in an unknown group, or a message arrives from a
 group where it is already admin but there is no `chats/*/config.yaml`, the

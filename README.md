@@ -21,9 +21,19 @@ notifies the owner only about the current outcome.
    Set `knowledge_pack: none` to opt out. Only `core.md` is injected each turn.
 5. Remove the example directory or change its placeholder chat ID.
 
-Codex defaults to `gpt-5.6-luna` with reasoning effort `xhigh`. The official
-Python SDK reuses existing Codex authentication. To start browser login from
-Python when no account is available:
+Client recommendations default to `gpt-5.6-luna` with reasoning effort `xhigh`.
+The internal Owner contour has separate settings and defaults to `gpt-5.6-sol`
+with the minimum reasoning effort `low`. Change them in `.env` without editing
+code, for example when you want to reduce usage:
+
+```dotenv
+OWNER_CODEX_MODEL=gpt-5.6-terra
+OWNER_CODEX_REASONING_EFFORT=none
+```
+
+`OWNER_CODEX_MODEL` can also be set back to `gpt-5.6-luna`. The official Python
+SDK reuses existing Codex authentication. To start browser login from Python
+when no account is available:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from openai_codex import Codex; c=Codex(); h=c.login_chatgpt(); print(h.auth_url); print(h.wait().success); c.close()"
