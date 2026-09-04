@@ -16,6 +16,8 @@ from agentbridge.agents.codex import (
     _ONBOARDING_SCHEMA,
     _OWNER_QUERY_INSTRUCTIONS,
     _OWNER_QUERY_SCHEMA,
+    _SEPIA_INSTRUCTIONS,
+    _SEPIA_SCHEMA,
     _SUGGEST_SCHEMA,
     validate_structured_output_schema,
 )
@@ -185,6 +187,11 @@ class _FakeCodex:
     suggest_payload: dict = _suggest_payload()
     critique_payload: dict = _suggest_payload(action="observe", suggested_reply="", observation="Closed.")
     owner_payload: dict = {"answer": "Owner answer"}
+    sepia_payload: dict = {
+        "refactored_reply": "Пришлю ссылку завтра в 10:00.",
+        "facts_preserved": True,
+        "commitments_preserved": True,
+    }
 
     def __enter__(self):
         return self
@@ -198,6 +205,8 @@ class _FakeCodex:
             thread = _FakeThread("thread-critique", self.critique_payload)
         elif kwargs.get("developer_instructions") == _OWNER_QUERY_INSTRUCTIONS:
             thread = _FakeThread("thread-owner", self.owner_payload)
+        elif kwargs.get("developer_instructions") == _SEPIA_INSTRUCTIONS:
+            thread = _FakeThread("thread-sepia", self.sepia_payload)
         else:
             thread = _FakeThread("thread-started", self.suggest_payload)
         self.threads.append(thread)
@@ -216,6 +225,11 @@ def fake_codex(monkeypatch):
     _FakeCodex.starts = []
     _FakeCodex.resumes = []
     _FakeCodex.threads = []
+    _FakeCodex.sepia_payload = {
+        "refactored_reply": "Пришлю ссылку завтра в 10:00.",
+        "facts_preserved": True,
+        "commitments_preserved": True,
+    }
     monkeypatch.setattr("agentbridge.agents.codex.Codex", _FakeCodex)
     return _FakeCodex
 
@@ -292,6 +306,42 @@ async def test_codex_critique_is_ephemeral_and_keeps_main_thread_id(fake_codex) 
 
 
 @pytest.mark.asyncio
+async def test_sepia_refactors_only_compact_draft_context(fake_codex) -> None:
+    provider = CodexProvider(sepia_enabled=True)
+    draft = AgentReply(
+        "thread-main",
+        "Нужно подтвердить срок отправки ссылки",
+        "На данный момент я пришлю ссылку завтра в 10:00.",
+        action=AgentAction.REPLY,
+        candidate_state={"commitments": ["Отправить ссылку завтра в 10:00"]},
+    )
+
+    result = await provider.refactor_reply(draft)
+
+    assert result.suggested_reply == "Пришлю ссылку завтра в 10:00."
+    sepia_thread = fake_codex.threads[-1]
+    assert fake_codex.starts[-1]["developer_instructions"] == _SEPIA_INSTRUCTIONS
+    assert fake_codex.starts[-1]["config"]["model_reasoning_effort"] == "low"
+    assert "Draft ответа:" in sepia_thread.prompts[0]
+    assert "Недавняя история" not in sepia_thread.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_sepia_falls_back_to_rick_draft_when_a_number_changes(fake_codex) -> None:
+    fake_codex.sepia_payload = {
+        "refactored_reply": "Пришлю ссылку завтра в 11:00.",
+        "facts_preserved": True,
+        "commitments_preserved": True,
+    }
+    provider = CodexProvider(sepia_enabled=True)
+    draft = AgentReply(
+        "thread-main", "Нужно подтвердить срок", "Пришлю ссылку завтра в 10:00.", action=AgentAction.REPLY,
+    )
+
+    assert (await provider.refactor_reply(draft)).suggested_reply == draft.suggested_reply
+
+
+@pytest.mark.asyncio
 async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_codex, tmp_path) -> None:
     from openai_codex import LocalImageInput, MentionInput, TextInput
 
@@ -320,7 +370,7 @@ async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_co
 
 
 def test_codex_output_schemas_match_structured_outputs_subset() -> None:
-    for schema in (_SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _ONBOARDING_SCHEMA):
+    for schema in (_SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _ONBOARDING_SCHEMA, _SEPIA_SCHEMA):
         validate_structured_output_schema(schema)
     field = _SUGGEST_SCHEMA["properties"]["candidate_state"]
     assert field["additionalProperties"] is False

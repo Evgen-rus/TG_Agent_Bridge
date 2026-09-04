@@ -14,9 +14,11 @@ Telegram long polling (drop_pending_updates=False)
      AgentBridge.transcribe, transcript stored by update_id in SQLite)
   -> download current-episode photos/PDFs via saved file_id into runtime/media
   -> live debounce per chat, or catch-up after restart
-  -> application: episode from stored messages, context pack, one model turn
+  -> application: episode from stored messages, context pack, Rick model turn
   -> AgentProvider (images as LocalImageInput, other files as MentionInput)
   -> CodexProvider: start or resume the chat's Codex thread
+  -> optional ephemeral Sepia refactor turn with draft + compact facts only
+  -> lightweight fact/commitment flags + exact number/link guard
   -> delete local media copies; keep file_id in SQLite
   -> update chat_state
   -> telegram.formatter
@@ -44,7 +46,11 @@ two paths use separately configured `CodexProvider` instances: `CODEX_MODEL` /
 `CODEX_REASONING_EFFORT` for client work and `OWNER_CODEX_MODEL` /
 `OWNER_CODEX_REASONING_EFFORT` for internal Owner queries, feedback analysis,
 and onboarding drafts. Regenerating a client recommendation after confirmed
-feedback still uses the client provider.
+feedback still uses the client provider. When `SEPIA_ENABLED` is true, only a
+final `reply` draft is sent to the project-local `sepia-refactor` skill together
+with the `client-chat` voice profile. Sepia gets no Telegram history or media.
+If its preservation flags fail or an exact number/link changes, the original
+Rick draft is kept. Owner queries, observations, and questions are not refactored.
 
 If the bot becomes admin in an unknown group, or a message arrives from a
 group where it is already admin but there is no `chats/*/config.yaml`, the

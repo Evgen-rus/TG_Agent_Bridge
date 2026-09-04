@@ -62,7 +62,15 @@ ENV/
 credentials/
 database/
 amo/tokens.json
-.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/sepia/
+!.agents/skills/sepia/**
+!.agents/skills/sepia-refactor/
+!.agents/skills/sepia-refactor/**
+!.agents/skills/client-chat/
+!.agents/skills/client-chat/**
 .codex/
 
 # Database

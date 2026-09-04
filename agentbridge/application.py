@@ -384,6 +384,12 @@ class AgentBridgeApplication:
         }
         reply = await self.provider.suggest(**suggest_kwargs)
         reply = await self._maybe_critique(reply, suggest_kwargs)
+        refactor = getattr(self.provider, "refactor_reply", None)
+        if refactor is not None:
+            try:
+                reply = await refactor(reply)
+            except Exception:
+                logger.exception("event=sepia_refactor_failed fallback=rick_draft")
         self._persist_thread(chat, reply.thread_id)
         self._apply_state_update(chat.telegram_chat_id, reply.candidate_state, reply.situation)
         action = reply.resolved_action()

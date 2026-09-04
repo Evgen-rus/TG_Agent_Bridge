@@ -22,11 +22,13 @@ def main() -> None:
         model=settings.codex_model,
         reasoning_effort=settings.codex_reasoning_effort,
         cwd=root,
+        sepia_enabled=settings.sepia_enabled,
     )
     owner_provider = CodexProvider(
         model=settings.owner_codex_model,
         reasoning_effort=settings.owner_codex_reasoning_effort,
         cwd=root,
+        sepia_enabled=False,
     )
     service = AgentBridgeApplication(
         registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size, settings.chats_dir,

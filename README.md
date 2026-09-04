@@ -22,6 +22,11 @@ notifies the owner only about the current outcome.
 5. Remove the example directory or change its placeholder chat ID.
 
 Client recommendations default to `gpt-5.6-luna` with reasoning effort `xhigh`.
+Their final wording is passed through the project-local Sepia `refactor` skill
+with the `client-chat` profile. Sepia receives only Rick's finished draft,
+communication state, and relevant facts/constraints, not the chat history.
+Set `SEPIA_ENABLED=false` to bypass this layer. Edit
+`.agents/skills/client-chat/SKILL.md` to change its client-chat style rules.
 The internal Owner contour has separate settings and defaults to `gpt-5.6-sol`
 with the minimum reasoning effort `low`. Change them in `.env` without editing
 code, for example when you want to reduce usage:

@@ -15,6 +15,15 @@ def test_owner_codex_defaults_are_separate_from_client(monkeypatch, tmp_path) ->
     assert settings.codex_reasoning_effort == "xhigh"
     assert settings.owner_codex_model == "gpt-5.6-sol"
     assert settings.owner_codex_reasoning_effort == "low"
+    assert settings.sepia_enabled is True
+
+
+def test_sepia_can_be_disabled(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("OWNER_CHAT_ID", "7654321")
+    monkeypatch.setenv("SEPIA_ENABLED", "off")
+
+    assert Settings.from_env(tmp_path).sepia_enabled is False
 
 
 def test_owner_codex_model_and_reasoning_are_configurable(monkeypatch, tmp_path) -> None:

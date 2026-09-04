@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from dataclasses import replace
 from pathlib import Path
 
 from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
@@ -129,6 +131,16 @@ _OWNER_QUERY_SCHEMA = {
     "required": ["answer"],
     "additionalProperties": False,
 }
+_SEPIA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "refactored_reply": {"type": "string"},
+        "facts_preserved": {"type": "boolean"},
+        "commitments_preserved": {"type": "boolean"},
+    },
+    "required": ["refactored_reply", "facts_preserved", "commitments_preserved"],
+    "additionalProperties": False,
+}
 _OWNER_VOICE = """Голос только для команды, и только в observation, owner_question и ответах во внутреннем чате.
 Сначала думай нейтрально и выбери action. Характер подключай в самом конце, как короткую формулировку уже готового вывода. Не трать длинное рассуждение на стиль и не меняй action ради остроты.
 suggested_reply клиенту — обычный деловой текст без этой окраски. observation — 1–3 коротких предложения.
@@ -214,6 +226,11 @@ wiki.md — стабильный контекст на русском: кто к
 directory_slug — латиница, строчные, слова через подчёркивание, без пути и пробелов.
 Не предлагай писать клиенту."""
 _CRITIQUE_INSTRUCTIONS = """Проверь предыдущий JSON-ответ как нейтральный аналитик. Исправь выдуманные факты, устаревшие рекомендации и слабые гипотезы, выданные как факты. Если более поздние сообщения закрыли вопрос — не предлагай reply на него. Не усиливай уверенность и не меняй action ради более острого тона. Голос команды может остаться в observation/owner_question, но смысл должен стать точнее. Верни тот же JSON schema."""
+_SEPIA_INSTRUCTIONS = """Ты выполняешь только финальную редактуру готового ответа клиенту.
+Используй установленный project skill $sepia-refactor в операции refactor и явно подключённый voice profile $client-chat.
+Не анализируй клиентский чат заново и не меняй стратегию Рика. Сохрани факты, цены, числа, сроки, обещания, условия, позицию компании, цель и степень уверенности дословно по смыслу.
+После редактуры сравни результат с draft. facts_preserved и commitments_preserved=true только если ничего критического не добавлено, не удалено и не изменено.
+Верни только JSON по схеме."""
 
 AGENT_PROMPT_VERSION = 7
 
@@ -221,9 +238,10 @@ AGENT_PROMPT_VERSION = 7
 class CodexProvider:
     prompt_version = AGENT_PROMPT_VERSION
 
-    def __init__(self, *, model: str = "gpt-5.6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None):
+    def __init__(self, *, model: str = "gpt-5.6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False):
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.sepia_enabled = sepia_enabled
         self.cwd = str((cwd or Path.cwd()).resolve())
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
@@ -252,6 +270,45 @@ class CodexProvider:
                 )
             payload = self._run_json(thread, _turn_input(prompt, attachments), _SUGGEST_SCHEMA)
             return _reply_from_payload(thread.id, payload)
+
+    async def refactor_reply(self, reply: AgentReply) -> AgentReply:
+        if not self.sepia_enabled or reply.resolved_action() != AgentAction.REPLY or not reply.suggested_reply:
+            return reply
+        return await asyncio.to_thread(self._refactor_reply_sync, reply)
+
+    def _refactor_reply_sync(self, reply: AgentReply) -> AgentReply:
+        state = reply.candidate_state or {}
+        facts = {
+            key: state.get(key)
+            for key in (
+                "facts", "decisions", "agreements", "commitments",
+                "waiting_from_client", "waiting_from_us", "next_step",
+            )
+            if state.get(key)
+        }
+        prompt = (
+            f"$sepia-refactor с voice profile $client-chat.\n\n"
+            f"Communication state / цель:\n{reply.situation}\n\n"
+            f"Необходимые факты и ограничения:\n{json.dumps(facts, ensure_ascii=False)}\n\n"
+            f"Draft ответа:\n{reply.suggested_reply}"
+        )
+        with Codex() as codex:
+            thread = codex.thread_start(
+                model=self.model,
+                cwd=self.cwd,
+                sandbox=Sandbox.read_only,
+                developer_instructions=_SEPIA_INSTRUCTIONS,
+                config={"model_reasoning_effort": "low"},
+            )
+            payload = self._run_json(thread, prompt, _SEPIA_SCHEMA)
+        refactored = str(payload.get("refactored_reply") or "").strip()
+        safe = (
+            bool(refactored)
+            and payload.get("facts_preserved") is True
+            and payload.get("commitments_preserved") is True
+            and _critical_anchors(refactored) == _critical_anchors(reply.suggested_reply)
+        )
+        return replace(reply, suggested_reply=refactored) if safe else reply
 
     def _critique_sync(
         self, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], context_pack: str,
@@ -394,3 +451,8 @@ def _reply_from_payload(thread_id: str, payload: dict) -> AgentReply:
         confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
         needs_critique=bool(payload.get("needs_critique")),
     )
+
+
+def _critical_anchors(text: str) -> list[str]:
+    """Cheap final guard for exact numbers and link-like facts changed by editing."""
+    return re.findall(r"https?://\S+|[\w.+-]+@[\w.-]+\.\w+|\d+(?:[.,]\d+)?", text, flags=re.IGNORECASE)

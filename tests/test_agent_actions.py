@@ -19,6 +19,11 @@ class ActionProvider:
         return self.reply
 
 
+class FailingSepiaProvider(ActionProvider):
+    async def refactor_reply(self, reply: AgentReply) -> AgentReply:
+        raise RuntimeError("Sepia unavailable")
+
+
 async def _handle(tmp_path, chat_registry, reply: AgentReply):
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
     provider = ActionProvider(reply)
@@ -99,3 +104,18 @@ async def test_no_action_does_not_create_a_recommendation(tmp_path, chat_registr
     assert store.pending_recommendations(7654321) == []
     assert len(provider.calls) == 1
     assert store.is_update_processed(61) is True
+
+
+@pytest.mark.asyncio
+async def test_sepia_failure_keeps_rick_draft(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = FailingSepiaProvider(
+        AgentReply("t", "Клиент ждёт срок", "Пришлём завтра", action=AgentAction.REPLY),
+    )
+    service = AgentBridgeApplication(chat_registry, store, provider, owner_chat_id=7654321)
+
+    result = await service.handle_message(-100123456, "Alice", "Когда пришлёте?", update_id=62)
+
+    assert result is not None
+    assert result.suggested_reply == "Пришлём завтра"
+    assert store.is_update_processed(62) is True
