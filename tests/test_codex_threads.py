@@ -39,6 +39,17 @@ class VersionedProvider:
         return AgentReply(f"thread-new-{self.created}", f"Situation after: {kwargs['message']}", "New reply")
 
 
+@dataclass
+class PersistentSepiaProvider(VersionedProvider):
+    sepia_calls: list[str | None] = field(default_factory=list)
+
+    async def refactor_reply(
+        self, reply: AgentReply, *, thread_id: str | None,
+    ) -> tuple[AgentReply, str]:
+        self.sepia_calls.append(thread_id)
+        return reply, thread_id or "sepia-new-1"
+
+
 @pytest.mark.asyncio
 async def test_new_chat_saves_current_prompt_version(tmp_path, chat_registry) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
@@ -88,6 +99,23 @@ async def test_restart_with_same_prompt_version_keeps_the_thread(tmp_path, chat_
     assert provider.calls[0]["thread_id"] == "thread-new-1"
     assert restarted_store.get_thread_id(-100123456) == "thread-new-1"
     assert restarted_store.get_thread_prompt_version(-100123456) == AGENT_PROMPT_VERSION
+
+
+@pytest.mark.asyncio
+async def test_restart_with_same_prompt_version_keeps_the_sepia_thread(tmp_path, chat_registry) -> None:
+    database_path = tmp_path / "agentbridge.sqlite3"
+    first_provider = PersistentSepiaProvider()
+    first = AgentBridgeApplication(chat_registry, ChatThreadStore(database_path), first_provider)
+    await first.handle_message(-100123456, "Alice", "Can I get the docs?")
+
+    restarted_provider = PersistentSepiaProvider()
+    restarted_store = ChatThreadStore(database_path)
+    restarted = AgentBridgeApplication(chat_registry, restarted_store, restarted_provider)
+    await restarted.handle_message(-100123456, "Alice", "And a quote")
+
+    assert first_provider.sepia_calls == [None]
+    assert restarted_provider.sepia_calls == ["sepia-new-1"]
+    assert restarted_store.get_sepia_thread_id(-100123456) == "sepia-new-1"
 
 
 @dataclass
@@ -214,7 +242,12 @@ class _FakeCodex:
 
     def thread_resume(self, thread_id: str, **kwargs) -> _FakeThread:
         self.resumes.append(thread_id)
-        payload = self.owner_payload if thread_id == "thread-owner" else self.suggest_payload
+        if thread_id == "thread-owner":
+            payload = self.owner_payload
+        elif thread_id == "thread-sepia":
+            payload = self.sepia_payload
+        else:
+            payload = self.suggest_payload
         thread = _FakeThread(thread_id, payload)
         self.threads.append(thread)
         return thread
@@ -316,14 +349,20 @@ async def test_sepia_refactors_only_compact_draft_context(fake_codex) -> None:
         candidate_state={"commitments": ["Отправить ссылку завтра в 10:00"]},
     )
 
-    result = await provider.refactor_reply(draft)
+    result, thread_id = await provider.refactor_reply(draft, thread_id=None)
 
     assert result.suggested_reply == "Пришлю ссылку завтра в 10:00."
+    assert thread_id == "thread-sepia"
     sepia_thread = fake_codex.threads[-1]
     assert fake_codex.starts[-1]["developer_instructions"] == _SEPIA_INSTRUCTIONS
     assert fake_codex.starts[-1]["config"]["model_reasoning_effort"] == "low"
     assert "Draft ответа:" in sepia_thread.prompts[0]
     assert "Недавняя история" not in sepia_thread.prompts[0]
+
+    resumed, resumed_thread_id = await provider.refactor_reply(draft, thread_id=thread_id)
+    assert resumed.suggested_reply == "Пришлю ссылку завтра в 10:00."
+    assert resumed_thread_id == "thread-sepia"
+    assert fake_codex.resumes == ["thread-sepia"]
 
 
 @pytest.mark.asyncio
@@ -338,7 +377,8 @@ async def test_sepia_falls_back_to_rick_draft_when_a_number_changes(fake_codex) 
         "thread-main", "Нужно подтвердить срок", "Пришлю ссылку завтра в 10:00.", action=AgentAction.REPLY,
     )
 
-    assert (await provider.refactor_reply(draft)).suggested_reply == draft.suggested_reply
+    result, _ = await provider.refactor_reply(draft, thread_id=None)
+    assert result.suggested_reply == draft.suggested_reply
 
 
 @pytest.mark.asyncio

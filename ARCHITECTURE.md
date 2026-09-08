@@ -38,10 +38,10 @@ OWNER_CHAT_ID
   -> ordinary human conversation is ignored
 ```
 
-Each monitored chat has two isolated persistent Codex threads: the client
-thread handles client-message recommendations, while the owner-query thread
-continues the team's internal questions about that chat. Both receive a fresh
-context pack on every turn; neither thread is a durable source of truth. The
+Each monitored chat has isolated persistent Codex threads: the client thread
+handles client-message recommendations, the owner-query thread continues the
+team's internal questions, and the optional Sepia thread edits final replies.
+All receive fresh input on every turn; none is a durable source of truth. The
 two paths use separately configured `CodexProvider` instances: `CODEX_MODEL` /
 `CODEX_REASONING_EFFORT` for client work and `OWNER_CODEX_MODEL` /
 `OWNER_CODEX_REASONING_EFFORT` for internal Owner queries, feedback analysis,
@@ -165,11 +165,12 @@ client automatically.
 ## Invariants
 
 - Suggest-only: never reply automatically to a monitored/client chat.
-- One Telegram chat maps to independent client and owner-query Codex threads,
+- One Telegram chat maps to independent client, owner-query, and optional Sepia Codex threads,
   plus one wiki, history, and `chat_state`. Each thread is continuity only and
   is stored with `prompt_version`. If `AGENT_PROMPT_VERSION` in
   `agents/codex.py` changes, the next client episode or owner query starts its
-  respective new thread instead of resuming the old one. Critique uses a
+  respective new thread instead of resuming the old one. Sepia follows the
+  same version boundary. Critique uses a
   separate ephemeral Codex thread and never overwrites `codex_thread_id`.
 - Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
   onboarding.

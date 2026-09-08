@@ -387,7 +387,18 @@ class AgentBridgeApplication:
         refactor = getattr(self.provider, "refactor_reply", None)
         if refactor is not None:
             try:
-                reply = await refactor(reply)
+                reply, sepia_thread_id = await refactor(
+                    reply,
+                    thread_id=self._sepia_thread_id_for_provider(chat.telegram_chat_id),
+                )
+                if sepia_thread_id:
+                    self.store.save_sepia_thread(
+                        chat.telegram_chat_id,
+                        chat.name,
+                        sepia_thread_id,
+                        chat.agent_provider,
+                        prompt_version=getattr(self.provider, "prompt_version", None),
+                    )
             except Exception:
                 logger.exception("event=sepia_refactor_failed fallback=rick_draft")
         self._persist_thread(chat, reply.thread_id)
@@ -445,6 +456,16 @@ class AgentBridgeApplication:
             chat.agent_provider,
             prompt_version=getattr(self.provider, "prompt_version", None),
         )
+
+    def _sepia_thread_id_for_provider(self, telegram_chat_id: int) -> str | None:
+        thread_id = self.store.get_sepia_thread_id(telegram_chat_id)
+        if not thread_id:
+            return None
+        current = getattr(self.provider, "prompt_version", None)
+        if current is None or self.store.get_sepia_thread_prompt_version(telegram_chat_id) == current:
+            return thread_id
+        logger.info("event=sepia_thread_reset chat_id=%s reason=prompt_version", telegram_chat_id)
+        return None
 
     def _discard_local_media(self, rows: list[StoredMessage]) -> None:
         for row in rows:

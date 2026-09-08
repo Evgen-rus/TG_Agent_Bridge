@@ -271,12 +271,12 @@ class CodexProvider:
             payload = self._run_json(thread, _turn_input(prompt, attachments), _SUGGEST_SCHEMA)
             return _reply_from_payload(thread.id, payload)
 
-    async def refactor_reply(self, reply: AgentReply) -> AgentReply:
+    async def refactor_reply(self, reply: AgentReply, *, thread_id: str | None) -> tuple[AgentReply, str | None]:
         if not self.sepia_enabled or reply.resolved_action() != AgentAction.REPLY or not reply.suggested_reply:
-            return reply
-        return await asyncio.to_thread(self._refactor_reply_sync, reply)
+            return reply, thread_id
+        return await asyncio.to_thread(self._refactor_reply_sync, reply, thread_id)
 
-    def _refactor_reply_sync(self, reply: AgentReply) -> AgentReply:
+    def _refactor_reply_sync(self, reply: AgentReply, thread_id: str | None) -> tuple[AgentReply, str]:
         state = reply.candidate_state or {}
         facts = {
             key: state.get(key)
@@ -293,14 +293,16 @@ class CodexProvider:
             f"Draft ответа:\n{reply.suggested_reply}"
         )
         with Codex() as codex:
-            thread = codex.thread_start(
-                model=self.model,
-                cwd=self.cwd,
-                sandbox=Sandbox.read_only,
-                developer_instructions=_SEPIA_INSTRUCTIONS,
-                config={"model_reasoning_effort": "low"},
-            )
-            payload = self._run_json(thread, prompt, _SEPIA_SCHEMA)
+            if thread_id:
+                try:
+                    thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
+                    payload = self._run_json(thread, prompt, _SEPIA_SCHEMA)
+                except Exception:
+                    thread = self._start_sepia_thread(codex)
+                    payload = self._run_json(thread, prompt, _SEPIA_SCHEMA)
+            else:
+                thread = self._start_sepia_thread(codex)
+                payload = self._run_json(thread, prompt, _SEPIA_SCHEMA)
         refactored = str(payload.get("refactored_reply") or "").strip()
         safe = (
             bool(refactored)
@@ -308,7 +310,16 @@ class CodexProvider:
             and payload.get("commitments_preserved") is True
             and _critical_anchors(refactored) == _critical_anchors(reply.suggested_reply)
         )
-        return replace(reply, suggested_reply=refactored) if safe else reply
+        return (replace(reply, suggested_reply=refactored) if safe else reply), thread.id
+
+    def _start_sepia_thread(self, codex: Codex):
+        return codex.thread_start(
+            model=self.model,
+            cwd=self.cwd,
+            sandbox=Sandbox.read_only,
+            developer_instructions=_SEPIA_INSTRUCTIONS,
+            config={"model_reasoning_effort": "low"},
+        )
 
     def _critique_sync(
         self, previous: AgentReply, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], context_pack: str,

@@ -45,6 +45,19 @@ def test_owner_query_thread_is_stored_separately_and_survives_restart(tmp_path) 
     assert restarted.get_owner_query_thread_prompt_version(-100123456) == 3
 
 
+def test_sepia_thread_is_stored_separately_and_survives_restart(tmp_path) -> None:
+    database_path = tmp_path / "agentbridge.sqlite3"
+    store = ChatThreadStore(database_path)
+    store.save_thread(-100123456, "Acme Support", "client-thread", prompt_version=3)
+    store.save_sepia_thread(-100123456, "Acme Support", "sepia-thread", prompt_version=3)
+
+    restarted = ChatThreadStore(database_path)
+
+    assert restarted.get_thread_id(-100123456) == "client-thread"
+    assert restarted.get_sepia_thread_id(-100123456) == "sepia-thread"
+    assert restarted.get_sepia_thread_prompt_version(-100123456) == 3
+
+
 def test_processed_update_survives_a_new_store_instance(tmp_path) -> None:
     database_path = tmp_path / "runtime" / "agentbridge.sqlite3"
     first_store = ChatThreadStore(database_path)

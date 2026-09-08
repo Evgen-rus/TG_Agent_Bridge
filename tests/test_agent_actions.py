@@ -20,7 +20,7 @@ class ActionProvider:
 
 
 class FailingSepiaProvider(ActionProvider):
-    async def refactor_reply(self, reply: AgentReply) -> AgentReply:
+    async def refactor_reply(self, reply: AgentReply, *, thread_id: str | None) -> tuple[AgentReply, str | None]:
         raise RuntimeError("Sepia unavailable")
 
 
