@@ -42,7 +42,10 @@ Each monitored chat has isolated persistent Codex threads: the client thread
 handles client-message recommendations, the owner-query thread continues the
 team's internal questions, and the optional Sepia thread edits final replies.
 All receive fresh input on every turn; none is a durable source of truth. The
-two paths use separately configured `CodexProvider` instances: `CODEX_MODEL` /
+client thread is resumed without reloading its turns; if its saved rollout is
+no longer available, Bridge starts one replacement thread and persists that ID
+after the successful episode, so later messages resume the replacement.
+The two paths use separately configured `CodexProvider` instances: `CODEX_MODEL` /
 `CODEX_REASONING_EFFORT` for client work and `OWNER_CODEX_MODEL` /
 `OWNER_CODEX_REASONING_EFFORT` for internal Owner queries, feedback analysis,
 and onboarding drafts. Regenerating a client recommendation after confirmed

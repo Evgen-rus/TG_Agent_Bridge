@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import json
 
 import pytest
+from openai_codex.errors import InvalidRequestError
 
 from agentbridge.agents.base import AgentAction, AgentReply
 from agentbridge.agents.codex import (
@@ -211,6 +212,7 @@ class _FakeThread:
 class _FakeCodex:
     starts: list[dict] = []
     resumes: list[str] = []
+    resume_kwargs: list[dict] = []
     threads: list[_FakeThread] = []
     suggest_payload: dict = _suggest_payload()
     critique_payload: dict = _suggest_payload(action="observe", suggested_reply="", observation="Closed.")
@@ -242,6 +244,7 @@ class _FakeCodex:
 
     def thread_resume(self, thread_id: str, **kwargs) -> _FakeThread:
         self.resumes.append(thread_id)
+        self.resume_kwargs.append(kwargs)
         if thread_id == "thread-owner":
             payload = self.owner_payload
         elif thread_id == "thread-sepia":
@@ -257,6 +260,7 @@ class _FakeCodex:
 def fake_codex(monkeypatch):
     _FakeCodex.starts = []
     _FakeCodex.resumes = []
+    _FakeCodex.resume_kwargs = []
     _FakeCodex.threads = []
     _FakeCodex.sepia_payload = {
         "refactored_reply": "Пришлю ссылку завтра в 10:00.",
@@ -314,7 +318,25 @@ async def test_codex_suggest_resumes_only_the_main_thread(fake_codex) -> None:
     assert first.thread_id == "thread-started"
     assert second.thread_id == "thread-started"
     assert fake_codex.resumes == ["thread-started"]
+    assert fake_codex.resume_kwargs[-1]["include_turns"] is False
     assert fake_codex.starts[0]["developer_instructions"] == _INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_codex_suggest_replaces_an_unavailable_saved_thread(fake_codex, monkeypatch) -> None:
+    def unavailable(self, thread_id: str, **kwargs):
+        raise InvalidRequestError(-32600, f"no rollout found for thread id {thread_id}")
+
+    monkeypatch.setattr(_FakeCodex, "thread_resume", unavailable)
+    provider = CodexProvider()
+
+    result = await provider.suggest(
+        message="Need docs", sender_name="Alice", chat_name="Acme", wiki="wiki", rules=[],
+        thread_id="missing-thread",
+    )
+
+    assert result.thread_id == "thread-started"
+    assert fake_codex.starts[-1]["developer_instructions"] == _INSTRUCTIONS
 
 
 @pytest.mark.asyncio

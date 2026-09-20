@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import replace
 from pathlib import Path
 
 from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
+from openai_codex.errors import InvalidRequestError, MethodNotFoundError
 
 from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, MediaAttachment, OwnerQueryAnswer
 from ..media import is_visual_media
+
+logger = logging.getLogger(__name__)
 
 _STRING = {"type": "string"}
 _STRING_LIST = {"type": "array", "items": {"type": "string"}}
@@ -232,7 +236,7 @@ _SEPIA_INSTRUCTIONS = """Ты выполняешь только финальну
 После редактуры сравни результат с draft. facts_preserved и commitments_preserved=true только если ничего критического не добавлено, не удалено и не изменено.
 Верни только JSON по схеме."""
 
-AGENT_PROMPT_VERSION = 7
+AGENT_PROMPT_VERSION = 8
 
 
 class CodexProvider:
@@ -262,14 +266,29 @@ class CodexProvider:
             prompt += f"\n\nПодтвержденное замечание владельца. Пересоздай текущую рекомендацию:\n{revision}"
         with Codex() as codex:
             if thread_id:
-                thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
+                try:
+                    thread = codex.thread_resume(
+                        thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False,
+                    )
+                except (InvalidRequestError, MethodNotFoundError) as exc:
+                    if not _thread_is_unavailable(exc):
+                        raise
+                    logger.warning(
+                        "event=codex_thread_replaced thread_id=%s reason=%s",
+                        thread_id,
+                        type(exc).__name__,
+                    )
+                    thread = self._start_suggest_thread(codex)
             else:
-                thread = codex.thread_start(
-                    model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
-                    developer_instructions=_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort},
-                )
+                thread = self._start_suggest_thread(codex)
             payload = self._run_json(thread, _turn_input(prompt, attachments), _SUGGEST_SCHEMA)
             return _reply_from_payload(thread.id, payload)
+
+    def _start_suggest_thread(self, codex):
+        return codex.thread_start(
+            model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+            developer_instructions=_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort},
+        )
 
     async def refactor_reply(self, reply: AgentReply, *, thread_id: str | None) -> tuple[AgentReply, str | None]:
         if not self.sepia_enabled or reply.resolved_action() != AgentAction.REPLY or not reply.suggested_reply:
@@ -295,7 +314,9 @@ class CodexProvider:
         with Codex() as codex:
             if thread_id:
                 try:
-                    thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
+                    thread = codex.thread_resume(
+                        thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False,
+                    )
                     payload = self._run_json(thread, prompt, _SEPIA_SCHEMA)
                 except Exception:
                     thread = self._start_sepia_thread(codex)
@@ -387,7 +408,9 @@ class CodexProvider:
         with Codex() as codex:
             if thread_id:
                 try:
-                    thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only)
+                    thread = codex.thread_resume(
+                        thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False,
+                    )
                     payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
                 except Exception:
                     thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
@@ -467,3 +490,8 @@ def _reply_from_payload(thread_id: str, payload: dict) -> AgentReply:
 def _critical_anchors(text: str) -> list[str]:
     """Cheap final guard for exact numbers and link-like facts changed by editing."""
     return re.findall(r"https?://\S+|[\w.+-]+@[\w.-]+\.\w+|\d+(?:[.,]\d+)?", text, flags=re.IGNORECASE)
+
+
+def _thread_is_unavailable(exc: Exception) -> bool:
+    message = str(exc).casefold()
+    return "paginated_threads" in message or "no rollout found for thread id" in message
