@@ -117,6 +117,23 @@ def _memory_confirmation_keyboard(draft_id: int, global_allowed: bool = True) ->
     return InlineKeyboardMarkup([buttons])
 
 
+def _owner_query_selection_keyboard(selection_id: int, options: list[tuple[int, str, bool]] | None = None) -> InlineKeyboardMarkup:
+    if not options:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("Все проекты", callback_data=f"portfolio:all:{selection_id}"),
+            InlineKeyboardButton("Выбрать несколько", callback_data=f"portfolio:multi:{selection_id}"),
+            InlineKeyboardButton("Один проект", callback_data=f"portfolio:single:{selection_id}"),
+        ]])
+    rows = [[InlineKeyboardButton(("✓ " if selected else "") + name, callback_data=f"portfolio:item_{'remove' if selected else 'add'}:{selection_id}:{index}")]
+            for index, name, selected in options]
+    rows.append([
+        InlineKeyboardButton("Готово", callback_data=f"portfolio:done:{selection_id}"),
+        InlineKeyboardButton("Сбросить", callback_data=f"portfolio:reset:{selection_id}"),
+        InlineKeyboardButton("Отмена", callback_data=f"portfolio:cancel:{selection_id}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
     """UX-only Telegram calls: a timeout must not abort local work like saving a rule."""
     try:
@@ -318,14 +335,19 @@ def create_telegram_application(
         text = result.text if isinstance(result, OwnerQueryResult) else str(result)
         prompt_id = result.prompt_id if isinstance(result, OwnerQueryResult) else None
         delivery_id = result.delivery_id if isinstance(result, OwnerQueryResult) else None
+        selection_id = result.selection_id if isinstance(result, OwnerQueryResult) else None
         if not text:
             return
         save = getattr(message_service, "save_pending_owner_query_delivery", None)
         if delivery_id is None and save is not None:
-            delivery_id = save(text, prompt_id)
+            try:
+                delivery_id = save(text, prompt_id, selection_id)
+            except TypeError:
+                delivery_id = save(text, prompt_id)
         try:
             sent = await _send(
                 bot, chat_id=owner_chat_id, text=text,
+                reply_markup=_owner_query_selection_keyboard(selection_id) if selection_id is not None else None,
                 delivery_key=f"owner-query:{delivery_id}" if delivery_id is not None else None,
             )
         except BadRequest:
@@ -344,6 +366,9 @@ def create_telegram_application(
         attach = getattr(message_service, "attach_owner_query_prompt", None)
         if prompt_id is not None and attach is not None and message_id is not None:
             attach(prompt_id, message_id)
+        attach_selection = getattr(message_service, "attach_owner_query_selection", None)
+        if selection_id is not None and attach_selection is not None and message_id is not None:
+            attach_selection(selection_id, message_id)
 
     async def _try_continue_owner_query(
         bot,
@@ -988,7 +1013,42 @@ def create_telegram_application(
         query = update.callback_query
         if query is None or query.message is None or query.message.chat.id != owner_chat_id:
             return
+        already = getattr(message_service, "is_update_processed", None)
+        if already is not None and already(update.update_id):
+            return
         await _telegram_try("answer_callback", query.answer())
+        data = query.data or ""
+        if data.startswith("portfolio:"):
+            parts = data.split(":")
+            if len(parts) not in {3, 4}:
+                return
+            try:
+                selection_id = int(parts[2])
+                index = int(parts[3]) if len(parts) == 4 else None
+            except ValueError:
+                return
+            handler = getattr(message_service, "handle_owner_query_selection", None)
+            if handler is None:
+                return
+            result = await handler(selection_id, parts[1], index, owner_chat_id)
+            if result is None:
+                return
+            if result.selection_id is not None:
+                options_getter = getattr(message_service, "owner_query_selection_options", None)
+                options = options_getter(result.selection_id) if options_getter is not None else []
+                markup = _owner_query_selection_keyboard(result.selection_id, options)
+                edit_text = getattr(query, "edit_message_text", None)
+                if edit_text is not None:
+                    await _telegram_try("edit_selection_keyboard", edit_text(result.text, reply_markup=markup))
+                else:
+                    await _telegram_try("edit_selection_keyboard", query.edit_message_reply_markup(reply_markup=markup))
+            else:
+                await _telegram_try("clear_selection_keyboard", query.edit_message_reply_markup(reply_markup=None))
+                await _deliver_owner_query(context.bot, result)
+            marker = getattr(message_service, "mark_update_processed", None)
+            if marker is not None:
+                marker(update.update_id)
+            return
         try:
             kind, action, raw_id = (query.data or "").split(":", 2)
             draft_id = int(raw_id)
@@ -1082,7 +1142,7 @@ def create_telegram_application(
     ))
     application.add_handler(CallbackQueryHandler(
         learning_callback,
-        pattern=r"^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$",
+        pattern=r"^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$|^portfolio:(?:all|multi|single|done|reset|cancel):\d+$|^portfolio:item(?:_add|_remove)?:\d+:\d+$",
     ))
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))

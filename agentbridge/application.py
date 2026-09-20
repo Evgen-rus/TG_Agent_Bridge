@@ -11,6 +11,7 @@ from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, Feedba
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
 from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
+from .owner_query import OwnerQueryIntent, OwnerQueryScope, PortfolioChatSummary, parse_owner_time_phrase
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ class OwnerQueryResult:
     text: str
     prompt_id: int | None = None
     delivery_id: int | None = None
+    selection_id: int | None = None
 
 
 class AgentBridgeApplication:
@@ -133,12 +135,14 @@ class AgentBridgeApplication:
         chats_dir: Path | None = None,
         knowledge_dir: Path | None = None,
         owner_provider: AgentProvider | None = None,
+        owner_timezone: str = "Asia/Novosibirsk",
     ):
         self.registry = registry
         self.store = store
         self.provider = provider
         self.owner_provider = owner_provider or provider
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
         self.episode_size = max(1, episode_size)
         self.chats_dir = chats_dir
         if knowledge_dir is not None:
@@ -507,18 +511,29 @@ class AgentBridgeApplication:
         *,
         episode: str = "",
         exclude_update_ids: set[int] | None = None,
+        time_from_utc: str | None = None,
+        time_to_utc: str | None = None,
+        time_label: str = "",
     ) -> str:
         state = self.store.get_chat_state(chat.telegram_chat_id)
         skipped = exclude_update_ids or set()
-        recent = [
-            item for item in self.store.recent_messages(chat.telegram_chat_id)
-            if item.update_id not in skipped
-        ]
+        if time_from_utc is not None or time_to_utc is not None:
+            recent, history_total, history_truncated = self.store.portfolio_messages(
+                chat.telegram_chat_id, limit=200,
+                time_from_utc=time_from_utc, time_to_utc=time_to_utc,
+            )
+        else:
+            recent = self.store.recent_messages(chat.telegram_chat_id)
+            history_total = len(recent)
+            history_truncated = False
+        recent = [item for item in recent if item.update_id not in skipped]
         experience = self.store.recent_experience(chat.telegram_chat_id)
         shared = self._shared_knowledge(chat)
         parts = [
             f"Wiki:\n{chat.wiki or '(пусто)'}",
         ]
+        if time_label:
+            parts.append(f"Период запроса: {time_label}")
         if shared:
             parts.append(shared)
         parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2))
@@ -527,7 +542,15 @@ class AgentBridgeApplication:
                 f"{item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
                 for item in recent
             )
-            parts.append("Недавняя история:\n" + history)
+            if time_from_utc is not None or time_to_utc is not None:
+                marker = f"показано {len(recent)} из {history_total}"
+                if history_truncated:
+                    marker += "; обрезано до 200 сообщений"
+                parts.append(f"История за период ({marker}):\n" + history)
+            else:
+                parts.append("Недавняя история:\n" + history)
+        elif time_from_utc is not None or time_to_utc is not None:
+            parts.append("История за период (показано 0 из 0):\n(нет сообщений)")
         if episode:
             parts.append("Текущий эпизод:\n" + episode)
         memories = self.store.active_memory_entries(chat.telegram_chat_id, chat.memory_project)
@@ -788,14 +811,28 @@ class AgentBridgeApplication:
             if continued is not None:
                 return continued
         chat = None
+        scope_for_chat: OwnerQueryScope | None = None
         if reply_to_message_id is not None and self.owner_chat_id is not None:
             recommendation = self.store.get_recommendation_by_owner_message(self.owner_chat_id, reply_to_message_id)
             if recommendation is not None:
                 chat = self.registry.get(recommendation.telegram_chat_id)
         if chat is None:
             chat = self.registry.find_by_name(text)
-        if chat is None and len(self.registry) == 1:
+        all_requested = any(phrase in " ".join(text.casefold().split()) for phrase in ("все чаты", "все клиенты", "все проекты", "по всем", "all chats", "all clients", "all projects"))
+        if chat is None and len(self.registry) == 1 and not all_requested:
             chat = self.registry.all_chats()[0]
+        if chat is None and reply_to_message_id is None:
+            scope = await self._resolve_owner_query_scope(text)
+            if scope is not None:
+                if len(scope.chat_ids) == 1 and scope.mode == "single":
+                    chat = self.registry.get(scope.chat_ids[0])
+                    scope_for_chat = scope
+                elif scope.chat_ids:
+                    return await self._answer_owner_portfolio(scope, update_id=update_id)
+                elif getattr(self.owner_provider, "resolve_owner_query_scope", None) is not None:
+                    if update_id is not None and not self.store.claim_update_processed(update_id):
+                        return None
+                    return self._new_owner_query_selection(text, scope)
         if chat is None:
             names = "\n\n".join(item.name for item in self.registry.all_chats()) or "нет подключённых чатов"
             prompt_id = self.store.create_owner_query_prompt(text)
@@ -805,21 +842,158 @@ class AgentBridgeApplication:
                 f"Уточните, о каком чате речь. Сейчас подключены:\n\n{names}",
                 prompt_id,
             )
-        answer = await self._answer_owner_query_for_chat(chat, text)
+        if scope_for_chat is None:
+            from_utc, to_utc, label = parse_owner_time_phrase(text, timezone_name=self.owner_timezone)
+            if from_utc is not None or to_utc is not None:
+                scope_for_chat = OwnerQueryScope("single", (chat.telegram_chat_id,), text, from_utc, to_utc, label)
+        answer = await self._answer_owner_query_for_chat(chat, text, scope=scope_for_chat)
         if update_id is not None:
             self.store.mark_update_processed(update_id)
-        return self._follow_up_query_result(chat, text, answer)
+        return self._follow_up_query_result(chat, text, answer, scope=scope_for_chat)
+
+    async def _resolve_owner_query_scope(self, text: str) -> OwnerQueryScope | None:
+        chats = self.registry.all_chats()
+        lower = " ".join(text.casefold().split())
+        all_phrases = ("все чаты", "все клиенты", "все проекты", "по всем", "all chats", "all clients", "all projects")
+        if any(phrase in lower for phrase in all_phrases):
+            from_utc, to_utc, label = parse_owner_time_phrase(text, timezone_name=self.owner_timezone)
+            return OwnerQueryScope("all", tuple(item.telegram_chat_id for item in chats), text, from_utc, to_utc, label)
+        exact = [item for item in chats if item.name.casefold() in lower or item.directory.name.casefold() in lower]
+        if len(exact) == 1:
+            from_utc, to_utc, label = parse_owner_time_phrase(text, timezone_name=self.owner_timezone)
+            return OwnerQueryScope("single", (exact[0].telegram_chat_id,), text, from_utc, to_utc, label)
+        if len(exact) > 1:
+            from_utc, to_utc, label = parse_owner_time_phrase(text, timezone_name=self.owner_timezone)
+            return OwnerQueryScope("multiple", tuple(item.telegram_chat_id for item in exact), text, from_utc, to_utc, label)
+        resolver = getattr(self.owner_provider, "resolve_owner_query_scope", None)
+        if resolver is None:
+            return None
+        known = [{"name": item.name, "slug": item.directory.name} for item in chats]
+        try:
+            intent = await resolver(question=text, known_chats=known)
+        except Exception:
+            logger.exception("event=owner_query_scope_resolution_failed")
+            return None
+        if isinstance(intent, dict):
+            intent = OwnerQueryIntent(
+                str(intent.get("mode") or "ambiguous"), tuple(intent.get("selected_names") or ()),
+                str(intent.get("time_phrase") or ""), str(intent.get("detail_level") or "short"),
+            )
+        selected: list[ChatConfig] = []
+        for name in getattr(intent, "selected_names", ()):
+            selected.extend(item for item in chats if name.casefold() in {item.name.casefold(), item.directory.name.casefold()})
+        unique = {item.telegram_chat_id: item for item in selected}
+        from_utc, to_utc, label = parse_owner_time_phrase(getattr(intent, "time_phrase", ""), timezone_name=self.owner_timezone)
+        mode = str(getattr(intent, "mode", "ambiguous") or "ambiguous")
+        if mode == "all":
+            ids = tuple(item.telegram_chat_id for item in chats)
+        else:
+            ids = tuple(unique)
+        if mode == "single" and len(ids) != 1:
+            return OwnerQueryScope("ambiguous", (), text, from_utc, to_utc, label, getattr(intent, "detail_level", "short"))
+        return OwnerQueryScope(mode, ids, text, from_utc, to_utc, label, getattr(intent, "detail_level", "short"))
+
+    def _new_owner_query_selection(self, question: str, scope: OwnerQueryScope) -> OwnerQueryResult:
+        selection_id = self.store.create_owner_query_selection(
+            question, self.owner_chat_id or 0, self.registry.known_ids(),
+            time_from_utc=scope.time_from_utc, time_to_utc=scope.time_to_utc,
+            time_label=scope.time_label, detail_level=scope.detail_level,
+        )
+        return OwnerQueryResult(
+            "Уточните охват вопроса:", selection_id=selection_id,
+        )
+
+    def owner_query_selection(self, selection_id: int):
+        return self.store.get_owner_query_selection(selection_id)
+
+    def attach_owner_query_selection(self, selection_id: int, owner_message_id: int) -> None:
+        self.store.attach_owner_query_selection(selection_id, owner_message_id)
+
+    def owner_query_selection_options(self, selection_id: int) -> list[tuple[int, str, bool]]:
+        selection = self.store.get_owner_query_selection(selection_id)
+        if selection is None:
+            return []
+        chosen = set(selection.selected_chat_ids)
+        return [(index, self.registry.get(chat_id).name if self.registry.get(chat_id) else f"чат {chat_id}", chat_id in chosen)
+                for index, chat_id in enumerate(selection.available_chat_ids)]
+
+    async def handle_owner_query_selection(
+        self, selection_id: int, action: str, index: int | None = None, owner_chat_id: int | None = None,
+    ) -> OwnerQueryResult | None:
+        selection = self.store.get_owner_query_selection(selection_id)
+        if selection is None or selection.status != "selecting":
+            return OwnerQueryResult("Этот выбор уже обработан или больше недоступен.")
+        if owner_chat_id is not None and selection.owner_chat_id != owner_chat_id:
+            return OwnerQueryResult("Этот выбор недоступен в данном чате.")
+        if action == "cancel":
+            self.store.cancel_owner_query_selection(selection_id)
+            return OwnerQueryResult("Запрос отменён.")
+        if action == "reset":
+            self.store.update_owner_query_selection(selection_id, selected_chat_ids=(), mode="ambiguous")
+            return OwnerQueryResult("Уточните охват вопроса:", selection_id=selection_id)
+        selected = list(selection.selected_chat_ids)
+        if action in {"item", "item_add", "item_remove"} and index is not None and 0 <= index < len(selection.available_chat_ids):
+            chat_id = selection.available_chat_ids[index]
+            if action == "item_add":
+                selected = [chat_id] if selection.mode == "single" else list(dict.fromkeys([*selected, chat_id]))
+            elif action == "item_remove":
+                selected = [item for item in selected if item != chat_id]
+            elif selection.mode == "single":
+                selected = [] if selected == [chat_id] else [chat_id]
+            else:
+                selected.remove(chat_id) if chat_id in selected else selected.append(chat_id)
+            self.store.update_owner_query_selection(selection_id, selected_chat_ids=selected)
+            return OwnerQueryResult("Выберите проекты и нажмите «Готово».", selection_id=selection_id)
+        if action in {"all", "multi", "single"}:
+            if action == "all":
+                selected = list(selection.available_chat_ids)
+            self.store.update_owner_query_selection(selection_id, mode=action, selected_chat_ids=selected)
+            if action != "all":
+                return OwnerQueryResult("Выберите проекты и нажмите «Готово».", selection_id=selection_id)
+        if action == "done" or action == "all":
+            selection = self.store.claim_owner_query_selection(selection_id)
+            if selection is None:
+                return OwnerQueryResult("Этот выбор уже обрабатывается или обработан.")
+            ids = selection.selected_chat_ids
+            if not ids:
+                self.store.reset_owner_query_selection(selection_id)
+                return OwnerQueryResult("Выберите хотя бы один проект.", selection_id=selection_id)
+            scope = OwnerQueryScope(
+                "single" if len(ids) == 1 else "multiple", ids, selection.question,
+                selection.time_from_utc, selection.time_to_utc, selection.time_label, selection.detail_level,
+            )
+            if len(ids) == 1:
+                chat = self.registry.get(ids[0])
+                if chat is None:
+                    self.store.fail_owner_query_selection(selection_id)
+                    return OwnerQueryResult("Выбранный чат больше не подключён.")
+                try:
+                    answer = await self._answer_owner_query_for_chat(chat, scope.question, scope=scope)
+                    result = self._follow_up_query_result(chat, scope.question, answer, scope=scope)
+                except Exception:
+                    logger.exception("event=owner_query_selection_single_failed selection_id=%s", selection_id)
+                    self.store.fail_owner_query_selection(selection_id)
+                    return OwnerQueryResult("Не удалось обработать выбранный проект.")
+                self.store.finish_owner_query_selection(selection_id)
+                return result
+            try:
+                return await self._answer_owner_portfolio(scope, selection_id=selection_id)
+            except Exception:
+                logger.exception("event=owner_query_selection_portfolio_failed selection_id=%s", selection_id)
+                self.store.fail_owner_query_selection(selection_id)
+                return OwnerQueryResult("Не удалось обработать выбранные проекты.")
+        return OwnerQueryResult("Выберите действие.", selection_id=selection_id)
 
     def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_query_prompt(prompt_id, owner_message_id)
 
-    def save_pending_owner_query_delivery(self, text: str, prompt_id: int | None) -> int:
-        return self.store.create_owner_query_delivery(text, prompt_id)
+    def save_pending_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None) -> int:
+        return self.store.create_owner_query_delivery(text, prompt_id, selection_id)
 
     def pending_owner_query_deliveries(self) -> list[OwnerQueryResult]:
         return [
-            OwnerQueryResult(text=text, prompt_id=prompt_id, delivery_id=delivery_id)
-            for delivery_id, text, prompt_id in self.store.pending_owner_query_deliveries()
+            OwnerQueryResult(text=text, prompt_id=prompt_id, delivery_id=delivery_id, selection_id=selection_id)
+            for delivery_id, text, prompt_id, selection_id in self.store.pending_owner_query_deliveries()
         ]
 
     def record_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
@@ -833,6 +1007,30 @@ class AgentBridgeApplication:
         prompt = self.store.get_owner_query_prompt_by_message(owner_message_id)
         if prompt is None:
             return None
+        if prompt.target_chat_ids:
+            scope = OwnerQueryScope(
+                "multiple" if len(prompt.target_chat_ids) > 1 else "single", prompt.target_chat_ids, text,
+                prompt.time_from_utc, prompt.time_to_utc, prompt.time_label or "текущее состояние и недавняя история",
+                prompt.detail_level,
+            )
+            if not self.store.answer_owner_query_prompt(prompt.id):
+                return None
+            if len(scope.chat_ids) == 1:
+                chat = self.registry.get(scope.chat_ids[0])
+                if chat is None:
+                    if update_id is not None:
+                        self.store.mark_update_processed(update_id)
+                    return OwnerQueryResult("Выбранный проект больше не подключён.")
+                answer = await self._answer_owner_query_for_chat(chat, text, scope=scope)
+                result = self._follow_up_query_result(chat, text, answer, scope=scope)
+            else:
+                try:
+                    result = await self._answer_owner_portfolio(scope)
+                except LookupError:
+                    result = OwnerQueryResult("Выбранные проекты больше не подключены.")
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return result
         if prompt.telegram_chat_id is not None:
             chat = self.registry.get(prompt.telegram_chat_id)
             if chat is None:
@@ -857,13 +1055,114 @@ class AgentBridgeApplication:
             self.store.mark_update_processed(update_id)
         return self._follow_up_query_result(chat, prompt.question, answer)
 
-    def _follow_up_query_result(self, chat: ChatConfig, question: str, answer: str) -> OwnerQueryResult:
-        prompt_id = self.store.create_owner_query_prompt(question, chat.telegram_chat_id)
+    def _follow_up_query_result(
+        self, chat: ChatConfig, question: str, answer: str, *, scope: OwnerQueryScope | None = None,
+    ) -> OwnerQueryResult:
+        prompt_id = self.store.create_owner_query_prompt(
+            question, chat.telegram_chat_id,
+            target_chat_ids=scope.chat_ids if scope else (),
+            time_from_utc=scope.time_from_utc if scope else None,
+            time_to_utc=scope.time_to_utc if scope else None,
+            time_label=scope.time_label if scope else "",
+            detail_level=scope.detail_level if scope else "short",
+        )
         return OwnerQueryResult(answer, prompt_id)
 
-    async def _answer_owner_query_for_chat(self, chat: ChatConfig, question: str) -> str:
+    async def _answer_owner_portfolio(
+        self, scope: OwnerQueryScope, *, update_id: int | None = None, selection_id: int | None = None,
+    ) -> OwnerQueryResult:
+        chats = [self.registry.get(chat_id) for chat_id in scope.chat_ids]
+        chats = [chat for chat in chats if chat is not None]
+        if not chats:
+            raise LookupError("no selected chats are still configured")
+        semaphore = asyncio.Semaphore(4)
+
+        async def summarize(chat: ChatConfig) -> dict[str, object]:
+            async with semaphore:
+                context, shown, total, truncated = self._portfolio_context(chat, scope)
+                method = getattr(self.provider, "summarize_portfolio_chat", None)
+                if method is None:
+                    raise RuntimeError("provider does not support portfolio summaries")
+                result = await method(
+                    question=scope.question, chat_name=chat.name, period=scope.time_label,
+                    context_pack=context, detail_level=scope.detail_level,
+                )
+                if isinstance(result, dict):
+                    result = PortfolioChatSummary(chat.name, scope.time_label, **{
+                        key: str(result.get(key) or "") for key in (
+                            "current_status", "events", "problems", "waiting_us", "waiting_client",
+                            "next_step", "metrics", "uncertainties",
+                        )
+                    })
+                return {"chat_name": chat.name, "summary": result, "shown": shown, "total": total, "truncated": truncated}
+
+        results = await asyncio.gather(*(summarize(chat) for chat in chats), return_exceptions=True)
+        compact: list[dict[str, object]] = []
+        for chat, result in zip(chats, results):
+            if isinstance(result, Exception):
+                compact.append({"chat_name": chat.name, "failure": "не удалось получить сводку"})
+            else:
+                summary = result["summary"]
+                if isinstance(summary, PortfolioChatSummary):
+                    compact.append({"chat_name": chat.name, "summary": {
+                        key: getattr(summary, key) for key in (
+                            "period", "current_status", "events", "problems", "waiting_us", "waiting_client",
+                            "next_step", "metrics", "uncertainties",
+                        )
+                    }, "history": f"показано {result['shown']} из {result['total']}" + ("; обрезано" if result["truncated"] else "")})
+        aggregate = getattr(self.owner_provider, "aggregate_owner_portfolio", None)
+        if aggregate is not None:
+            try:
+                answer = await aggregate(
+                    question=scope.question, period=scope.time_label, detail_level=scope.detail_level, summaries=compact,
+                )
+            except Exception:
+                logger.exception("event=owner_portfolio_aggregate_failed")
+                answer = "Не удалось собрать общий итог; отдельные сводки временно недоступны."
+        else:
+            answer = "\n\n".join(
+                f"{item['chat_name']}: {item.get('failure') or (item.get('summary') or {}).get('current_status', '')}"
+                for item in compact
+            )
+        prompt_id = self.store.create_owner_query_prompt(
+            scope.question, self.owner_chat_id,
+            target_chat_ids=scope.chat_ids, time_from_utc=scope.time_from_utc,
+            time_to_utc=scope.time_to_utc, time_label=scope.time_label, detail_level=scope.detail_level,
+        )
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        if selection_id is not None:
+            self.store.finish_owner_query_selection(selection_id)
+        return OwnerQueryResult(str(answer), prompt_id)
+
+    def _portfolio_context(self, chat: ChatConfig, scope: OwnerQueryScope) -> tuple[str, int, int, bool]:
+        messages, total, truncated = self.store.portfolio_messages(
+            chat.telegram_chat_id, time_from_utc=scope.time_from_utc, time_to_utc=scope.time_to_utc, limit=200,
+        )
+        state = self.store.get_chat_state(chat.telegram_chat_id)
+        history = "\n".join(f"{item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
+        parts = [f"Клиент: {chat.name}", f"Период: {scope.time_label}", f"Wiki:\n{chat.wiki or '(пусто)'}"]
+        shared = self._shared_knowledge(chat)
+        if shared:
+            parts.append(shared)
+        parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False))
+        parts.append(f"История ({'показано ' + str(len(messages)) + ' из ' + str(total) + (', обрезано' if truncated else '')}):\n" + (history or "(нет сообщений)"))
+        memories = self.store.active_memory_entries(chat.telegram_chat_id, chat.memory_project)
+        if memories:
+            parts.append("Подтверждённая память:\n" + "\n".join(f"- {item.content}" for item in memories))
+        parts.append("Правила:\n" + ("\n".join(f"- {rule}" for rule in self.store.active_rule_texts(chat.telegram_chat_id)) or "(нет)"))
+        return "\n\n".join(parts), len(messages), total, truncated
+
+    async def _answer_owner_query_for_chat(
+        self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None,
+    ) -> str:
         answerer = getattr(self.owner_provider, "answer_owner_query", None)
-        pack = self._context_pack(chat)
+        pack = self._context_pack(
+            chat,
+            time_from_utc=scope.time_from_utc if scope else None,
+            time_to_utc=scope.time_to_utc if scope else None,
+            time_label=scope.time_label if scope else "",
+        )
         if answerer is not None:
             thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
             result = await answerer(

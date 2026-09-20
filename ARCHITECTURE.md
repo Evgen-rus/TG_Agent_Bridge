@@ -36,6 +36,10 @@ OWNER_CHAT_ID
      without a client chat or a reply to a recommendation
   -> reply to a “which chat?” clarification or to the last assistant answer:
      continue that query
+  -> portfolio query: resolve single/multiple/all scope; ambiguous scope gets
+     durable owner-only selection buttons, then isolated per-chat summaries and
+     owner aggregation. Periods are converted from OWNER_TIMEZONE to [from,to)
+     UTC before SQLite history filtering.
   -> reply to a new-group card: client brief, then confirm wiki draft
   -> /rules and /undo from the owner-chat command menu only
   -> ordinary human conversation is ignored
@@ -95,6 +99,8 @@ a series of outdated recommendations.
   batching, owner mention/reply interface, and owner-message formatting.
 - `agentbridge/application.py`: use-case orchestration, context pack, catch-up,
   chat_state updates, and owner assistant queries.
+- `agentbridge/owner_query.py`: owner-query scope/summary value objects and
+  deterministic local-time to UTC period parsing.
 - `agentbridge/agents/base.py`: provider boundary and action types.
 - `agentbridge/agents/codex.py`: official `openai-codex` implementation and
   structured Codex output.
@@ -175,6 +181,14 @@ the current situation and propose confirmed memory; it is never sent to the
 client automatically.
 
 ## Invariants
+
+Portfolio owner queries do not reuse client Codex threads. The client provider
+creates one stateless structured summary per selected chat (at most four in
+parallel) from that chat's wiki, state, scoped memory/rules/knowledge and at
+most 200 messages. The owner provider receives only compact summaries or a
+failure stub for aggregation. `owner_query_selections` persists an ambiguous
+selection and atomically claims it for processing; `owner_query_prompts` keeps
+selected IDs and time metadata so a follow-up reruns the same portfolio.
 
 - Suggest-only: never reply automatically to a monitored/client chat.
 - One Telegram chat maps to independent client, owner-query, and optional Sepia Codex threads,

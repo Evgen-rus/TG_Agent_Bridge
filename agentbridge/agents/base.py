@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
+from ..owner_query import OwnerQueryIntent, PortfolioChatSummary
+
 
 class AgentAction:
     REPLY = "reply"
@@ -123,3 +125,17 @@ class AgentProvider(Protocol):
         context_pack: str,
         thread_id: str | None,
     ) -> OwnerQueryAnswer: ...
+
+    async def resolve_owner_query_scope(
+        self, *, question: str, known_chats: Sequence[dict[str, str]],
+    ) -> OwnerQueryIntent: ...
+
+    async def summarize_portfolio_chat(
+        self, *, question: str, chat_name: str, period: str, context_pack: str,
+        detail_level: str,
+    ) -> PortfolioChatSummary: ...
+
+    async def aggregate_owner_portfolio(
+        self, *, question: str, period: str, detail_level: str,
+        summaries: Sequence[dict[str, object]],
+    ) -> str: ...

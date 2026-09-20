@@ -104,6 +104,27 @@ class OwnerQueryPrompt:
     owner_message_id: int | None
     status: str
     telegram_chat_id: int | None = None
+    target_chat_ids: tuple[int, ...] = ()
+    time_from_utc: str | None = None
+    time_to_utc: str | None = None
+    time_label: str = ""
+    detail_level: str = "short"
+
+
+@dataclass(frozen=True)
+class OwnerQuerySelection:
+    id: int
+    question: str
+    owner_chat_id: int
+    available_chat_ids: tuple[int, ...]
+    selected_chat_ids: tuple[int, ...]
+    mode: str
+    status: str
+    time_from_utc: str | None
+    time_to_utc: str | None
+    time_label: str
+    detail_level: str
+    owner_message_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +343,8 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_telegram_messages_pending
                     ON telegram_messages(chat_id, processing_status, id);
+                CREATE INDEX IF NOT EXISTS idx_telegram_messages_chat_date
+                    ON telegram_messages(chat_id, telegram_date, id);
                 CREATE TABLE IF NOT EXISTS chat_states (
                     telegram_chat_id INTEGER PRIMARY KEY,
                     state_json TEXT NOT NULL,
@@ -344,6 +367,11 @@ class ChatThreadStore:
                     question TEXT NOT NULL,
                     owner_message_id INTEGER,
                     telegram_chat_id INTEGER,
+                    target_chat_ids TEXT NOT NULL DEFAULT '[]',
+                    time_from_utc TEXT,
+                    time_to_utc TEXT,
+                    time_label TEXT NOT NULL DEFAULT '',
+                    detail_level TEXT NOT NULL DEFAULT 'short',
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -353,11 +381,30 @@ class ChatThreadStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     text TEXT NOT NULL,
                     prompt_id INTEGER,
+                    selection_id INTEGER,
                     owner_message_id INTEGER,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_owner_query_deliveries_pending
                     ON owner_query_deliveries(owner_message_id);
+                CREATE TABLE IF NOT EXISTS owner_query_selections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question TEXT NOT NULL,
+                    owner_chat_id INTEGER NOT NULL,
+                    available_chat_ids TEXT NOT NULL,
+                    selected_chat_ids TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    time_from_utc TEXT,
+                    time_to_utc TEXT,
+                    time_label TEXT NOT NULL DEFAULT '',
+                    detail_level TEXT NOT NULL DEFAULT 'short',
+                    owner_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_owner_query_selections_status
+                    ON owner_query_selections(owner_chat_id, status);
                 CREATE TABLE IF NOT EXISTS owner_delivery_parts (
                     owner_chat_id INTEGER NOT NULL,
                     delivery_key TEXT NOT NULL,
@@ -407,6 +454,10 @@ class ChatThreadStore:
             connection.execute(
                 "UPDATE telegram_messages SET processing_status='pending' WHERE processing_status='processing'"
             )
+            connection.execute(
+                "UPDATE owner_query_selections SET status='selecting', updated_at=? WHERE status='processing'",
+                (_now(),),
+            )
 
     @staticmethod
     def _upgrade_schema(connection: sqlite3.Connection) -> None:
@@ -423,7 +474,15 @@ class ChatThreadStore:
             ),
             "memory_entries": (("kind", "TEXT NOT NULL DEFAULT 'fact'"),),
             "chat_threads": (("prompt_version", "INTEGER"),),
-            "owner_query_prompts": (("telegram_chat_id", "INTEGER"),),
+            "owner_query_prompts": (
+                ("telegram_chat_id", "INTEGER"),
+                ("target_chat_ids", "TEXT NOT NULL DEFAULT '[]'"),
+                ("time_from_utc", "TEXT"),
+                ("time_to_utc", "TEXT"),
+                ("time_label", "TEXT NOT NULL DEFAULT ''"),
+                ("detail_level", "TEXT NOT NULL DEFAULT 'short'"),
+            ),
+            "owner_query_deliveries": (("selection_id", "INTEGER"),),
             "telegram_messages": (
                 ("media_kind", "TEXT NOT NULL DEFAULT ''"),
                 ("media_path", "TEXT NOT NULL DEFAULT ''"),
@@ -631,6 +690,15 @@ class ChatThreadStore:
                 WHERE update_id=? AND processing_status IN ('ignored', 'pending', 'processed')""",
                 (telegram_update_id,),
             )
+
+    def claim_update_processed(self, telegram_update_id: int) -> bool:
+        """Atomically claim an owner-only update before creating durable UI state."""
+        with self._connect() as connection:
+            result = connection.execute(
+                "INSERT OR IGNORE INTO processed_updates VALUES (?, ?)",
+                (telegram_update_id, _now()),
+            )
+        return result.rowcount == 1
 
     def record_internal_context(self, telegram_chat_id: int, chat_name: str, sender_name: str, message_text: str) -> None:
         with self._connect() as connection:
@@ -1164,12 +1232,20 @@ class ChatThreadStore:
                 [(item.update_id, _now()) for item in messages],
             )
 
-    def recent_messages(self, chat_id: int, limit: int = 20) -> list[StoredMessage]:
+    def recent_messages(
+        self, chat_id: int, limit: int = 20, *,
+        time_from_utc: str | None = None, time_to_utc: str | None = None,
+    ) -> list[StoredMessage]:
         with self._connect() as connection:
+            clauses = ["chat_id=?", "role IN ('client', 'internal')"]
+            params: list[object] = [chat_id]
+            if time_from_utc is not None:
+                clauses.append("telegram_date >= ?"); params.append(time_from_utc)
+            if time_to_utc is not None:
+                clauses.append("telegram_date < ?"); params.append(time_to_utc)
             rows = connection.execute(
-                """SELECT * FROM telegram_messages WHERE chat_id=? AND role IN ('client', 'internal')
-                ORDER BY id DESC LIMIT ?""",
-                (chat_id, limit),
+                f"SELECT * FROM telegram_messages WHERE {' AND '.join(clauses)} ORDER BY telegram_date DESC, id DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
         return [self._stored_message(row) for row in reversed(rows)]
 
@@ -1254,12 +1330,20 @@ class ChatThreadStore:
             owner_message_id=row["owner_message_id"], status=row["status"],
         )
 
-    def create_owner_query_prompt(self, question: str, telegram_chat_id: int | None = None) -> int:
+    def create_owner_query_prompt(
+        self, question: str, telegram_chat_id: int | None = None, *,
+        target_chat_ids: tuple[int, ...] | list[int] = (),
+        time_from_utc: str | None = None, time_to_utc: str | None = None,
+        time_label: str = "", detail_level: str = "short",
+    ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                """INSERT INTO owner_query_prompts (question, telegram_chat_id, status, created_at)
-                VALUES (?, ?, 'pending', ?)""",
-                (question.strip(), telegram_chat_id, _now()),
+                """INSERT INTO owner_query_prompts
+                (question, telegram_chat_id, target_chat_ids, time_from_utc, time_to_utc,
+                 time_label, detail_level, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (question.strip(), telegram_chat_id, json.dumps(list(target_chat_ids)),
+                 time_from_utc, time_to_utc, time_label, detail_level, _now()),
             )
             return int(cursor.lastrowid)
 
@@ -1283,7 +1367,140 @@ class ChatThreadStore:
             id=row["id"], question=row["question"],
             owner_message_id=row["owner_message_id"], status=row["status"],
             telegram_chat_id=row["telegram_chat_id"] if "telegram_chat_id" in keys else None,
+            target_chat_ids=tuple(json.loads(row["target_chat_ids"] or "[]")) if "target_chat_ids" in keys else (),
+            time_from_utc=row["time_from_utc"] if "time_from_utc" in keys else None,
+            time_to_utc=row["time_to_utc"] if "time_to_utc" in keys else None,
+            time_label=row["time_label"] if "time_label" in keys else "",
+            detail_level=row["detail_level"] if "detail_level" in keys else "short",
         )
+
+    def create_owner_query_selection(
+        self, question: str, owner_chat_id: int, available_chat_ids: list[int] | tuple[int, ...],
+        *, time_from_utc: str | None = None, time_to_utc: str | None = None,
+        time_label: str = "", detail_level: str = "short",
+    ) -> int:
+        now = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO owner_query_selections
+                (question, owner_chat_id, available_chat_ids, selected_chat_ids, mode, status,
+                 time_from_utc, time_to_utc, time_label, detail_level, created_at, updated_at)
+                VALUES (?, ?, ?, '[]', 'ambiguous', 'selecting', ?, ?, ?, ?, ?, ?)""",
+                (question.strip(), owner_chat_id, json.dumps(list(available_chat_ids)),
+                 time_from_utc, time_to_utc, time_label, detail_level, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    @staticmethod
+    def _owner_query_selection(row: sqlite3.Row) -> OwnerQuerySelection:
+        def ids(name: str) -> tuple[int, ...]:
+            try:
+                return tuple(int(value) for value in json.loads(row[name] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return ()
+        return OwnerQuerySelection(
+            id=row["id"], question=row["question"], owner_chat_id=row["owner_chat_id"],
+            available_chat_ids=ids("available_chat_ids"), selected_chat_ids=ids("selected_chat_ids"),
+            mode=row["mode"], status=row["status"], time_from_utc=row["time_from_utc"],
+            time_to_utc=row["time_to_utc"], time_label=row["time_label"], detail_level=row["detail_level"],
+            owner_message_id=row["owner_message_id"],
+        )
+
+    def get_owner_query_selection(self, selection_id: int) -> OwnerQuerySelection | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM owner_query_selections WHERE id=?", (selection_id,)).fetchone()
+        return None if row is None else self._owner_query_selection(row)
+
+    def attach_owner_query_selection(self, selection_id: int, owner_message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE owner_query_selections SET owner_message_id=?, updated_at=? WHERE id=?",
+                (owner_message_id, _now(), selection_id),
+            )
+
+    def update_owner_query_selection(
+        self, selection_id: int, *, mode: str | None = None, selected_chat_ids: list[int] | tuple[int, ...] | None = None,
+        status: str | None = None,
+    ) -> bool:
+        values: list[object] = []
+        updates: list[str] = []
+        if mode is not None:
+            updates.append("mode=?"); values.append(mode)
+        if selected_chat_ids is not None:
+            updates.append("selected_chat_ids=?"); values.append(json.dumps(list(selected_chat_ids)))
+        if status is not None:
+            updates.append("status=?"); values.append(status)
+        if not updates:
+            return False
+        updates.append("updated_at=?"); values.append(_now()); values.append(selection_id)
+        with self._connect() as connection:
+            result = connection.execute(
+                f"UPDATE owner_query_selections SET {', '.join(updates)} WHERE id=? AND status='selecting'",
+                values,
+            )
+        return result.rowcount == 1
+
+    def claim_owner_query_selection(self, selection_id: int) -> OwnerQuerySelection | None:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE owner_query_selections SET status='processing', updated_at=? WHERE id=? AND status='selecting'",
+                (_now(), selection_id),
+            )
+            if result.rowcount != 1:
+                return None
+            row = connection.execute("SELECT * FROM owner_query_selections WHERE id=?", (selection_id,)).fetchone()
+        return None if row is None else self._owner_query_selection(row)
+
+    def cancel_owner_query_selection(self, selection_id: int) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE owner_query_selections SET status='cancelled', updated_at=? WHERE id=? AND status='selecting'",
+                (_now(), selection_id),
+            )
+        return result.rowcount == 1
+
+    def finish_owner_query_selection(self, selection_id: int) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE owner_query_selections SET status='answered', updated_at=? WHERE id=? AND status='processing'",
+                (_now(), selection_id),
+            )
+        return result.rowcount == 1
+
+    def reset_owner_query_selection(self, selection_id: int) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE owner_query_selections SET status='selecting', updated_at=? WHERE id=? AND status='processing'",
+                (_now(), selection_id),
+            )
+        return result.rowcount == 1
+
+    def fail_owner_query_selection(self, selection_id: int) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE owner_query_selections SET status='failed', updated_at=? WHERE id=? AND status='processing'",
+                (_now(), selection_id),
+            )
+        return result.rowcount == 1
+
+    def portfolio_messages(
+        self, chat_id: int, *, time_from_utc: str | None = None, time_to_utc: str | None = None,
+        limit: int = 200,
+    ) -> tuple[list[StoredMessage], int, bool]:
+        clauses = ["chat_id=?", "role IN ('client', 'internal')"]
+        params: list[object] = [chat_id]
+        if time_from_utc is not None:
+            clauses.append("telegram_date >= ?"); params.append(time_from_utc)
+        if time_to_utc is not None:
+            clauses.append("telegram_date < ?"); params.append(time_to_utc)
+        where = " AND ".join(clauses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM telegram_messages WHERE {where} ORDER BY telegram_date DESC, id DESC LIMIT ?", (*params, limit + 1),
+            ).fetchall()
+            total = int(connection.execute(f"SELECT COUNT(*) FROM telegram_messages WHERE {where}", params).fetchone()[0])
+        shown = [self._stored_message(row) for row in reversed(rows[:limit])]
+        return shown, total, total > limit
 
     def answer_owner_query_prompt(self, prompt_id: int) -> bool:
         with self._connect() as connection:
@@ -1293,22 +1510,22 @@ class ChatThreadStore:
             )
         return result.rowcount == 1
 
-    def create_owner_query_delivery(self, text: str, prompt_id: int | None) -> int:
+    def create_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                """INSERT INTO owner_query_deliveries (text, prompt_id, created_at)
-                VALUES (?, ?, ?)""",
-                (text, prompt_id, _now()),
+                """INSERT INTO owner_query_deliveries (text, prompt_id, selection_id, created_at)
+                VALUES (?, ?, ?, ?)""",
+                (text, prompt_id, selection_id, _now()),
             )
             return int(cursor.lastrowid)
 
-    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None]]:
+    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None, int | None]]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT id, text, prompt_id FROM owner_query_deliveries
+                """SELECT id, text, prompt_id, selection_id FROM owner_query_deliveries
                 WHERE owner_message_id IS NULL ORDER BY id""",
             ).fetchall()
-        return [(int(row["id"]), row["text"], row["prompt_id"]) for row in rows]
+        return [(int(row["id"]), row["text"], row["prompt_id"], row["selection_id"]) for row in rows]
 
     def attach_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
         with self._connect() as connection:

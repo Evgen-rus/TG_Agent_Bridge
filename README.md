@@ -34,6 +34,7 @@ code, for example when you want to reduce usage:
 ```dotenv
 OWNER_CODEX_MODEL=gpt-5.6-terra
 OWNER_CODEX_REASONING_EFFORT=none
+OWNER_TIMEZONE=Asia/Novosibirsk
 ```
 
 `OWNER_CODEX_MODEL` can also be set back to `gpt-5.6-luna`. The official Python
@@ -45,6 +46,12 @@ when no account is available:
 ```
 
 Never commit `.env` or Codex authentication files.
+
+Владелец может спросить сразу про один, несколько или все подключённые чаты.
+Для неоднозначного запроса бот покажет выбор проектов. Периоды вроде «сегодня»,
+«вчера», «за неделю» и «последние 7 дней» считаются в `OWNER_TIMEZONE` и
+фильтруют историю по полуоткрытому UTC-интервалу. Без периода используются
+текущее состояние и ограниченная недавняя история.
 
 `MESSAGE_BATCH_SECONDS` controls the live per-chat collection window and
 defaults to 20 seconds. Human messages received in the same monitored chat
