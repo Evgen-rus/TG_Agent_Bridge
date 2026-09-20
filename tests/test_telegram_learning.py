@@ -104,7 +104,7 @@ class FakeLearningService:
         self.context_calls.append({"reply_to_message_id": reply_to_message_id, "text": text})
         scope = "global" if text.casefold().startswith("общий контекст:") else "chat"
         chat_name = "все чаты" if scope == "global" else "Acme"
-        return MemoryProposal(8, chat_name, content, scope)
+        return MemoryProposal(8, chat_name, content, scope, global_allowed=scope == "global")
 
     def confirm_memory(self, draft_id: int, scope: str = "chat"):
         self.memory_confirm_calls.append(draft_id)
@@ -205,6 +205,18 @@ async def test_owner_feedback_memory_candidate_is_a_separate_three_way_prompt() 
 
 
 @pytest.mark.asyncio
+async def test_chat_only_feedback_memory_candidate_has_no_global_button() -> None:
+    service = FakeLearningService(feedback_memory=MemoryProposal(9, "Acme", "Только для этого чата.", "chat", False))
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _text_callback(application)(
+        FakeUpdate(FakeMessage("Сохрани для этого клиента", FakeReply(9001, FakeUser(777, "AgentBridge", True))), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert [button.text for button in bot.sent[1]["reply_markup"].inline_keyboard[0]] == ["Только этот чат", "Не сохранять"]
+
+
+@pytest.mark.asyncio
 async def test_context_reply_to_bot_recommendation_creates_memory_confirmation() -> None:
     service = FakeLearningService()
     application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
@@ -215,7 +227,7 @@ async def test_context_reply_to_bot_recommendation_creates_memory_confirmation()
     )
     assert service.context_calls == [{"reply_to_message_id": 9001, "text": "Контекст: Клиент использует свой колл-центр."}]
     buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
-    assert [button.callback_data for button in buttons] == ["memory:global:8", "memory:chat:8", "memory:no:8"]
+    assert [button.callback_data for button in buttons] == ["memory:chat:8", "memory:no:8"]
 
 
 @pytest.mark.asyncio

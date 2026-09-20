@@ -106,12 +106,15 @@ def _confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def _memory_confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Для всех", callback_data=f"memory:global:{draft_id}"),
+def _memory_confirmation_keyboard(draft_id: int, global_allowed: bool = True) -> InlineKeyboardMarkup:
+    buttons = []
+    if global_allowed:
+        buttons.append(InlineKeyboardButton("Для всех", callback_data=f"memory:global:{draft_id}"))
+    buttons.extend([
         InlineKeyboardButton("Только этот чат", callback_data=f"memory:chat:{draft_id}"),
         InlineKeyboardButton("Не сохранять", callback_data=f"memory:no:{draft_id}"),
-    ]])
+    ])
+    return InlineKeyboardMarkup([buttons])
 
 
 async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
@@ -674,7 +677,10 @@ def create_telegram_application(
             await _send(context.bot, chat_id=owner_chat_id, text=f"AgentBridge не смог подготовить рекомендацию. Чат ID: {chat_id}. Проверьте журнал приложения.")
 
     async def _send_memory_proposal(bot, proposal: MemoryProposal) -> None:
-        await _send(bot, chat_id=owner_chat_id, text=format_memory_proposal(proposal), reply_markup=_memory_confirmation_keyboard(proposal.draft_id))
+        await _send(
+            bot, chat_id=owner_chat_id, text=format_memory_proposal(proposal),
+            reply_markup=_memory_confirmation_keyboard(proposal.draft_id, proposal.global_allowed),
+        )
 
     async def _deliver_onboarding_notice(bot, notice: OnboardingNotice) -> None:
         if not notice.needs_delivery:

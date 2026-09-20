@@ -88,6 +88,7 @@ class MemoryProposal:
     chat_name: str
     content: str
     scope: str
+    global_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -741,7 +742,7 @@ class AgentBridgeApplication:
             )
             if update_id is not None:
                 self.store.mark_update_processed(update_id)
-            return MemoryProposal(draft.id, "все чаты", draft.content, draft.scope)
+            return MemoryProposal(draft.id, "все чаты", draft.content, draft.scope, draft.global_allowed)
         chat = self.registry.get(recommendation.telegram_chat_id)
         project_key = chat.memory_project if chat is not None else None
         if scope == "project" and not project_key:
@@ -752,7 +753,7 @@ class AgentBridgeApplication:
         )
         if update_id is not None:
             self.store.mark_update_processed(update_id)
-        return MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
+        return MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope, draft.global_allowed)
 
     @staticmethod
     def _parse_memory_command(text: str) -> tuple[str, str] | None:
@@ -768,9 +769,11 @@ class AgentBridgeApplication:
         if draft is None:
             return None
         if draft.recommendation_id is None:
-            return MemoryProposal(draft.id, "все чаты", draft.content, draft.scope)
+            return MemoryProposal(draft.id, "все чаты", draft.content, draft.scope, draft.global_allowed)
         recommendation = self.store.get_recommendation(draft.recommendation_id)
-        return None if recommendation is None else MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
+        return None if recommendation is None else MemoryProposal(
+            draft.id, recommendation.chat_name, draft.content, draft.scope, draft.global_allowed,
+        )
 
     def reject_memory(self, draft_id: int) -> bool:
         return self.store.reject_memory_draft(draft_id)
@@ -943,7 +946,7 @@ class AgentBridgeApplication:
                 question.recommendation_id, author_user_id, author_name, answer.strip(), "chat", None,
                 global_allowed=False,
             )
-            memory_proposal = MemoryProposal(draft.id, chat.name, draft.content, draft.scope)
+            memory_proposal = MemoryProposal(draft.id, chat.name, draft.content, draft.scope, draft.global_allowed)
         return QuestionReplyResult(suggestion, memory_proposal)
 
     async def clarify_feedback(self, prompt_message_id: int, feedback: str, update_id: int | None = None) -> LearningProposal | None:
@@ -1052,7 +1055,7 @@ class AgentBridgeApplication:
             recommendation.id, author_user_id, author_name, content, scope, None,
             global_allowed=scope == "global",
         )
-        return MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
+        return MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope, draft.global_allowed)
 
     def _memory_candidate_is_duplicate(self, chat: ChatConfig, content: str) -> bool:
         candidate = _normalise_memory_text(content)
