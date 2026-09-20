@@ -13,6 +13,7 @@ chats/*
 # Pytest basetemp leftovers
 tmp/
 tmp_pytest/
+My_dev_projectTG_Agent_Bridgetmp_pytest/
 .pytest_tmp_run/
 
 # Python

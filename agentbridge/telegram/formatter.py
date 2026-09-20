@@ -76,16 +76,7 @@ def format_learning_proposal(proposal: "LearningProposal") -> str:
 
 
 def format_memory_proposal(proposal: "MemoryProposal") -> str:
-    scope = {
-        "chat": f"только для чата «{proposal.chat_name}»",
-        "project": "для связанного проекта",
-        "global": "для всех подключённых чатов",
-    }[proposal.scope]
-    return (
-        f"Контекст для сохранения:\n{proposal.content}\n\n"
-        f"Область: {scope}\n\n"
-        "Сохранить?"
-    )
+    return f"Предлагаю запомнить:\n\n{proposal.content}"
 
 
 def format_onboarding_notice(notice: "OnboardingNotice") -> str:

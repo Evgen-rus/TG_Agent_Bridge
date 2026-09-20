@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agentbridge.agents.base import AgentReply, OwnerQueryAnswer
+from agentbridge.agents.base import AgentReply, FeedbackAnalysis, OwnerQueryAnswer
 from agentbridge.application import AgentBridgeApplication, OwnerQueryResult
 from agentbridge.chats.loader import ChatConfig, ChatRegistry
 from agentbridge.storage.sqlite import ChatThreadStore
@@ -106,6 +106,14 @@ async def test_duplicate_update_is_ignored_across_restart(tmp_path, chat_registr
 @pytest.mark.asyncio
 async def test_internal_participant_is_saved_without_a_recommendation(tmp_path, chat_registry) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    recommendation_id = store.create_recommendation(
+        -100123456, "Acme Support", "Owner", "seed", "seed", "seed",
+    )
+    draft = store.create_learning_draft(
+        recommendation_id, 1, "Owner", "seed",
+        FeedbackAnalysis("internal", "Сообщения от Евгения Расюка не пересылать.", "internal_sender", "client", False, None),
+    )
+    assert store.confirm_draft(draft.id)
     provider = FakeProvider()
     service = AgentBridgeApplication(chat_registry, store, provider)
 
@@ -122,10 +130,37 @@ async def test_internal_participant_is_saved_without_a_recommendation(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_internal_sender_rule_is_scoped_to_one_chat(tmp_path) -> None:
+    first = ChatConfig(-100123456, "First", "codex", "wiki", Path("chats/first"))
+    second = ChatConfig(-100999000, "Second", "codex", "wiki", Path("chats/second"))
+    registry = ChatRegistry({first.telegram_chat_id: first, second.telegram_chat_id: second})
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    recommendation_id = store.create_recommendation(first.telegram_chat_id, first.name, "Owner", "seed", "seed", "seed")
+    draft = store.create_learning_draft(
+        recommendation_id, 1, "Owner", "seed",
+        FeedbackAnalysis("internal", "Сообщения от Евгения Расюка не пересылать.", "internal_sender", "client", False, None),
+    )
+    assert store.confirm_draft(draft.id)
+    provider = FakeProvider()
+    service = AgentBridgeApplication(registry, store, provider)
+
+    assert await service.handle_message(first.telegram_chat_id, "Евгений Расюк", "внутреннее", 91) is None
+    assert await service.handle_message(second.telegram_chat_id, "Евгений Расюк", "внутреннее", 92) is not None
+
+
+@pytest.mark.asyncio
 async def test_confirmed_chat_memory_and_internal_context_are_sent_only_to_that_chat(tmp_path, chat_registry) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
     provider = FakeProvider()
     service = AgentBridgeApplication(chat_registry, store, provider)
+    recommendation_id = store.create_recommendation(
+        -100123456, "Acme", "Owner", "seed", "seed", "seed",
+    )
+    internal_rule = store.create_learning_draft(
+        recommendation_id, 1, "Owner", "seed",
+        FeedbackAnalysis("internal", "Сообщения от Евгения Расюка не пересылать.", "internal_sender", "client", False, None),
+    )
+    assert store.confirm_draft(internal_rule.id)
     suggestion = await service.handle_message(-100123456, "Alice", "Can I get the docs?")
     assert suggestion is not None
     service.record_owner_delivery(suggestion.recommendation_id, 7654321, 9001)
@@ -133,7 +168,9 @@ async def test_confirmed_chat_memory_and_internal_context_are_sent_only_to_that_
         7654321, 9001, 42, "Owner", "Контекст: Клиенту нужен договор до запуска проекта."
     )
     assert proposal is not None and proposal.scope == "chat"
-    assert service.confirm_memory(proposal.draft_id) is not None
+    assert store.get_memory_draft(proposal.draft_id).global_allowed is False
+    assert service.confirm_memory(proposal.draft_id, "global") is None
+    assert service.confirm_memory(proposal.draft_id, "chat") is not None
     await service.handle_message(-100123456, "Евгений Расюк", "Юрист уже получил реквизиты.")
     await service.handle_message(-100123456, "Alice", "What is the next step?")
 

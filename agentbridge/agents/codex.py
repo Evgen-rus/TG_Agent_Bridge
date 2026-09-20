@@ -125,8 +125,13 @@ _FEEDBACK_SCHEMA = {
         "scope": {"type": "string", "enum": ["client", "global"]},
         "regenerate_current": {"type": "boolean"},
         "revision_instruction": {"type": ["string", "null"]},
+        "candidate_memory": {"type": ["string", "null"]},
+        "candidate_memory_scope": {"type": ["string", "null"]},
     },
-    "required": ["understanding", "proposed_rule", "conflict_key", "scope", "regenerate_current", "revision_instruction"],
+    "required": [
+        "understanding", "proposed_rule", "conflict_key", "scope", "regenerate_current",
+        "revision_instruction", "candidate_memory", "candidate_memory_scope",
+    ],
     "additionalProperties": False,
 }
 _OWNER_QUERY_SCHEMA = {
@@ -196,6 +201,11 @@ scope=global допустим только при явном указании в
 чтобы новое правило той же темы могло заменить старое. Иначе оба поля null.
 regenerate_current=true, если замечание требует исправить текущую рекомендацию.
 revision_instruction описывает только необходимое исправление текущего ответа или null.
+candidate_memory — null, если в замечании нет нового короткого повторяемого знания. Если
+знание действительно пригодится в похожих будущих ситуациях, сформулируй его одной
+атомарной фразой без имён, дат и других случайных деталей. candidate_memory_scope —
+global для общего рабочего принципа, chat для правила только этого клиента, иначе null.
+Не предлагай global, если формулировка содержит client-specific факт.
 Не применяй замечание: только интерпретируй для подтверждения человеком.
 Понимание пиши коротко и по делу, без театральности."""
 _OWNER_QUERY_INSTRUCTIONS = """Ты отвечаешь команде во внутреннем чате на вопрос о клиентском чате.
@@ -394,6 +404,8 @@ class CodexProvider:
             conflict_key=str(payload["conflict_key"]).strip() if payload["conflict_key"] else None,
             scope=str(payload["scope"]), regenerate_current=bool(payload["regenerate_current"]),
             revision_instruction=str(payload["revision_instruction"]).strip() if payload["revision_instruction"] else None,
+            candidate_memory=str(payload["candidate_memory"]).strip() if payload.get("candidate_memory") else None,
+            candidate_memory_scope=str(payload["candidate_memory_scope"]).strip() if payload.get("candidate_memory_scope") else None,
         )
 
     async def answer_owner_query(

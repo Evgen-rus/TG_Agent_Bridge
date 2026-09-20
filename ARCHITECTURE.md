@@ -27,6 +27,9 @@ Telegram long polling (drop_pending_updates=False)
 
 OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
+     A substantive owner correction may also create a pending memory draft;
+     it is delivered separately with «Для всех», «Только этот чат» and
+     «Не сохранять» buttons, and scope is applied only after the button press.
   -> reply to a proactive question: fill the knowledge gap
   -> mention/tag of the bot: assistant query
   -> «Общий контекст: …» in the owner chat: confirmable global memory,
@@ -136,9 +139,12 @@ core if attached, current `chat_state`, recent history, the current episode,
 confirmed memory, rules, and recent experience. Do not send the whole archive
 or the whole knowledge pack.
 
-SQLite also stores recent internal messages from the configured LeadRecord
-participants for their original chat. Those messages never create an owner
-recommendation by themselves, but they are part of mixed episodes and later
+SQLite also stores recent internal messages when an active learning rule for
+that same chat identifies the sender as internal; global learning rules are
+not used for participant classification. There is no global sender
+registry: a name learned in one chat does not classify the same name in
+another chat. Those messages never create an owner recommendation by
+themselves, but they are part of mixed episodes and later
 local context.
 
 Recommendations are persisted before owner delivery. A missing owner message ID
@@ -159,6 +165,9 @@ without logging raw exception text that could contain credentials.
 
 A newer rule with the same semantic conflict key supersedes the old version.
 Global scope also requires explicit global wording in the owner's feedback.
+Before a new candidate is offered, active memory, active rules, and the
+relevant knowledge-pack markdown are checked with normalized exact or
+containment matching; this check does not change prompt packing.
 
 `ASK_OWNER` is used when a needed fact is missing. The question is sent only to
 `OWNER_CHAT_ID` and linked back to the client chat. The owner's reply can update
@@ -178,8 +187,8 @@ client automatically.
 - Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
   onboarding.
 - Bot-authored messages and commands do not invoke Codex.
-- Messages from configured internal LeadRecord participants are captured as
-  local context and do not create a recommendation on their own.
+- Senders identified by an active, chat-scoped internal-participant rule are
+  captured as local context and do not create a recommendation on their own.
 - Cross-chat context is limited to explicitly confirmed project/global memory
   and the attached shared knowledge pack; raw client-chat context remains
   isolated. Shared cases are internal and must not be retold to another client.

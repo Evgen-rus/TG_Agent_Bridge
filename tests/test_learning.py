@@ -84,6 +84,153 @@ async def test_global_scope_requires_explicit_owner_wording(tmp_path, chat_regis
 
 
 @pytest.mark.asyncio
+async def test_owner_feedback_creates_pending_memory_candidate_until_scope_is_confirmed(tmp_path, chat_registry) -> None:
+    analysis = FeedbackAnalysis(
+        "Сначала проверить обработку текущей базы.", None, None, "client", True,
+        "Перепиши текущий ответ.",
+        "При большом необработанном остатке сначала рассматривать дожим текущей базы.",
+        "global",
+    )
+    service, store, _ = await _prepared_service(tmp_path, chat_registry, analysis)
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "В дальнейшем сначала проверяем текущую базу", 77)
+
+    assert proposal is not None and proposal.memory_proposal is not None
+    memory = proposal.memory_proposal
+    assert store.get_memory_draft(memory.draft_id).status == "pending"
+    assert store.active_memory_entries(-100123456, None) == []
+    confirmed = service.confirm_memory(memory.draft_id, "global")
+    assert confirmed is not None and confirmed.scope == "global"
+    assert [item.content for item in store.active_memory_entries(-100123456, None)] == [memory.content]
+
+
+@pytest.mark.asyncio
+async def test_client_specific_memory_candidate_cannot_be_promoted_to_global(tmp_path, chat_registry) -> None:
+    analysis = FeedbackAnalysis(
+        "Сохраняем только для этого клиента.", None, None, "client", False, None,
+        "Для Acme сначала использовать текущую базу.", "chat",
+    )
+    service, store, _ = await _prepared_service(tmp_path, chat_registry, analysis)
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Для Acme сначала текущая база", 78)
+
+    assert proposal is not None and proposal.memory_proposal is not None
+    assert proposal.memory_proposal.scope == "chat"
+    assert service.confirm_memory(proposal.memory_proposal.draft_id, "global") is None
+
+
+@pytest.mark.asyncio
+async def test_chat_candidate_scope_is_enforced_at_confirmation(tmp_path, chat_registry) -> None:
+    analysis = FeedbackAnalysis(
+        "Правило только для этого чата.", None, None, "client", False, None,
+        "Для этого чата сначала проверить остаток текущей базы.", "chat",
+    )
+    service, store, _ = await _prepared_service(tmp_path, chat_registry, analysis)
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Для этого чата сначала остаток", 81)
+    assert proposal is not None and proposal.memory_proposal is not None
+    draft_id = proposal.memory_proposal.draft_id
+    assert service.confirm_memory(draft_id, "global") is None
+    assert service.confirm_memory(draft_id, "chat") is not None
+
+
+@pytest.mark.asyncio
+async def test_one_off_feedback_needs_no_memory_or_rule_confirmation(tmp_path, chat_registry) -> None:
+    analysis = FeedbackAnalysis("Только перепиши текущий ответ.", None, None, "client", True, "Rewrite it.")
+    service, store, _ = await _prepared_service(tmp_path, chat_registry, analysis)
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Перепиши только этот ответ", 79)
+    assert proposal is not None
+    result = await service.confirm_learning(proposal.draft_id)
+    assert result is not None
+    assert store.active_rule_texts(-100123456) == []
+    assert store.active_memory_entries(-100123456, None) == []
+    assert store.recent_experience(-100123456)
+
+
+@pytest.mark.asyncio
+async def test_memory_candidate_is_suppressed_when_knowledge_already_covers_it(tmp_path, chat_registry) -> None:
+    analysis = FeedbackAnalysis(
+        "Дозвон не равен отказу.", None, None, "client", False, None,
+        "Недозвон не равен отказу.", "global",
+    )
+    service, store, _ = await _prepared_service(tmp_path, chat_registry, analysis)
+    service.knowledge_dir = tmp_path / "knowledge"
+    current = chat_registry.all_chats()[0]
+    service.registry = ChatRegistry({current.telegram_chat_id: ChatConfig(
+        current.telegram_chat_id, current.name, current.agent_provider, current.wiki,
+        current.directory, knowledge_pack="leadgenbureau",
+    )})
+    shared_dir = service.knowledge_dir / "leadgenbureau"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "core.md").write_text("Недозвон не равен отказу.", encoding="utf-8")
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Это общий принцип", 80)
+    assert proposal is not None and proposal.memory_proposal is None
+    assert store.active_memory_entries(-100123456, None) == []
+
+
+@pytest.mark.asyncio
+async def test_memory_candidate_is_suppressed_by_active_memory_or_rule(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = LearningProvider(FeedbackAnalysis("Same", None, None, "client", False, None))
+    service = AgentBridgeApplication(chat_registry, store, provider, owner_chat_id=7654321)
+    recommendation = await service.handle_message(-100123456, "Alice", "Need docs")
+    assert recommendation is not None
+    service.record_owner_delivery(recommendation.recommendation_id, 7654321, 9001)
+    existing = store.create_memory_draft(
+        recommendation.recommendation_id, 1, "Owner", "Проверять текущую базу", "global", None,
+    )
+    assert store.confirm_memory_draft(existing.id) is not None
+    analysis = FeedbackAnalysis(
+        "Повтор", None, None, "client", False, None, "Проверять текущую базу", "global",
+    )
+    provider.analysis = analysis
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "В дальнейшем проверять базу", 82)
+    assert proposal is not None and proposal.memory_proposal is None
+
+
+@pytest.mark.asyncio
+async def test_memory_candidate_checks_active_rule_and_non_core_knowledge(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = LearningProvider(FeedbackAnalysis("Same", None, None, "client", False, None))
+    service = AgentBridgeApplication(chat_registry, store, provider, owner_chat_id=7654321)
+    service.knowledge_dir = tmp_path / "knowledge"
+    current = chat_registry.all_chats()[0]
+    service.registry = ChatRegistry({current.telegram_chat_id: ChatConfig(
+        current.telegram_chat_id, current.name, current.agent_provider, current.wiki,
+        current.directory, knowledge_pack="leadgenbureau",
+    )})
+    shared_dir = service.knowledge_dir / "leadgenbureau"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "operations.md").write_text("Сначала проверить текущую базу перед расширением объёма.", encoding="utf-8")
+    recommendation = await service.handle_message(-100123456, "Alice", "Need docs")
+    assert recommendation is not None
+    service.record_owner_delivery(recommendation.recommendation_id, 7654321, 9001)
+    rule_draft = store.create_learning_draft(
+        recommendation.recommendation_id, 1, "Owner", "seed",
+        FeedbackAnalysis("Same", "Проверять текущую базу перед расширением объёма.", "volume", "client", False, None),
+    )
+    assert store.confirm_draft(rule_draft.id)
+    provider.analysis = FeedbackAnalysis(
+        "Повтор", None, None, "client", False, None,
+        "Проверять текущую базу перед расширением объёма.", "chat",
+    )
+    proposal = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "В дальнейшем проверять базу", 84)
+    assert proposal is not None and proposal.memory_proposal is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_owner_update_creates_only_one_memory_draft(tmp_path, chat_registry) -> None:
+    analysis = FeedbackAnalysis(
+        "Проверять остаток.", None, None, "client", False, None,
+        "Проверять остаток текущей базы.", "chat",
+    )
+    service, store, _ = await _prepared_service(tmp_path, chat_registry, analysis)
+    first = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Проверь остаток", 83)
+    second = await service.handle_owner_feedback(7654321, 9001, 42, "Owner", "Проверь остаток", 83)
+    assert first is not None and first.memory_proposal is not None
+    assert second is None
+    with store._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM memory_drafts").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_confirmed_rule_can_suppress_future_owner_notification(tmp_path, chat_registry) -> None:
     analysis = FeedbackAnalysis("Ignore this situation", "Ignore greetings", "notify_greeting", "client", False, None)
     service, store, provider = await _prepared_service(tmp_path, chat_registry, analysis)

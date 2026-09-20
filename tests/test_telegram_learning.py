@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
+from telegram import CallbackQuery, Update, User
 
 from telegram.error import TimedOut
 
@@ -69,6 +70,8 @@ class FakeLearningService:
     confirm_result: LearningResult | None = field(default_factory=lambda: LearningResult("Acme", True, None, False))
     context_calls: list[dict] = field(default_factory=list)
     memory_confirm_calls: list[int] = field(default_factory=list)
+    memory_scope_calls: list[str] = field(default_factory=list)
+    feedback_memory: MemoryProposal | None = None
 
     async def handle_messages(self, telegram_chat_id, messages):
         raise AssertionError("Owner messages must not enter the client pipeline")
@@ -84,7 +87,7 @@ class FakeLearningService:
             "feedback": feedback,
             "update_id": update_id,
         })
-        return LearningProposal(7, "Acme", "Write warmer", "Use a warm tone", "client", True)
+        return LearningProposal(7, "Acme", "Write warmer", "Use a warm tone", "client", True, self.feedback_memory)
 
     @staticmethod
     def is_memory_context_command(text: str) -> bool:
@@ -103,9 +106,10 @@ class FakeLearningService:
         chat_name = "все чаты" if scope == "global" else "Acme"
         return MemoryProposal(8, chat_name, content, scope)
 
-    def confirm_memory(self, draft_id: int):
+    def confirm_memory(self, draft_id: int, scope: str = "chat"):
         self.memory_confirm_calls.append(draft_id)
-        return MemoryProposal(draft_id, "Acme", "Known fact", "chat")
+        self.memory_scope_calls.append(scope)
+        return MemoryProposal(draft_id, "Acme", "Known fact", scope)
 
     def reject_memory(self, draft_id: int):
         return True
@@ -187,6 +191,20 @@ async def test_reply_to_bot_recommendation_creates_confirmable_proposal() -> Non
 
 
 @pytest.mark.asyncio
+async def test_owner_feedback_memory_candidate_is_a_separate_three_way_prompt() -> None:
+    service = FakeLearningService(feedback_memory=MemoryProposal(9, "Acme", "Сначала проверить текущую базу.", "chat"))
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _text_callback(application)(
+        FakeUpdate(FakeMessage("Обычно сначала проверяем текущую базу", FakeReply(9001, FakeUser(777, "AgentBridge", True))), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+    assert len(bot.sent) == 2
+    assert bot.sent[1]["text"] == "Предлагаю запомнить:\n\nСначала проверить текущую базу."
+    assert [button.text for button in bot.sent[1]["reply_markup"].inline_keyboard[0]] == ["Для всех", "Только этот чат", "Не сохранять"]
+
+
+@pytest.mark.asyncio
 async def test_context_reply_to_bot_recommendation_creates_memory_confirmation() -> None:
     service = FakeLearningService()
     application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
@@ -197,7 +215,7 @@ async def test_context_reply_to_bot_recommendation_creates_memory_confirmation()
     )
     assert service.context_calls == [{"reply_to_message_id": 9001, "text": "Контекст: Клиент использует свой колл-центр."}]
     buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
-    assert [button.callback_data for button in buttons] == ["memory:yes:8", "memory:no:8"]
+    assert [button.callback_data for button in buttons] == ["memory:global:8", "memory:chat:8", "memory:no:8"]
 
 
 @pytest.mark.asyncio
@@ -213,9 +231,9 @@ async def test_standalone_global_context_does_not_need_reply_or_mention() -> Non
         "reply_to_message_id": None,
         "text": "Общий контекст: фраза про маркетинг утверждена.",
     }]
-    assert "для всех подключённых чатов" in bot.sent[0]["text"]
+    assert bot.sent[0]["text"].startswith("Предлагаю запомнить:\n\n")
     buttons = bot.sent[0]["reply_markup"].inline_keyboard[0]
-    assert [button.callback_data for button in buttons] == ["memory:yes:8", "memory:no:8"]
+    assert [button.callback_data for button in buttons] == ["memory:global:8", "memory:chat:8", "memory:no:8"]
 
 
 @pytest.mark.asyncio
@@ -236,7 +254,7 @@ async def test_mentioned_global_context_does_not_become_an_owner_query() -> None
         "reply_to_message_id": None,
         "text": "Общий контекст: недозвон не отказ.",
     }]
-    assert bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data == "memory:yes:8"
+    assert bot.sent[0]["reply_markup"].inline_keyboard[0][0].callback_data == "memory:global:8"
 
 
 @pytest.mark.asyncio
@@ -354,3 +372,39 @@ async def test_yes_button_still_confirms_when_clearing_buttons_times_out() -> No
     await _learning_callback(application)(update, FakeContext(bot))
     assert service.confirm_calls == [2]
     assert bot.sent[-1]["text"] == "Правило сохранено."
+
+
+@pytest.mark.asyncio
+async def test_memory_scope_button_is_applied_only_on_confirmation() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    query = FakeCallbackQuery(
+        data="memory:global:8", message=FakeCallbackMessage(FakeChat(7654321)),
+    )
+    await _learning_callback(application)(FakeCallbackUpdate(query), FakeContext(bot))
+    assert service.memory_scope_calls == ["global"]
+
+
+@pytest.mark.asyncio
+async def test_registered_callback_handler_accepts_new_and_legacy_memory_actions() -> None:
+    service = FakeLearningService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    handler = application.handlers[0][1]
+    for action in ("global", "chat", "no", "yes"):
+        query = CallbackQuery(
+            id="callback",
+            from_user=User(id=42, first_name="Owner", is_bot=False),
+            chat_instance="owner",
+            data=f"memory:{action}:8",
+        )
+        update = Update(update_id=1, callback_query=query)
+        assert handler.check_update(update)
+    bot = FakeBot()
+    await handler.callback(
+        FakeCallbackUpdate(FakeCallbackQuery(
+            data="memory:yes:8", message=FakeCallbackMessage(FakeChat(7654321)),
+        )),
+        FakeContext(bot),
+    )
+    assert service.memory_scope_calls == ["chat"]

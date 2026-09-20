@@ -3,19 +3,18 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 import json
+import re
 import logging
 from pathlib import Path
-import re
 
 from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, MediaAttachment, OwnerQueryAnswer
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
-from .knowledge import load_knowledge_pack
+from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
 
 logger = logging.getLogger(__name__)
 _GLOBAL_WORDING = re.compile(r"\b(для\s+всех|всем\s+клиент|глобальн)", re.IGNORECASE)
-_INTERNAL_PARTICIPANTS = frozenset({"евгений расюк", "евгений росюк", "дмитрий смагин"})
 _MEMORY_PREFIXES = (
     ("общий контекст:", "global"),
     ("запомни для всех чатов:", "global"),
@@ -72,6 +71,7 @@ class LearningProposal:
     proposed_rule: str | None
     scope: str
     regenerate_current: bool
+    memory_proposal: "MemoryProposal | None" = None
 
 
 @dataclass(frozen=True)
@@ -184,10 +184,10 @@ class AgentBridgeApplication:
             if chat is None:
                 if not self.store.has_open_onboarding(chat_id):
                     return False
-                role = "internal" if sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
+                role = "internal" if self._is_internal_sender(chat_id, sender_name) else "client"
                 status = "held"
             else:
-                role = "internal" if sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
+                role = "internal" if self._is_internal_sender(chat_id, sender_name) else "client"
                 status = "pending"
         return self.store.ingest_telegram_message(
             update_id=update_id,
@@ -307,7 +307,7 @@ class AgentBridgeApplication:
     def _ingest_incoming(self, telegram_chat_id: int, item: IncomingMessage) -> None:
         if item.update_id is None or not has_message_content(item.text, item.media_kind, item.telegram_file_id):
             return
-        role = "internal" if item.sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS else "client"
+        role = "internal" if self._is_internal_sender(telegram_chat_id, item.sender_name) else "client"
         self.store.ingest_telegram_message(
             update_id=item.update_id,
             chat_id=telegram_chat_id,
@@ -345,7 +345,7 @@ class AgentBridgeApplication:
         if ignore_internal_filter:
             internal, external = [], messages
         else:
-            internal, external = self._split_internal_messages(messages)
+            internal, external = self._split_internal_messages(chat.telegram_chat_id, messages)
         for item in internal:
             self.store.record_internal_context(
                 chat.telegram_chat_id, chat.name, item.sender_name.strip() or "Внутренний участник",
@@ -698,12 +698,16 @@ class AgentBridgeApplication:
             analysis = FeedbackAnalysis(
                 analysis.understanding, analysis.proposed_rule, analysis.conflict_key, "client",
                 analysis.regenerate_current, analysis.revision_instruction,
+                analysis.candidate_memory, analysis.candidate_memory_scope,
             )
         draft = self.store.create_learning_draft(recommendation.id, author_user_id, author_name, feedback, analysis)
+        memory_proposal = self._create_feedback_memory_candidate(
+            recommendation, author_user_id, author_name, analysis,
+        )
         if update_id is not None:
             self.store.mark_update_processed(update_id)
         logger.info("event=feedback_analysis_done draft_id=%s recommendation_id=%s scope=%s regenerate=%s", draft.id, recommendation.id, draft.scope, draft.regenerate_current)
-        return self._proposal(draft, recommendation.chat_name)
+        return self._proposal(draft, recommendation.chat_name, memory_proposal)
 
     @staticmethod
     def is_memory_context_command(text: str) -> bool:
@@ -733,7 +737,7 @@ class AgentBridgeApplication:
             if scope != "global":
                 return None
             draft = self.store.create_memory_draft(
-                None, author_user_id, author_name, content, "global", None,
+                None, author_user_id, author_name, content, "global", None, global_allowed=True,
             )
             if update_id is not None:
                 self.store.mark_update_processed(update_id)
@@ -743,7 +747,8 @@ class AgentBridgeApplication:
         if scope == "project" and not project_key:
             return None
         draft = self.store.create_memory_draft(
-            recommendation.id, author_user_id, author_name, content, scope, project_key if scope == "project" else None,
+            recommendation.id, author_user_id, author_name, content, scope,
+            project_key if scope == "project" else None, global_allowed=False,
         )
         if update_id is not None:
             self.store.mark_update_processed(update_id)
@@ -758,8 +763,8 @@ class AgentBridgeApplication:
                 return (scope, content) if content else None
         return None
 
-    def confirm_memory(self, draft_id: int) -> MemoryProposal | None:
-        draft = self.store.confirm_memory_draft(draft_id)
+    def confirm_memory(self, draft_id: int, scope: str | None = None) -> MemoryProposal | None:
+        draft = self.store.confirm_memory_draft(draft_id, scope)
         if draft is None:
             return None
         if draft.recommendation_id is None:
@@ -936,6 +941,7 @@ class AgentBridgeApplication:
         if question.recommendation_id is not None:
             draft = self.store.create_memory_draft(
                 question.recommendation_id, author_user_id, author_name, answer.strip(), "chat", None,
+                global_allowed=False,
             )
             memory_proposal = MemoryProposal(draft.id, chat.name, draft.content, draft.scope)
         return QuestionReplyResult(suggestion, memory_proposal)
@@ -956,7 +962,11 @@ class AgentBridgeApplication:
             rules=self.store.active_rule_texts(recommendation.telegram_chat_id),
         )
         if analysis.scope == "global" and not _GLOBAL_WORDING.search(combined_feedback):
-            analysis = FeedbackAnalysis(analysis.understanding, analysis.proposed_rule, analysis.conflict_key, "client", analysis.regenerate_current, analysis.revision_instruction)
+            analysis = FeedbackAnalysis(
+                analysis.understanding, analysis.proposed_rule, analysis.conflict_key, "client",
+                analysis.regenerate_current, analysis.revision_instruction,
+                analysis.candidate_memory, analysis.candidate_memory_scope,
+            )
         updated = self.store.replace_learning_draft_analysis(draft.id, combined_feedback, analysis)
         if update_id is not None:
             self.store.mark_update_processed(update_id)
@@ -1026,9 +1036,59 @@ class AgentBridgeApplication:
             logger.info("event=learning_rule_undone rule_id=%s scope=%s", rule.id, rule.scope)
         return rule
 
+    def _create_feedback_memory_candidate(
+        self, recommendation, author_user_id: int, author_name: str, analysis: FeedbackAnalysis,
+    ) -> MemoryProposal | None:
+        content = (analysis.candidate_memory or "").strip()
+        if len(content) < 12:
+            return None
+        scope = analysis.candidate_memory_scope if analysis.candidate_memory_scope in {"global", "chat"} else "chat"
+        if scope == "global" and self._candidate_mentions_client(content, recommendation):
+            return None
+        chat = self.registry.get(recommendation.telegram_chat_id)
+        if chat is None or self._memory_candidate_is_duplicate(chat, content):
+            return None
+        draft = self.store.create_memory_draft(
+            recommendation.id, author_user_id, author_name, content, scope, None,
+            global_allowed=scope == "global",
+        )
+        return MemoryProposal(draft.id, recommendation.chat_name, draft.content, draft.scope)
+
+    def _memory_candidate_is_duplicate(self, chat: ChatConfig, content: str) -> bool:
+        candidate = _normalise_memory_text(content)
+        if not candidate:
+            return True
+        sources = [item.content for item in self.store.active_memory_entries(chat.telegram_chat_id, chat.memory_project)]
+        sources.extend(self.store.active_rule_texts(chat.telegram_chat_id))
+        for document in load_knowledge_pack_documents(self.knowledge_dir, chat.knowledge_pack):
+            sources.extend(line for line in document.splitlines() if line.strip())
+        for source in sources:
+            normalized = _normalise_memory_text(source)
+            if not normalized:
+                continue
+            if candidate == normalized:
+                return True
+            if len(candidate) >= 40 and (candidate in normalized or normalized in candidate):
+                return True
+        return False
+
     @staticmethod
-    def _proposal(draft: LearningDraft, chat_name: str) -> LearningProposal:
-        return LearningProposal(draft.id, chat_name, draft.understanding, draft.proposed_rule, draft.scope, draft.regenerate_current)
+    def _candidate_mentions_client(content: str, recommendation) -> bool:
+        normalized = _normalise_memory_text(content)
+        for value in (recommendation.chat_name, recommendation.sender_name):
+            marker = _normalise_memory_text(value)
+            if marker and marker in normalized:
+                return True
+        return False
+
+    @staticmethod
+    def _proposal(
+        draft: LearningDraft, chat_name: str, memory_proposal: MemoryProposal | None = None,
+    ) -> LearningProposal:
+        return LearningProposal(
+            draft.id, chat_name, draft.understanding, draft.proposed_rule, draft.scope,
+            draft.regenerate_current, memory_proposal,
+        )
 
     @staticmethod
     def _suggestion_from_record(record) -> Suggestion:
@@ -1046,9 +1106,30 @@ class AgentBridgeApplication:
             owner_question=getattr(record, "owner_question", "") or "",
         )
 
-    @staticmethod
-    def _split_internal_messages(messages: list[IncomingMessage]) -> tuple[list[IncomingMessage], list[IncomingMessage]]:
-        internal = [item for item in messages if item.sender_name.strip().casefold() in _INTERNAL_PARTICIPANTS]
+    def _is_internal_sender(self, telegram_chat_id: int, sender_name: str) -> bool:
+        name_tokens = re.findall(r"[a-zа-яё0-9]+", sender_name.casefold())
+        if not name_tokens:
+            return False
+        for rule in self.store.active_rule_texts(telegram_chat_id, include_global=False):
+            rule_tokens = re.findall(r"[a-zа-яё0-9]+", rule.casefold())
+            # Learning rules are chat-scoped. Prefix matching handles the
+            # ordinary Russian case ending ("Евгений Расюк" / "Евгения
+            # Расюка") without introducing a global participant registry.
+            if all(
+                any(
+                    len(token) >= 4
+                    and (candidate.startswith(token[:5]) or token.startswith(candidate[:5]))
+                    for candidate in rule_tokens
+                )
+                for token in name_tokens
+            ):
+                return True
+        return False
+
+    def _split_internal_messages(
+        self, telegram_chat_id: int, messages: list[IncomingMessage],
+    ) -> tuple[list[IncomingMessage], list[IncomingMessage]]:
+        internal = [item for item in messages if self._is_internal_sender(telegram_chat_id, item.sender_name)]
         return internal, [item for item in messages if item not in internal]
 
 
@@ -1113,3 +1194,7 @@ def _episode_attachments(messages: list[IncomingMessage]) -> tuple[MediaAttachme
 
 def action_label(action: str) -> str:
     return _ACTION_LABELS.get(action, action)
+
+
+def _normalise_memory_text(text: str) -> str:
+    return re.sub(r"[^\w\s]+", " ", text.casefold(), flags=re.UNICODE).strip()

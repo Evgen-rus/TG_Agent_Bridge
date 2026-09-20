@@ -154,6 +154,15 @@ def test_confirmed_project_and_global_memory_are_scoped(tmp_path) -> None:
     assert store.active_memory_texts(-1002, None) == ["Global fact"]
 
 
+def test_active_memory_kind_can_be_corrected_through_store_api(tmp_path) -> None:
+    store = ChatThreadStore(tmp_path / "runtime" / "agentbridge.sqlite3")
+    draft = store.create_memory_draft(None, 1, "Owner", "Rule", "global", None)
+    assert store.confirm_memory_draft(draft.id) is not None
+    entry = store.active_memory_entries(-1001, None)[0]
+    assert store.set_memory_entry_kind(entry.id, "rule") is True
+    assert store.active_memory_entries(-1001, None)[0].kind == "rule"
+
+
 def test_unlinked_global_memory_draft_can_be_confirmed(tmp_path) -> None:
     store = ChatThreadStore(tmp_path / "runtime" / "agentbridge.sqlite3")
     draft = store.create_memory_draft(None, 1, "Owner", "Утверждённая фраза для робота", "global", None)
@@ -181,9 +190,30 @@ def test_legacy_memory_drafts_accept_unlinked_global(tmp_path) -> None:
             updated_at TEXT NOT NULL
         )"""
     )
+    connection.executemany(
+        """INSERT INTO memory_drafts
+        (recommendation_id, author_user_id, author_name, content, scope, project_key, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+        [
+            (1, 1, "Owner", "Legacy chat draft", "chat", None, "now", "now"),
+            (1, 1, "Owner", "Legacy global draft", "global", None, "now", "now"),
+        ],
+    )
     connection.commit()
     connection.close()
     store = ChatThreadStore(path)
-    draft = store.create_memory_draft(None, 1, "Owner", "Global from legacy db", "global", None)
-    assert store.confirm_memory_draft(draft.id) is not None
-    assert store.active_memory_texts(-1001, None) == ["Global from legacy db"]
+    chat_draft = store.get_memory_draft(1)
+    global_draft = store.get_memory_draft(2)
+    assert chat_draft is not None and chat_draft.global_allowed is False
+    assert global_draft is not None and global_draft.global_allowed is True
+    assert store.confirm_memory_draft(chat_draft.id, "global") is None
+    assert store.confirm_memory_draft(global_draft.id, "global") is not None
+    assert store.active_memory_texts(-1001, None) == ["Legacy global draft"]
+
+    explicit = store.create_memory_draft(
+        None, 1, "Owner", "Explicit chat draft", "chat", None, global_allowed=False,
+    )
+    restarted = ChatThreadStore(path)
+    persisted = restarted.get_memory_draft(explicit.id)
+    assert persisted is not None and persisted.global_allowed is False
+    assert restarted.confirm_memory_draft(explicit.id, "global") is None

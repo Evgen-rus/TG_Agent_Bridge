@@ -220,7 +220,7 @@ async def test_reply_to_proactive_question_is_linked_to_the_client() -> None:
     assert service.question_calls == [{"reply_to_message_id": 9001, "answer": "Да, тест ещё действует"}]
     assert service.client_calls == []
     assert all(item["chat_id"] == 7654321 for item in bot.sent)
-    assert any("Сохранить?" in item["text"] for item in bot.sent)
+    assert any("Предлагаю запомнить:" in item["text"] for item in bot.sent)
 
 
 @pytest.mark.asyncio

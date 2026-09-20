@@ -51,6 +51,8 @@ class FeedbackAnalysis:
     scope: str
     regenerate_current: bool
     revision_instruction: str | None
+    candidate_memory: str | None = None
+    candidate_memory_scope: str | None = None
 
 
 @dataclass(frozen=True)

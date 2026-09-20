@@ -40,6 +40,16 @@ def load_knowledge_pack(knowledge_dir: Path | None, pack_name: str | None) -> st
     return "\n\n".join(parts)
 
 
+def load_knowledge_pack_documents(knowledge_dir: Path | None, pack_name: str | None) -> list[str]:
+    """Read pack markdown for local duplicate checks without changing prompt packing."""
+    if knowledge_dir is None or not pack_name:
+        return []
+    pack_dir = knowledge_dir / pack_name
+    if not pack_dir.is_dir():
+        return []
+    return [path.read_text(encoding="utf-8") for path in sorted(pack_dir.glob("*.md")) if path.is_file()]
+
+
 def _extra_doc_lines(knowledge_dir: Path, pack_dir: Path, pack_name: str) -> list[str]:
     root = knowledge_dir.resolve()
     project_root = root.parent

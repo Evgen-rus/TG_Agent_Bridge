@@ -108,8 +108,9 @@ def _confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
 
 def _memory_confirmation_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Да, сохранить", callback_data=f"memory:yes:{draft_id}"),
-        InlineKeyboardButton("Нет, отменить", callback_data=f"memory:no:{draft_id}"),
+        InlineKeyboardButton("Для всех", callback_data=f"memory:global:{draft_id}"),
+        InlineKeyboardButton("Только этот чат", callback_data=f"memory:chat:{draft_id}"),
+        InlineKeyboardButton("Не сохранять", callback_data=f"memory:no:{draft_id}"),
     ]])
 
 
@@ -918,6 +919,8 @@ def create_telegram_application(
                 )
                 return True
             await _send(context.bot, chat_id=owner_chat_id, text=format_learning_proposal(proposal), reply_markup=_confirmation_keyboard(proposal.draft_id))
+            if getattr(proposal, "memory_proposal", None) is not None:
+                await _send_memory_proposal(context.bot, proposal.memory_proposal)
             return True
 
     async def _handle_question_result(bot, result: QuestionReplyResult) -> None:
@@ -1023,7 +1026,11 @@ def create_telegram_application(
                 rejected = message_service.reject_memory(draft_id)
                 await _send(context.bot, chat_id=owner_chat_id, text="Сохранение контекста отменено." if rejected else "Этот контекст уже обработан или больше недоступен.")
                 return
-            proposal = message_service.confirm_memory(draft_id)
+            # Старые memory:yes callbacks carry the draft's original scope.
+            proposal = (
+                message_service.confirm_memory(draft_id)
+                if action == "yes" else message_service.confirm_memory(draft_id, action)
+            )
             await _send(context.bot, chat_id=owner_chat_id, text="Контекст сохранён." if proposal is not None else "Этот контекст уже обработан или больше недоступен.")
             return
         if action == "no":
@@ -1067,7 +1074,10 @@ def create_telegram_application(
         (filters.TEXT | filters.PHOTO | filters.VOICE | filters.Document.ALL) & ~filters.COMMAND,
         queue_message,
     ))
-    application.add_handler(CallbackQueryHandler(learning_callback, pattern=r"^(learn|memory|onboard):(yes|no):\d+$"))
+    application.add_handler(CallbackQueryHandler(
+        learning_callback,
+        pattern=r"^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$",
+    ))
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("undo", undo_command))

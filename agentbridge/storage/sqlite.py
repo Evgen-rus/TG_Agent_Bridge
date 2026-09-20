@@ -81,6 +81,7 @@ class StoredMessage:
 
 @dataclass(frozen=True)
 class MemoryEntry:
+    id: int
     content: str
     scope: str
     kind: str
@@ -160,6 +161,7 @@ class MemoryDraft:
     project_key: str | None
     status: str
     kind: str = "fact"
+    global_allowed: bool = True
 
 
 class ChatThreadStore:
@@ -282,6 +284,7 @@ class ChatThreadStore:
                     scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
                     project_key TEXT,
                     kind TEXT NOT NULL DEFAULT 'fact',
+                    global_allowed INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -414,7 +417,10 @@ class ChatThreadStore:
                 ("unknowns", "TEXT NOT NULL DEFAULT ''"),
                 ("owner_question", "TEXT NOT NULL DEFAULT ''"),
             ),
-            "memory_drafts": (("kind", "TEXT NOT NULL DEFAULT 'fact'"),),
+            "memory_drafts": (
+                ("kind", "TEXT NOT NULL DEFAULT 'fact'"),
+                ("global_allowed", "INTEGER NOT NULL DEFAULT 1"),
+            ),
             "memory_entries": (("kind", "TEXT NOT NULL DEFAULT 'fact'"),),
             "chat_threads": (("prompt_version", "INTEGER"),),
             "owner_query_prompts": (("telegram_chat_id", "INTEGER"),),
@@ -431,9 +437,16 @@ class ChatThreadStore:
             existing = {
                 row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
             }
+            added: set[str] = set()
             for name, definition in specs:
                 if name not in existing:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                    added.add(name)
+            if table == "memory_drafts" and "global_allowed" in added:
+                connection.execute(
+                    """UPDATE memory_drafts SET global_allowed=
+                    CASE WHEN scope='global' THEN 1 ELSE 0 END"""
+                )
         ChatThreadStore._ensure_memory_drafts_allow_unlinked(connection)
 
     @staticmethod
@@ -454,6 +467,7 @@ class ChatThreadStore:
                 scope TEXT NOT NULL CHECK(scope IN ('chat', 'project', 'global')),
                 project_key TEXT,
                 kind TEXT NOT NULL DEFAULT 'fact',
+                global_allowed INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -853,13 +867,20 @@ class ChatThreadStore:
             connection.execute("UPDATE learning_drafts SET status='confirmed', updated_at=? WHERE id=?", (now, draft_id))
         return True
 
-    def active_rule_texts(self, telegram_chat_id: int) -> list[str]:
+    def active_rule_texts(self, telegram_chat_id: int, *, include_global: bool = True) -> list[str]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """SELECT rule_text FROM learning_rules WHERE status='active'
-                AND (scope='global' OR telegram_chat_id=?) ORDER BY id""",
-                (telegram_chat_id,),
-            ).fetchall()
+            if include_global:
+                rows = connection.execute(
+                    """SELECT rule_text FROM learning_rules WHERE status='active'
+                    AND (scope='global' OR telegram_chat_id=?) ORDER BY id""",
+                    (telegram_chat_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT rule_text FROM learning_rules WHERE status='active'
+                    AND scope != 'global' AND telegram_chat_id=? ORDER BY id""",
+                    (telegram_chat_id,),
+                ).fetchall()
         return [row["rule_text"] for row in rows]
 
     def list_active_rules(self) -> list[RuleRecord]:
@@ -895,15 +916,17 @@ class ChatThreadStore:
     def create_memory_draft(
         self, recommendation_id: int | None, author_user_id: int, author_name: str,
         content: str, scope: str, project_key: str | None, kind: str = "fact",
+        global_allowed: bool = True,
     ) -> MemoryDraft:
         now = _now()
         kind = kind if kind in MEMORY_KINDS else "fact"
         with self._connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO memory_drafts
-                (recommendation_id, author_user_id, author_name, content, scope, project_key, kind, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
-                (recommendation_id, author_user_id, author_name, content, scope, project_key, kind, now, now),
+                (recommendation_id, author_user_id, author_name, content, scope, project_key, kind,
+                 global_allowed, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (recommendation_id, author_user_id, author_name, content, scope, project_key, kind, int(global_allowed), now, now),
             )
             draft_id = int(cursor.lastrowid)
         return self.get_memory_draft(draft_id)  # type: ignore[return-value]
@@ -919,31 +942,40 @@ class ChatThreadStore:
             author_name=row["author_name"], content=row["content"], scope=row["scope"],
             project_key=row["project_key"], status=row["status"],
             kind=row["kind"] if "kind" in keys and row["kind"] else "fact",
+            global_allowed=bool(row["global_allowed"]) if "global_allowed" in keys else True,
         )
 
-    def confirm_memory_draft(self, draft_id: int) -> MemoryDraft | None:
+    def confirm_memory_draft(self, draft_id: int, scope: str | None = None) -> MemoryDraft | None:
         draft = self.get_memory_draft(draft_id)
         if draft is None or draft.status != "pending":
+            return None
+        target_scope = scope or draft.scope
+        if target_scope not in {"chat", "project", "global"}:
+            return None
+        if target_scope == "global" and not draft.global_allowed:
             return None
         recommendation = (
             self.get_recommendation(draft.recommendation_id)
             if draft.recommendation_id is not None else None
         )
-        if recommendation is None and draft.scope != "global":
+        if recommendation is None and target_scope != "global":
+            return None
+        if target_scope == "project" and not draft.project_key:
             return None
         with self._connect() as connection:
             claimed = connection.execute(
-                "UPDATE memory_drafts SET status='confirming', updated_at=? WHERE id=? AND status='pending'",
-                (_now(), draft_id),
+                """UPDATE memory_drafts SET scope=?, project_key=?, status='confirming', updated_at=?
+                WHERE id=? AND status='pending'""",
+                (target_scope, draft.project_key if target_scope == "project" else None, _now(), draft_id),
             )
             if claimed.rowcount != 1:
                 return None
-            chat_id = recommendation.telegram_chat_id if draft.scope == "chat" and recommendation is not None else None
+            chat_id = recommendation.telegram_chat_id if target_scope == "chat" and recommendation is not None else None
             connection.execute(
                 """INSERT INTO memory_entries
                 (telegram_chat_id, project_key, content, scope, kind, author_user_id, author_name, source_draft_id, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
-                (chat_id, draft.project_key, draft.content, draft.scope, draft.kind, draft.author_user_id,
+                (chat_id, draft.project_key if target_scope == "project" else None, draft.content, target_scope, draft.kind, draft.author_user_id,
                  draft.author_name, draft.id, _now()),
             )
             connection.execute("UPDATE memory_drafts SET status='confirmed', updated_at=? WHERE id=?", (_now(), draft_id))
@@ -971,7 +1003,7 @@ class ChatThreadStore:
     def active_memory_entries(self, telegram_chat_id: int, project_key: str | None) -> list[MemoryEntry]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT content, scope, kind FROM memory_entries WHERE status='active' AND (
+                """SELECT id, content, scope, kind FROM memory_entries WHERE status='active' AND (
                     scope='global' OR (scope='chat' AND telegram_chat_id=?)
                     OR (scope='project' AND project_key=?)
                 ) ORDER BY id""",
@@ -979,12 +1011,23 @@ class ChatThreadStore:
             ).fetchall()
         return [
             MemoryEntry(
+                id=row["id"],
                 content=row["content"],
                 scope=row["scope"],
                 kind=row["kind"] if "kind" in row.keys() and row["kind"] else "fact",
             )
             for row in rows
         ]
+
+    def set_memory_entry_kind(self, entry_id: int, kind: str) -> bool:
+        if kind not in MEMORY_KINDS:
+            return False
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE memory_entries SET kind=? WHERE id=? AND status='active'",
+                (kind, entry_id),
+            )
+        return result.rowcount == 1
 
     def ingest_telegram_message(
         self,
