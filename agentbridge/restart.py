@@ -24,6 +24,10 @@ def spawn_restart_helper(*, old_pid: int, project_root: Path, python_executable:
             "-PythonExecutable", str(python),
         ],
         cwd=root,
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        creationflags=(
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_BREAKAWAY_FROM_JOB
+        ),
         close_fds=True,
     )

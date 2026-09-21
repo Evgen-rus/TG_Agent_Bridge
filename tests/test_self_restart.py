@@ -56,6 +56,7 @@ def test_restart_helper_uses_current_project_python_and_old_pid(tmp_path, monkey
     assert ["-OldPid", "123"] == args[args.index("-OldPid"):args.index("-OldPid") + 2]
     assert str(root.resolve()) in args and str(python.resolve()) in args
     assert kwargs["cwd"] == root.resolve()
+    assert kwargs["creationflags"] & __import__("subprocess").CREATE_BREAKAWAY_FROM_JOB
 
 
 def test_restart_helper_refuses_non_windows(tmp_path, monkeypatch) -> None:
