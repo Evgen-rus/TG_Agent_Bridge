@@ -42,6 +42,7 @@ def main() -> None:
         batch_seconds=settings.message_batch_seconds,
         delivery_retry_seconds=settings.delivery_retry_seconds,
         catchup_idle_seconds=settings.catchup_idle_seconds,
+        owner_timezone=settings.owner_timezone,
         media_dir=settings.media_dir,
         media_ttl_seconds=settings.media_ttl_seconds,
         openai_api_key=settings.openai_api_key,

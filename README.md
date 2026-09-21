@@ -47,6 +47,11 @@ when no account is available:
 
 Never commit `.env` or Codex authentication files.
 
+Owner reminders are created with `/remind YYYY-MM-DD HH:MM text` in the owner
+chat. The time is interpreted in `OWNER_TIMEZONE`; `/reminders` shows the
+unsent queue. Due reminders are stored in SQLite and delivered only to the
+owner chat by the existing retry loop.
+
 Владелец может спросить сразу про один, несколько или все подключённые чаты.
 Для неоднозначного запроса бот покажет выбор проектов. Периоды вроде «сегодня»,
 «вчера», «за неделю» и «последние 7 дней» считаются в `OWNER_TIMEZONE` и

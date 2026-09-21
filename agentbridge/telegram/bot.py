@@ -6,12 +6,14 @@ import asyncio
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import time
 from types import SimpleNamespace
 from typing import Protocol
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, NetworkError, TelegramError
@@ -38,6 +40,8 @@ _TYPING_REFRESH_SECONDS = 4.0
 _OWNER_BOT_COMMANDS = (
     BotCommand("rules", "Показать активные правила"),
     BotCommand("undo", "Отменить последнее правило"),
+    BotCommand("remind", "Создать напоминание"),
+    BotCommand("reminders", "Показать напоминания"),
 )
 logger = logging.getLogger(__name__)
 
@@ -155,6 +159,32 @@ async def register_owner_command_menu(bot, owner_chat_id: int) -> None:
         logger.warning("event=telegram_transient_error operation=set_my_commands")
 
 
+def _owner_zone(timezone_name: str):
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name != "Asia/Novosibirsk":
+            raise
+        return timezone(timedelta(hours=7), name=timezone_name)
+
+
+def _parse_reminder_args(args: list[str], timezone_name: str) -> tuple[str, str, str]:
+    if len(args) < 3:
+        raise ValueError("usage")
+    try:
+        zone = _owner_zone(timezone_name)
+        local = datetime.strptime(" ".join(args[:2]), "%Y-%m-%d %H:%M").replace(tzinfo=zone)
+    except (ValueError, TypeError):
+        raise ValueError("date") from None
+    remind_at = local.astimezone(timezone.utc)
+    if remind_at <= datetime.now(timezone.utc):
+        raise ValueError("past")
+    text = " ".join(args[2:]).strip()
+    if not text:
+        raise ValueError("text")
+    return remind_at.isoformat(), local.strftime("%Y-%m-%d %H:%M"), text
+
+
 def _onboarding_keyboard(onboarding_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Да, сохранить", callback_data=f"onboard:yes:{onboarding_id}"),
@@ -231,6 +261,7 @@ def create_telegram_application(
     catchup_max_seconds: float = 30.0,
     media_dir: Path | None = None,
     media_ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS,
+    owner_timezone: str = "Asia/Novosibirsk",
     openai_api_key: str = "",
     transcription_model: str = "gpt-4o-mini-transcribe",
     polling_hard_timeout_seconds: float = 30.0,
@@ -370,6 +401,25 @@ def create_telegram_application(
         if selection_id is not None and attach_selection is not None and message_id is not None:
             attach_selection(selection_id, message_id)
 
+    async def _deliver_reminder(bot, reminder) -> None:
+        try:
+            await _send(
+                bot,
+                chat_id=owner_chat_id,
+                text=f"🔔 Напоминание\n{reminder.text}",
+                delivery_key=f"reminder:{reminder.id}",
+            )
+            mark_sent = getattr(message_service, "mark_reminder_sent", None)
+            if mark_sent is not None:
+                mark_sent(reminder.id)
+            logger.info("event=reminder_sent reminder_id=%s", reminder.id)
+        except BadRequest:
+            logger.warning("event=reminder_delivery_pending reason=telegram_bad_request reminder_id=%s", reminder.id)
+        except NetworkError as exc:
+            logger.warning("event=reminder_delivery_pending reason=telegram_network_error error_type=%s reminder_id=%s", type(exc).__name__, reminder.id)
+        except Exception:
+            logger.exception("event=reminder_delivery_pending reason=delivery_error reminder_id=%s", reminder.id)
+
     async def _try_continue_owner_query(
         bot,
         update: Update,
@@ -439,15 +489,24 @@ def create_telegram_application(
             for query_result in query_results:
                 await _deliver_owner_query(bot, query_result)
         notices = getattr(message_service, "pending_onboarding_notices", None)
-        if notices is None:
+        if notices is not None:
+            try:
+                pending_notices = notices()
+            except Exception:
+                logger.exception("event=onboarding_notice_scan_failed")
+                pending_notices = []
+            for notice in pending_notices:
+                await _deliver_onboarding_notice(bot, notice)
+        due = getattr(message_service, "pending_due_reminders", None)
+        if due is None:
             return
         try:
-            pending_notices = notices()
+            reminders = due()
         except Exception:
-            logger.exception("event=onboarding_notice_scan_failed")
+            logger.exception("event=reminder_scan_failed")
             return
-        for notice in pending_notices:
-            await _deliver_onboarding_notice(bot, notice)
+        for reminder in reminders:
+            await _deliver_reminder(bot, reminder)
 
     async def _delivery_retry_loop(application: Application) -> None:
         while True:
@@ -1120,6 +1179,48 @@ def create_telegram_application(
         if update.effective_chat and update.effective_chat.id == owner_chat_id:
             await _send(context.bot, chat_id=owner_chat_id, text=format_rules(message_service.list_rules()))
 
+    async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or update.effective_chat.id != owner_chat_id:
+            return
+        args = list(getattr(context, "args", None) or [])
+        try:
+            remind_at_utc, local_label, text = _parse_reminder_args(args, owner_timezone)
+        except ValueError as exc:
+            usage = "/remind YYYY-MM-DD HH:MM текст"
+            if str(exc) == "past":
+                message = "Время напоминания уже прошло. " + usage
+            elif str(exc) == "date":
+                message = "Нужны дата и время в формате YYYY-MM-DD HH:MM."
+            else:
+                message = "Формат: " + usage
+            await _send(context.bot, chat_id=owner_chat_id, text=message)
+            return
+        create = getattr(message_service, "create_reminder", None)
+        if create is None:
+            await _send(context.bot, chat_id=owner_chat_id, text="Напоминания в этом режиме недоступны.")
+            return
+        reminder_id = create(remind_at_utc, text)
+        await _send(
+            context.bot,
+            chat_id=owner_chat_id,
+            text=f"Напоминание #{reminder_id} сохранено на {local_label} ({owner_timezone}).",
+        )
+
+    async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or update.effective_chat.id != owner_chat_id:
+            return
+        get_pending = getattr(message_service, "pending_reminders", None)
+        reminders = get_pending() if get_pending is not None else []
+        if not reminders:
+            await _send(context.bot, chat_id=owner_chat_id, text="Активных напоминаний нет.")
+            return
+        zone = _owner_zone(owner_timezone)
+        lines = [
+            f"#{item.id} - {datetime.fromisoformat(item.remind_at_utc).astimezone(zone):%Y-%m-%d %H:%M}: {item.text}"
+            for item in reminders
+        ]
+        await _send(context.bot, chat_id=owner_chat_id, text="Активные напоминания:\n" + "\n".join(lines))
+
     async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_chat or update.effective_chat.id != owner_chat_id:
             return
@@ -1147,4 +1248,6 @@ def create_telegram_application(
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("undo", undo_command))
+    application.add_handler(CommandHandler("remind", remind_command))
+    application.add_handler(CommandHandler("reminders", reminders_command))
     return application

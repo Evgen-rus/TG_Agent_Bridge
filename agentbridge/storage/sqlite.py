@@ -128,6 +128,14 @@ class OwnerQuerySelection:
 
 
 @dataclass(frozen=True)
+class ReminderRecord:
+    id: int
+    owner_chat_id: int
+    remind_at_utc: str
+    text: str
+
+
+@dataclass(frozen=True)
 class LearningDraft:
     id: int
     recommendation_id: int
@@ -414,6 +422,15 @@ class ChatThreadStore:
                     PRIMARY KEY(owner_chat_id, delivery_key, part_index),
                     UNIQUE(owner_chat_id, owner_message_id)
                 );
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_chat_id INTEGER NOT NULL,
+                    remind_at_utc TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    sent_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_reminders_due
+                    ON reminders(owner_chat_id, sent_at, remind_at_utc);
                 CREATE TABLE IF NOT EXISTS experience_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_chat_id INTEGER,
@@ -1526,6 +1543,42 @@ class ChatThreadStore:
                 WHERE owner_message_id IS NULL ORDER BY id""",
             ).fetchall()
         return [(int(row["id"]), row["text"], row["prompt_id"], row["selection_id"]) for row in rows]
+
+    def create_reminder(self, owner_chat_id: int, remind_at_utc: str, text: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO reminders (owner_chat_id, remind_at_utc, text) VALUES (?, ?, ?)",
+                (owner_chat_id, remind_at_utc, text),
+            )
+            return int(cursor.lastrowid)
+
+    def pending_due_reminders(self, owner_chat_id: int, now_utc: str | None = None) -> list[ReminderRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, owner_chat_id, remind_at_utc, text FROM reminders
+                WHERE owner_chat_id=? AND sent_at IS NULL AND remind_at_utc<=?
+                ORDER BY remind_at_utc, id""",
+                (owner_chat_id, now_utc or _now()),
+            ).fetchall()
+        return [ReminderRecord(row["id"], row["owner_chat_id"], row["remind_at_utc"], row["text"]) for row in rows]
+
+    def pending_reminders(self, owner_chat_id: int) -> list[ReminderRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, owner_chat_id, remind_at_utc, text FROM reminders
+                WHERE owner_chat_id=? AND sent_at IS NULL
+                ORDER BY remind_at_utc, id""",
+                (owner_chat_id,),
+            ).fetchall()
+        return [ReminderRecord(row["id"], row["owner_chat_id"], row["remind_at_utc"], row["text"]) for row in rows]
+
+    def mark_reminder_sent(self, reminder_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE reminders SET sent_at=? WHERE id=? AND sent_at IS NULL",
+                (_now(), reminder_id),
+            )
+            return cursor.rowcount == 1
 
     def attach_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
         with self._connect() as connection:

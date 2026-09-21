@@ -12,7 +12,7 @@ from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new
 from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
 from .owner_query import OwnerQueryIntent, OwnerQueryScope, PortfolioChatSummary, parse_owner_time_phrase
-from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, RuleRecord, StoredMessage
+from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, ReminderRecord, RuleRecord, StoredMessage
 
 logger = logging.getLogger(__name__)
 _GLOBAL_WORDING = re.compile(r"\b(для\s+всех|всем\s+клиент|глобальн)", re.IGNORECASE)
@@ -998,6 +998,18 @@ class AgentBridgeApplication:
 
     def record_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_query_delivery(delivery_id, owner_message_id)
+
+    def create_reminder(self, remind_at_utc: str, text: str) -> int:
+        return self.store.create_reminder(self.owner_chat_id, remind_at_utc, text)
+
+    def pending_due_reminders(self) -> list[ReminderRecord]:
+        return self.store.pending_due_reminders(self.owner_chat_id)
+
+    def pending_reminders(self) -> list[ReminderRecord]:
+        return self.store.pending_reminders(self.owner_chat_id)
+
+    def mark_reminder_sent(self, reminder_id: int) -> bool:
+        return self.store.mark_reminder_sent(reminder_id)
 
     async def continue_owner_query(
         self, owner_message_id: int, text: str, update_id: int | None = None,

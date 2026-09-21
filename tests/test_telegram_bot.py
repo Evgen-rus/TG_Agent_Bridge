@@ -528,6 +528,8 @@ async def test_owner_command_menu_is_scoped_to_owner_chat_only() -> None:
     assert [(item.command, item.description) for item in owner_call["commands"]] == [
         ("rules", "Показать активные правила"),
         ("undo", "Отменить последнее правило"),
+        ("remind", "Создать напоминание"),
+        ("reminders", "Показать напоминания"),
     ]
     assert isinstance(owner_call["scope"], BotCommandScopeChat)
     assert owner_call["scope"].chat_id == 7654321

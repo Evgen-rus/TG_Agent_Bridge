@@ -25,6 +25,12 @@ Telegram long polling (drop_pending_updates=False)
   -> OWNER_CHAT_ID only
     action: reply | ask_owner | observe | no_action
 
+Owner reminder commands are stored in SQLite with an absolute UTC due time.
+The existing owner delivery retry loop sends due reminders only to
+`OWNER_CHAT_ID` and marks them sent after successful Telegram delivery. A
+restart therefore delivers overdue pending reminders without requiring a
+separate scheduler.
+
 OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
      A substantive owner correction may also create a pending memory draft;
@@ -114,8 +120,8 @@ a series of outdated recommendations.
   notes; the configured `TRANSCRIPTION_MODEL` is the only transcription model.
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
   state, processed updates, pending/delivered recommendation links, learning
-  drafts, versioned rules, memory, owner questions, experience, and Telegram
-  `file_id` metadata for client attachments.
+  drafts, versioned rules, memory, owner questions, reminders, experience, and
+  Telegram `file_id` metadata for client attachments.
 - `agentbridge/logging.py`: secret redaction and seven-day daily diagnostic
   file rotation.
 
