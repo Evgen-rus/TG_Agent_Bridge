@@ -136,6 +136,19 @@ class ReminderRecord:
 
 
 @dataclass(frozen=True)
+class GeneralTaskRecord:
+    id: int
+    owner_chat_id: int
+    request_text: str
+    understanding: str
+    kind: str
+    payload: dict
+    status: str
+    owner_message_id: int | None = None
+    clarification_message_id: int | None = None
+
+
+@dataclass(frozen=True)
 class LearningDraft:
     id: int
     recommendation_id: int
@@ -431,6 +444,21 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_reminders_due
                     ON reminders(owner_chat_id, sent_at, remind_at_utc);
+                CREATE TABLE IF NOT EXISTS owner_general_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_chat_id INTEGER NOT NULL,
+                    request_text TEXT NOT NULL,
+                    understanding TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    owner_message_id INTEGER,
+                    clarification_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_owner_general_tasks_message
+                    ON owner_general_tasks(owner_chat_id, owner_message_id, clarification_message_id, status);
                 CREATE TABLE IF NOT EXISTS experience_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_chat_id INTEGER,
@@ -475,6 +503,10 @@ class ChatThreadStore:
                 "UPDATE owner_query_selections SET status='selecting', updated_at=? WHERE status='processing'",
                 (_now(),),
             )
+            connection.execute(
+                "UPDATE owner_general_tasks SET status='failed', updated_at=? WHERE status='executing'",
+                (_now(),),
+            )
 
     @staticmethod
     def _upgrade_schema(connection: sqlite3.Connection) -> None:
@@ -499,7 +531,7 @@ class ChatThreadStore:
                 ("time_label", "TEXT NOT NULL DEFAULT ''"),
                 ("detail_level", "TEXT NOT NULL DEFAULT 'short'"),
             ),
-            "owner_query_deliveries": (("selection_id", "INTEGER"),),
+            "owner_query_deliveries": (("selection_id", "INTEGER"), ("general_task_id", "INTEGER")),
             "telegram_messages": (
                 ("media_kind", "TEXT NOT NULL DEFAULT ''"),
                 ("media_path", "TEXT NOT NULL DEFAULT ''"),
@@ -1527,22 +1559,22 @@ class ChatThreadStore:
             )
         return result.rowcount == 1
 
-    def create_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None) -> int:
+    def create_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None, general_task_id: int | None = None) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                """INSERT INTO owner_query_deliveries (text, prompt_id, selection_id, created_at)
-                VALUES (?, ?, ?, ?)""",
-                (text, prompt_id, selection_id, _now()),
+                """INSERT INTO owner_query_deliveries (text, prompt_id, selection_id, general_task_id, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (text, prompt_id, selection_id, general_task_id, _now()),
             )
             return int(cursor.lastrowid)
 
-    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None, int | None]]:
+    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None, int | None, int | None]]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT id, text, prompt_id, selection_id FROM owner_query_deliveries
+                """SELECT id, text, prompt_id, selection_id, general_task_id FROM owner_query_deliveries
                 WHERE owner_message_id IS NULL ORDER BY id""",
             ).fetchall()
-        return [(int(row["id"]), row["text"], row["prompt_id"], row["selection_id"]) for row in rows]
+        return [(int(row["id"]), row["text"], row["prompt_id"], row["selection_id"], row["general_task_id"]) for row in rows]
 
     def create_reminder(self, owner_chat_id: int, remind_at_utc: str, text: str) -> int:
         with self._connect() as connection:
@@ -1551,6 +1583,70 @@ class ChatThreadStore:
                 (owner_chat_id, remind_at_utc, text),
             )
             return int(cursor.lastrowid)
+
+    @staticmethod
+    def _general_task(row: sqlite3.Row) -> GeneralTaskRecord:
+        return GeneralTaskRecord(
+            int(row["id"]), int(row["owner_chat_id"]), row["request_text"], row["understanding"],
+            row["kind"], json.loads(row["payload_json"] or "{}"), row["status"],
+            row["owner_message_id"], row["clarification_message_id"],
+        )
+
+    def create_general_task(self, owner_chat_id: int, request_text: str, understanding: str, kind: str, payload: dict) -> int:
+        now = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO owner_general_tasks
+                (owner_chat_id, request_text, understanding, kind, payload_json, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'confirming', ?, ?)""",
+                (owner_chat_id, request_text, understanding, kind, json.dumps(payload, ensure_ascii=False), now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def get_general_task(self, task_id: int) -> GeneralTaskRecord | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM owner_general_tasks WHERE id=?", (task_id,)).fetchone()
+        return None if row is None else self._general_task(row)
+
+    def attach_general_task_message(self, task_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE owner_general_tasks SET owner_message_id=?, clarification_message_id=NULL, updated_at=? WHERE id=? AND status='confirming'",
+                (message_id, _now(), task_id),
+            )
+
+    def mark_general_task_clarification(self, task_id: int, message_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE owner_general_tasks SET clarification_message_id=?, updated_at=? WHERE id=? AND status='confirming'",
+                (message_id, _now(), task_id),
+            )
+            return cursor.rowcount == 1
+
+    def general_task_by_clarification(self, owner_chat_id: int, message_id: int) -> GeneralTaskRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM owner_general_tasks WHERE owner_chat_id=? AND clarification_message_id=? AND status='confirming'",
+                (owner_chat_id, message_id),
+            ).fetchone()
+        return None if row is None else self._general_task(row)
+
+    def revise_general_task(self, task_id: int, request_text: str, understanding: str, kind: str, payload: dict) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE owner_general_tasks SET request_text=?, understanding=?, kind=?, payload_json=?,
+                owner_message_id=NULL, clarification_message_id=NULL, updated_at=? WHERE id=? AND status='confirming'""",
+                (request_text, understanding, kind, json.dumps(payload, ensure_ascii=False), _now(), task_id),
+            )
+            return cursor.rowcount == 1
+
+    def set_general_task_status(self, task_id: int, expected: str, status: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE owner_general_tasks SET status=?, updated_at=? WHERE id=? AND status=?",
+                (status, _now(), task_id, expected),
+            )
+            return cursor.rowcount == 1
 
     def pending_due_reminders(self, owner_chat_id: int, now_utc: str | None = None) -> list[ReminderRecord]:
         with self._connect() as connection:

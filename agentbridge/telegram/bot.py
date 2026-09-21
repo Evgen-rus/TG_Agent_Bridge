@@ -122,12 +122,20 @@ def _memory_confirmation_keyboard(draft_id: int, global_allowed: bool = True) ->
 
 
 def _owner_query_selection_keyboard(selection_id: int, options: list[tuple[int, str, bool]] | None = None) -> InlineKeyboardMarkup:
+    if options and len(options) == 1 and not options[0][2]:
+        index, name, _ = options[0]
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(name, callback_data=f"portfolio:choose:{selection_id}:{index}")],
+            [InlineKeyboardButton("Общая задача", callback_data=f"portfolio:general:{selection_id}")],
+            [InlineKeyboardButton("Отмена", callback_data=f"portfolio:cancel:{selection_id}")],
+        ])
     if not options:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("Все проекты", callback_data=f"portfolio:all:{selection_id}"),
             InlineKeyboardButton("Выбрать несколько", callback_data=f"portfolio:multi:{selection_id}"),
             InlineKeyboardButton("Один проект", callback_data=f"portfolio:single:{selection_id}"),
-        ]])
+        ], [InlineKeyboardButton("Общая задача", callback_data=f"portfolio:general:{selection_id}")],
+            [InlineKeyboardButton("Отмена", callback_data=f"portfolio:cancel:{selection_id}")]])
     rows = [[InlineKeyboardButton(("✓ " if selected else "") + name, callback_data=f"portfolio:item_{'remove' if selected else 'add'}:{selection_id}:{index}")]
             for index, name, selected in options]
     rows.append([
@@ -135,7 +143,16 @@ def _owner_query_selection_keyboard(selection_id: int, options: list[tuple[int, 
         InlineKeyboardButton("Сбросить", callback_data=f"portfolio:reset:{selection_id}"),
         InlineKeyboardButton("Отмена", callback_data=f"portfolio:cancel:{selection_id}"),
     ])
+    rows.insert(-1, [InlineKeyboardButton("Общая задача", callback_data=f"portfolio:general:{selection_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def _general_task_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Да, чувак, погнали!", callback_data=f"general:confirm:{task_id}")],
+        [InlineKeyboardButton("🟡 Погоди, Рик, есть нюанс...", callback_data=f"general:refine:{task_id}")],
+        [InlineKeyboardButton("🔴 Кладу на это болт! *отрыжка*", callback_data=f"general:cancel:{task_id}")],
+    ])
 
 
 async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
@@ -367,18 +384,26 @@ def create_telegram_application(
         prompt_id = result.prompt_id if isinstance(result, OwnerQueryResult) else None
         delivery_id = result.delivery_id if isinstance(result, OwnerQueryResult) else None
         selection_id = result.selection_id if isinstance(result, OwnerQueryResult) else None
+        general_task_id = result.general_task_id if isinstance(result, OwnerQueryResult) else None
         if not text:
             return
         save = getattr(message_service, "save_pending_owner_query_delivery", None)
         if delivery_id is None and save is not None:
             try:
-                delivery_id = save(text, prompt_id, selection_id)
+                delivery_id = save(text, prompt_id, selection_id, general_task_id)
             except TypeError:
                 delivery_id = save(text, prompt_id)
         try:
+            selection_options = None
+            if selection_id is not None:
+                options_getter = getattr(message_service, "owner_query_selection_options", None)
+                selection_options = options_getter(selection_id) if options_getter is not None else None
             sent = await _send(
                 bot, chat_id=owner_chat_id, text=text,
-                reply_markup=_owner_query_selection_keyboard(selection_id) if selection_id is not None else None,
+                reply_markup=(
+                    _owner_query_selection_keyboard(selection_id, selection_options) if selection_id is not None
+                    else _general_task_keyboard(general_task_id) if general_task_id is not None else None
+                ),
                 delivery_key=f"owner-query:{delivery_id}" if delivery_id is not None else None,
             )
         except BadRequest:
@@ -400,6 +425,9 @@ def create_telegram_application(
         attach_selection = getattr(message_service, "attach_owner_query_selection", None)
         if selection_id is not None and attach_selection is not None and message_id is not None:
             attach_selection(selection_id, message_id)
+        attach_general = getattr(message_service, "attach_general_task", None)
+        if general_task_id is not None and attach_general is not None and message_id is not None:
+            attach_general(general_task_id, message_id)
 
     async def _deliver_reminder(bot, reminder) -> None:
         try:
@@ -894,6 +922,14 @@ def create_telegram_application(
             and (bot_id is None or getattr(replied_sender, "id", None) == bot_id)
         )
         if replied_to_this_bot and reply_id is not None:
+            general_clarifier = getattr(message_service, "handle_general_task_clarification", None)
+            if general_clarifier is not None:
+                async with _typing(context.bot, owner_chat_id):
+                    general_result = await general_clarifier(owner_chat_id, reply_id, owner_text, update.update_id)
+                if general_result is not None:
+                    await _deliver_owner_query(context.bot, general_result)
+                    return True
+        if replied_to_this_bot and reply_id is not None:
             onboard_brief = getattr(message_service, "handle_onboarding_brief", None)
             if onboard_brief is not None:
                 async with _typing(context.bot, owner_chat_id):
@@ -1077,6 +1113,30 @@ def create_telegram_application(
             return
         await _telegram_try("answer_callback", query.answer())
         data = query.data or ""
+        if data.startswith("general:"):
+            try:
+                _, action, raw_id = data.split(":", 2)
+                task_id = int(raw_id)
+            except ValueError:
+                return
+            handler = getattr(message_service, "handle_general_task_action", None)
+            if handler is None:
+                return
+            await _telegram_try("clear_general_task_buttons", query.edit_message_reply_markup(reply_markup=None))
+            if action == "refine":
+                result = await handler(task_id, action, owner_chat_id)
+                prompt = await _send(context.bot, chat_id=owner_chat_id, text=result.text)
+                marker = getattr(message_service, "mark_general_task_clarification", None)
+                if prompt is not None and marker is not None:
+                    marker(task_id, prompt.message_id)
+            else:
+                async with _typing(context.bot, owner_chat_id):
+                    result = await handler(task_id, action, owner_chat_id)
+                await _deliver_owner_query(context.bot, result)
+            marker = getattr(message_service, "mark_update_processed", None)
+            if marker is not None:
+                marker(update.update_id)
+            return
         if data.startswith("portfolio:"):
             parts = data.split(":")
             if len(parts) not in {3, 4}:

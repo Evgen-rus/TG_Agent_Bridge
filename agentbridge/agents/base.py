@@ -71,6 +71,16 @@ class OwnerQueryAnswer:
 
 
 @dataclass(frozen=True)
+class GeneralTaskPlan:
+    thread_id: str
+    understanding: str
+    kind: str
+    remind_at_utc: str = ""
+    local_label: str = ""
+    reminder_text: str = ""
+
+
+@dataclass(frozen=True)
 class MediaAttachment:
     path: str
     kind: str = ""
@@ -125,6 +135,12 @@ class AgentProvider(Protocol):
         context_pack: str,
         thread_id: str | None,
     ) -> OwnerQueryAnswer: ...
+
+    async def plan_general_task(
+        self, *, request: str, timezone_name: str, now_local: str, thread_id: str | None,
+    ) -> GeneralTaskPlan: ...
+
+    async def run_general_task(self, *, request: str, thread_id: str) -> OwnerQueryAnswer: ...
 
     async def resolve_owner_query_scope(
         self, *, question: str, known_chats: Sequence[dict[str, str]],

@@ -10,7 +10,7 @@ from pathlib import Path
 from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
 from openai_codex.errors import InvalidRequestError, MethodNotFoundError
 
-from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, MediaAttachment, OwnerQueryAnswer
+from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
 from ..media import is_visual_media
 from ..owner_query import OwnerQueryIntent, PortfolioChatSummary
 
@@ -141,6 +141,18 @@ _OWNER_QUERY_SCHEMA = {
     "required": ["answer"],
     "additionalProperties": False,
 }
+_GENERAL_TASK_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "understanding": {"type": "string"},
+        "kind": {"type": "string", "enum": ["general", "reminder"]},
+        "remind_at_utc": {"type": "string"},
+        "local_label": {"type": "string"},
+        "reminder_text": {"type": "string"},
+    },
+    "required": ["understanding", "kind", "remind_at_utc", "local_label", "reminder_text"],
+    "additionalProperties": False,
+}
 _OWNER_SCOPE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -237,6 +249,21 @@ Wiki чата важнее общей методики. Чужие клиент�
 Не предлагай отправлять это клиенту.
 Формат под Telegram: короткие абзацы, между смысловыми блоками пустая строка, ориентир один экран. Типографика переписки, не книги: длинное тире (—) и среднее (–) не используй, вместо них дефис "-" или двоеточие; кавычки только прямые '"', не «»; без Markdown, заголовков и списков, если тебя прямо не просят.
 """ + _OWNER_VOICE
+_GENERAL_TASK_PLAN_INSTRUCTIONS = """Ты личный Codex-помощник владельца. Клиентского контекста здесь нет.
+Если запрос начинается с текущего времени и текста задачи, это режим планирования: ничего не выполняй,
+не меняй файлы и не запускай команды, только верни понимание по схеме.
+Если владелец просит напомнить, kind=reminder: вычисли точное будущее время из now_local и timezone,
+верни ISO UTC в remind_at_utc, понятную локальную дату в local_label и короткий reminder_text.
+Если время неоднозначно, прямо попроси уточнить его в understanding, а remind_at_utc оставь пустым.
+Для остальных задач kind=general. understanding кратко перечисляет цель и существенные действия,
+особенно запись файлов, сеть, SSH, отправку сообщений, deploy или удаление. Остальные поля пустые.
+Не добавляй действий, которых владелец не просил. Пиши по-русски.
+Если запрос прямо сообщает, что владелец подтвердил выполнение, это режим выполнения: выполни только
+подтверждённую задачу штатными инструментами и верни короткий фактический итог."""
+_GENERAL_TASK_RUN_INSTRUCTIONS = """Ты личный Codex-помощник владельца. Выполни только подтверждённую задачу.
+Работай в текущем окружении и соблюдай его разрешения. Перед рискованным или внешним действием используй
+штатный механизм запроса разрешения. Не подмешивай клиентские чаты. Не отправляй сообщения, не делай deploy,
+push, платные вызовы и удаления, если это явно не входит в подтверждённую задачу. Верни короткий фактический итог."""
 _ONBOARDING_SCHEMA = {
     "type": "object",
     "properties": {
@@ -264,6 +291,7 @@ for _schema_name, _schema in (
     ("suggest", _SUGGEST_SCHEMA),
     ("feedback", _FEEDBACK_SCHEMA),
     ("owner_query", _OWNER_QUERY_SCHEMA),
+    ("general_task_plan", _GENERAL_TASK_PLAN_SCHEMA),
     ("onboarding", _ONBOARDING_SCHEMA),
     ("owner_scope", _OWNER_SCOPE_SCHEMA),
     ("portfolio_summary", _PORTFOLIO_SUMMARY_SCHEMA),
@@ -448,6 +476,44 @@ class CodexProvider:
         self, *, question: str, chat_name: str, context_pack: str, thread_id: str | None,
     ) -> OwnerQueryAnswer:
         return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack, thread_id)
+
+    async def plan_general_task(
+        self, *, request: str, timezone_name: str, now_local: str, thread_id: str | None,
+    ) -> GeneralTaskPlan:
+        return await asyncio.to_thread(self._plan_general_task_sync, request, timezone_name, now_local, thread_id)
+
+    def _plan_general_task_sync(self, request: str, timezone_name: str, now_local: str, thread_id: str | None) -> GeneralTaskPlan:
+        prompt = f"Текущее локальное время: {now_local}\nЧасовой пояс: {timezone_name}\n\nЗадача владельца:\n{request}"
+        with Codex() as codex:
+            if thread_id:
+                try:
+                    thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False)
+                except Exception:
+                    thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                        developer_instructions=_GENERAL_TASK_PLAN_INSTRUCTIONS,
+                        config={"model_reasoning_effort": self.reasoning_effort})
+            else:
+                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                    developer_instructions=_GENERAL_TASK_PLAN_INSTRUCTIONS,
+                    config={"model_reasoning_effort": self.reasoning_effort})
+            payload = self._run_json(thread, prompt, _GENERAL_TASK_PLAN_SCHEMA)
+        return GeneralTaskPlan(thread.id, str(payload["understanding"]).strip(), str(payload["kind"]),
+            str(payload["remind_at_utc"]).strip(), str(payload["local_label"]).strip(), str(payload["reminder_text"]).strip())
+
+    async def run_general_task(self, *, request: str, thread_id: str) -> OwnerQueryAnswer:
+        return await asyncio.to_thread(self._run_general_task_sync, request, thread_id)
+
+    def _run_general_task_sync(self, request: str, thread_id: str) -> OwnerQueryAnswer:
+        prompt = f"Владелец подтвердил выполнение этой задачи:\n\n{request}"
+        with Codex() as codex:
+            try:
+                thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False)
+            except Exception:
+                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                    developer_instructions=_GENERAL_TASK_RUN_INSTRUCTIONS,
+                    config={"model_reasoning_effort": self.reasoning_effort})
+            payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+        return OwnerQueryAnswer(thread.id, str(payload["answer"]).strip())
 
     def _answer_owner_query_sync(
         self, question: str, chat_name: str, context_pack: str, thread_id: str | None,

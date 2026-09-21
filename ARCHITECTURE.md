@@ -49,6 +49,13 @@ OWNER_CHAT_ID
   -> reply to a new-group card: client brief, then confirm wiki draft
   -> /rules and /undo from the owner-chat command menu only
   -> ordinary human conversation is ignored
+
+Ambiguous owner queries include an explicit «Общая задача» choice. This path has
+one persistent owner-only Codex thread under reserved key `0` and receives no
+client wiki, history, state, or scoped memory. It first stores a durable task
+plan and waits for «Да, чувак, погнали!», clarification, or cancellation.
+Natural-language reminders are planned by Codex but, after confirmation, use
+the existing SQLite reminder API and delivery loop instead of an ad-hoc command.
 ```
 
 Each monitored chat has isolated persistent Codex threads: the client thread
@@ -204,6 +211,9 @@ selected IDs and time metadata so a follow-up reruns the same portfolio.
   respective new thread instead of resuming the old one. Sepia follows the
   same version boundary. Critique uses a
   separate ephemeral Codex thread and never overwrites `codex_thread_id`.
+- General owner tasks never execute before their durable Telegram confirmation;
+  duplicate callbacks cannot run a task twice. Arbitrary failed tasks are not
+  retried automatically, while reminder delivery keeps its existing retry path.
 - Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
   onboarding.
 - Bot-authored messages and commands do not invoke Codex.

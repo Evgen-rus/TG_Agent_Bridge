@@ -27,8 +27,8 @@ with the `client-chat` profile. Sepia receives only Rick's finished draft,
 communication state, and relevant facts/constraints, not the chat history.
 Set `SEPIA_ENABLED=false` to bypass this layer. Edit
 `.agents/skills/client-chat/SKILL.md` to change its client-chat style rules.
-The internal Owner contour has separate settings and defaults to `gpt-5.6-sol`
-with the minimum reasoning effort `low`. Change them in `.env` without editing
+The internal Owner contour has separate settings and defaults to `gpt-5.6-luna`
+with the minimum reasoning effort `xhigh`. Change them in `.env` without editing
 code, for example when you want to reduce usage:
 
 ```dotenv
@@ -51,6 +51,12 @@ Owner reminders are created with `/remind YYYY-MM-DD HH:MM text` in the owner
 chat. The time is interpreted in `OWNER_TIMEZONE`; `/reminders` shows the
 unsent queue. Due reminders are stored in SQLite and delivered only to the
 owner chat by the existing retry loop.
+
+For an owner question with no explicit client, choose `Общая задача`. Rick first
+shows how it understood the task and waits for confirmation, clarification, or
+cancellation. This mode has one persistent Codex thread and no client context.
+Phrases such as `напомни через час проверить отчёт` use the same durable reminder
+store after confirmation; `/remind` remains available as the exact command form.
 
 Владелец может спросить сразу про один, несколько или все подключённые чаты.
 Для неоднозначного запроса бот покажет выбор проектов. Периоды вроде «сегодня»,

@@ -7,7 +7,7 @@ import re
 import logging
 from pathlib import Path
 
-from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, MediaAttachment, OwnerQueryAnswer
+from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
 from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
@@ -122,6 +122,7 @@ class OwnerQueryResult:
     prompt_id: int | None = None
     delivery_id: int | None = None
     selection_id: int | None = None
+    general_task_id: int | None = None
 
 
 class AgentBridgeApplication:
@@ -818,9 +819,12 @@ class AgentBridgeApplication:
                 chat = self.registry.get(recommendation.telegram_chat_id)
         if chat is None:
             chat = self.registry.find_by_name(text)
+        if chat is None and len(self.registry) == 1:
+            only = self.registry.all_chats()[0]
+            words = {word for word in re.findall(r"[\w-]+", only.name.casefold()) if len(word) >= 4}
+            if words.intersection(re.findall(r"[\w-]+", text.casefold())):
+                chat = only
         all_requested = any(phrase in " ".join(text.casefold().split()) for phrase in ("все чаты", "все клиенты", "все проекты", "по всем", "all chats", "all clients", "all projects"))
-        if chat is None and len(self.registry) == 1 and not all_requested:
-            chat = self.registry.all_chats()[0]
         if chat is None and reply_to_message_id is None:
             scope = await self._resolve_owner_query_scope(text)
             if scope is not None:
@@ -829,7 +833,7 @@ class AgentBridgeApplication:
                     scope_for_chat = scope
                 elif scope.chat_ids:
                     return await self._answer_owner_portfolio(scope, update_id=update_id)
-                elif getattr(self.owner_provider, "resolve_owner_query_scope", None) is not None:
+                else:
                     if update_id is not None and not self.store.claim_update_processed(update_id):
                         return None
                     return self._new_owner_query_selection(text, scope)
@@ -865,6 +869,8 @@ class AgentBridgeApplication:
         if len(exact) > 1:
             from_utc, to_utc, label = parse_owner_time_phrase(text, timezone_name=self.owner_timezone)
             return OwnerQueryScope("multiple", tuple(item.telegram_chat_id for item in exact), text, from_utc, to_utc, label)
+        if len(chats) == 1:
+            return OwnerQueryScope("ambiguous", (), text)
         resolver = getattr(self.owner_provider, "resolve_owner_query_scope", None)
         if resolver is None:
             return None
@@ -925,6 +931,9 @@ class AgentBridgeApplication:
             return OwnerQueryResult("Этот выбор уже обработан или больше недоступен.")
         if owner_chat_id is not None and selection.owner_chat_id != owner_chat_id:
             return OwnerQueryResult("Этот выбор недоступен в данном чате.")
+        if action == "general":
+            self.store.cancel_owner_query_selection(selection_id)
+            return await self._prepare_general_task(selection.question)
         if action == "cancel":
             self.store.cancel_owner_query_selection(selection_id)
             return OwnerQueryResult("Запрос отменён.")
@@ -932,6 +941,9 @@ class AgentBridgeApplication:
             self.store.update_owner_query_selection(selection_id, selected_chat_ids=(), mode="ambiguous")
             return OwnerQueryResult("Уточните охват вопроса:", selection_id=selection_id)
         selected = list(selection.selected_chat_ids)
+        if action == "choose" and index is not None and 0 <= index < len(selection.available_chat_ids):
+            self.store.update_owner_query_selection(selection_id, mode="single", selected_chat_ids=(selection.available_chat_ids[index],))
+            action = "done"
         if action in {"item", "item_add", "item_remove"} and index is not None and 0 <= index < len(selection.available_chat_ids):
             chat_id = selection.available_chat_ids[index]
             if action == "item_add":
@@ -984,16 +996,105 @@ class AgentBridgeApplication:
                 return OwnerQueryResult("Не удалось обработать выбранные проекты.")
         return OwnerQueryResult("Выберите действие.", selection_id=selection_id)
 
+    async def _prepare_general_task(self, request: str, task_id: int | None = None) -> OwnerQueryResult:
+        planner = getattr(self.owner_provider, "plan_general_task", None)
+        if planner is None:
+            return OwnerQueryResult("Общие задачи в этом режиме недоступны.")
+        from datetime import datetime, timedelta, timezone
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(self.owner_timezone)
+        except Exception:
+            zone = timezone(timedelta(hours=7), name=self.owner_timezone)
+        thread_id = self._owner_query_thread_id_for_provider(0)
+        plan = await planner(
+            request=request, timezone_name=self.owner_timezone,
+            now_local=datetime.now(zone).isoformat(timespec="minutes"), thread_id=thread_id,
+        )
+        if not isinstance(plan, GeneralTaskPlan):
+            return OwnerQueryResult("Не удалось подготовить понимание задачи.")
+        self.store.save_owner_query_thread(0, "Общие задачи", plan.thread_id,
+            prompt_version=getattr(self.owner_provider, "prompt_version", None))
+        payload = {"remind_at_utc": plan.remind_at_utc, "local_label": plan.local_label, "reminder_text": plan.reminder_text}
+        if task_id is None:
+            task_id = self.store.create_general_task(self.owner_chat_id or 0, request, plan.understanding, plan.kind, payload)
+        elif not self.store.revise_general_task(task_id, request, plan.understanding, plan.kind, payload):
+            return OwnerQueryResult("Эта задача уже обработана или отменена.")
+        return OwnerQueryResult(f"Я понял задачу так:\n\n{plan.understanding}", general_task_id=task_id)
+
+    def attach_general_task(self, task_id: int, owner_message_id: int) -> None:
+        self.store.attach_general_task_message(task_id, owner_message_id)
+
+    def mark_general_task_clarification(self, task_id: int, owner_message_id: int) -> bool:
+        return self.store.mark_general_task_clarification(task_id, owner_message_id)
+
+    async def handle_general_task_clarification(
+        self, owner_chat_id: int, reply_to_message_id: int, text: str, update_id: int | None = None,
+    ) -> OwnerQueryResult | None:
+        task = self.store.general_task_by_clarification(owner_chat_id, reply_to_message_id)
+        if task is None:
+            return None
+        if update_id is not None and self.store.is_update_processed(update_id):
+            return None
+        result = await self._prepare_general_task(task.request_text + "\n\nУточнение владельца: " + text, task.id)
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        return result
+
+    async def handle_general_task_action(self, task_id: int, action: str, owner_chat_id: int) -> OwnerQueryResult:
+        task = self.store.get_general_task(task_id)
+        if task is None or task.owner_chat_id != owner_chat_id or task.status != "confirming":
+            return OwnerQueryResult("Эта задача уже обработана или больше недоступна.")
+        if action == "cancel":
+            self.store.set_general_task_status(task_id, "confirming", "cancelled")
+            return OwnerQueryResult("Кладу задачу на полку. Отменено.")
+        if action == "refine":
+            return OwnerQueryResult("Напишите или наговорите нюанс ответом на это сообщение.", general_task_id=task_id)
+        if action != "confirm" or not self.store.set_general_task_status(task_id, "confirming", "executing"):
+            return OwnerQueryResult("Эта задача уже обрабатывается или обработана.")
+        try:
+            if task.kind == "reminder":
+                remind_at = str(task.payload.get("remind_at_utc") or "")
+                reminder_text = str(task.payload.get("reminder_text") or "")
+                from datetime import datetime, timezone
+                try:
+                    future = datetime.fromisoformat(remind_at) > datetime.now(timezone.utc)
+                except (TypeError, ValueError):
+                    future = False
+                if not future or not reminder_text:
+                    self.store.set_general_task_status(task_id, "executing", "failed")
+                    return OwnerQueryResult("Не хватает точного времени или текста напоминания. Уточните задачу заново.")
+                reminder_id = self.create_reminder(remind_at, reminder_text)
+                self.store.set_general_task_status(task_id, "executing", "done")
+                return OwnerQueryResult(f"Напоминание #{reminder_id} сохранено на {task.payload.get('local_label') or remind_at} ({self.owner_timezone}).")
+            runner = getattr(self.owner_provider, "run_general_task", None)
+            thread_id = self._owner_query_thread_id_for_provider(0)
+            if runner is None or not thread_id:
+                raise RuntimeError("general task runner unavailable")
+            result = await runner(request=task.request_text, thread_id=thread_id)
+            if isinstance(result, OwnerQueryAnswer):
+                self.store.save_owner_query_thread(0, "Общие задачи", result.thread_id,
+                    prompt_version=getattr(self.owner_provider, "prompt_version", None))
+                answer = result.answer
+            else:
+                answer = str(result)
+            self.store.set_general_task_status(task_id, "executing", "done")
+            return OwnerQueryResult(answer)
+        except Exception:
+            logger.exception("event=general_task_failed task_id=%s", task_id)
+            self.store.set_general_task_status(task_id, "executing", "failed")
+            return OwnerQueryResult("Не удалось выполнить общую задачу. Изменения автоматически не повторяю.")
+
     def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_query_prompt(prompt_id, owner_message_id)
 
-    def save_pending_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None) -> int:
-        return self.store.create_owner_query_delivery(text, prompt_id, selection_id)
+    def save_pending_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None, general_task_id: int | None = None) -> int:
+        return self.store.create_owner_query_delivery(text, prompt_id, selection_id, general_task_id)
 
     def pending_owner_query_deliveries(self) -> list[OwnerQueryResult]:
         return [
-            OwnerQueryResult(text=text, prompt_id=prompt_id, delivery_id=delivery_id, selection_id=selection_id)
-            for delivery_id, text, prompt_id, selection_id in self.store.pending_owner_query_deliveries()
+            OwnerQueryResult(text=text, prompt_id=prompt_id, delivery_id=delivery_id, selection_id=selection_id, general_task_id=general_task_id)
+            for delivery_id, text, prompt_id, selection_id, general_task_id in self.store.pending_owner_query_deliveries()
         ]
 
     def record_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
