@@ -145,7 +145,7 @@ _GENERAL_TASK_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
         "understanding": {"type": "string"},
-        "kind": {"type": "string", "enum": ["general", "reminder"]},
+        "kind": {"type": "string", "enum": ["general", "reminder", "restart"]},
         "remind_at_utc": {"type": "string"},
         "local_label": {"type": "string"},
         "reminder_text": {"type": "string"},
@@ -255,6 +255,8 @@ _GENERAL_TASK_PLAN_INSTRUCTIONS = """Ты личный Codex-помощник в
 Если владелец просит напомнить, kind=reminder: вычисли точное будущее время из now_local и timezone,
 верни ISO UTC в remind_at_utc, понятную локальную дату в local_label и короткий reminder_text.
 Если время неоднозначно, прямо попроси уточнить его в understanding, а remind_at_utc оставь пустым.
+Если владелец явно просит перезапустить Рика, AgentBridge или тебя самого, kind=restart. Не выбирай
+restart для повторного анализа/запроса, обновления данных, перезагрузки страницы или неоднозначной фразы.
 Для остальных задач kind=general. understanding кратко перечисляет цель и существенные действия,
 особенно запись файлов, сеть, SSH, отправку сообщений, deploy или удаление. Остальные поля пустые.
 Не добавляй действий, которых владелец не просил. Пиши по-русски.

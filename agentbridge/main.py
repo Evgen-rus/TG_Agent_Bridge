@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import sys
 
 from .agents.codex import CodexProvider
 from .application import AgentBridgeApplication
@@ -52,6 +53,8 @@ def main() -> None:
         polling_stall_seconds=settings.telegram_poll_stall_seconds,
         polling_restart_timeout_seconds=settings.telegram_poll_restart_timeout_seconds,
         polling_bootstrap_retries=settings.telegram_bootstrap_retries,
+        restart_project_root=root,
+        restart_python_executable=Path(sys.executable),
     )
     logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
     telegram_application.run_polling(

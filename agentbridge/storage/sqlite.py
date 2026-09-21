@@ -149,6 +149,15 @@ class GeneralTaskRecord:
 
 
 @dataclass(frozen=True)
+class SelfRestartRecord:
+    id: int
+    general_task_id: int
+    owner_chat_id: int
+    old_pid: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class LearningDraft:
     id: int
     recommendation_id: int
@@ -459,6 +468,18 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_owner_general_tasks_message
                     ON owner_general_tasks(owner_chat_id, owner_message_id, clarification_message_id, status);
+                CREATE TABLE IF NOT EXISTS self_restarts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    general_task_id INTEGER NOT NULL UNIQUE,
+                    owner_chat_id INTEGER NOT NULL,
+                    old_pid INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_self_restarts_pending
+                    ON self_restarts(status, old_pid, id);
                 CREATE TABLE IF NOT EXISTS experience_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_chat_id INTEGER,
@@ -1645,6 +1666,48 @@ class ChatThreadStore:
             cursor = connection.execute(
                 "UPDATE owner_general_tasks SET status=?, updated_at=? WHERE id=? AND status=?",
                 (status, _now(), task_id, expected),
+            )
+            return cursor.rowcount == 1
+
+    def create_self_restart(self, task_id: int, owner_chat_id: int, old_pid: int, reason: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO self_restarts
+                (general_task_id, owner_chat_id, old_pid, reason, status, created_at)
+                VALUES (?, ?, ?, ?, 'prepared', ?)""",
+                (task_id, owner_chat_id, old_pid, reason, _now()),
+            )
+            return int(cursor.lastrowid)
+
+    def pending_self_restart(self, current_pid: int) -> SelfRestartRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, general_task_id, owner_chat_id, old_pid, reason FROM self_restarts
+                WHERE status='launched' AND old_pid<>? ORDER BY id LIMIT 1""",
+                (current_pid,),
+            ).fetchone()
+        return None if row is None else SelfRestartRecord(*row)
+
+    def finish_self_restart(self, restart_id: int, *, launched: bool) -> bool:
+        restart_status, task_status = ("launched", "done") if launched else ("failed", "failed")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT general_task_id FROM self_restarts WHERE id=? AND status='prepared'", (restart_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute("UPDATE self_restarts SET status=? WHERE id=?", (restart_status, restart_id))
+            connection.execute(
+                "UPDATE owner_general_tasks SET status=?, updated_at=? WHERE id=? AND status='executing'",
+                (task_status, _now(), int(row["general_task_id"])),
+            )
+            return True
+
+    def acknowledge_self_restart(self, restart_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE self_restarts SET status='acknowledged', completed_at=? WHERE id=? AND status='launched'",
+                (_now(), restart_id),
             )
             return cursor.rowcount == 1
 

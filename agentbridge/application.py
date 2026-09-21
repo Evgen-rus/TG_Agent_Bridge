@@ -123,6 +123,7 @@ class OwnerQueryResult:
     delivery_id: int | None = None
     selection_id: int | None = None
     general_task_id: int | None = None
+    restart_marker_id: int | None = None
 
 
 class AgentBridgeApplication:
@@ -1067,6 +1068,13 @@ class AgentBridgeApplication:
                 reminder_id = self.create_reminder(remind_at, reminder_text)
                 self.store.set_general_task_status(task_id, "executing", "done")
                 return OwnerQueryResult(f"Напоминание #{reminder_id} сохранено на {task.payload.get('local_label') or remind_at} ({self.owner_timezone}).")
+            if task.kind == "restart":
+                import os
+                marker_id = self.store.create_self_restart(task.id, owner_chat_id, os.getpid(), task.request_text)
+                return OwnerQueryResult(
+                    "Перезапускаюсь. Сейчас проверим, переживу ли я собственную операцию на мозге.",
+                    restart_marker_id=marker_id,
+                )
             runner = getattr(self.owner_provider, "run_general_task", None)
             thread_id = self._owner_query_thread_id_for_provider(0)
             if runner is None or not thread_id:
@@ -1102,6 +1110,15 @@ class AgentBridgeApplication:
 
     def create_reminder(self, remind_at_utc: str, text: str) -> int:
         return self.store.create_reminder(self.owner_chat_id, remind_at_utc, text)
+
+    def pending_self_restart(self, current_pid: int):
+        return self.store.pending_self_restart(current_pid)
+
+    def finish_self_restart(self, restart_id: int, *, launched: bool) -> bool:
+        return self.store.finish_self_restart(restart_id, launched=launched)
+
+    def acknowledge_self_restart(self, restart_id: int) -> bool:
+        return self.store.acknowledge_self_restart(restart_id)
 
     def pending_due_reminders(self) -> list[ReminderRecord]:
         return self.store.pending_due_reminders(self.owner_chat_id)

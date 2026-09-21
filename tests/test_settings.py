@@ -3,7 +3,7 @@ from __future__ import annotations
 from agentbridge.settings import Settings
 
 
-def test_owner_codex_defaults_are_separate_from_client(monkeypatch, tmp_path) -> None:
+def test_owner_codex_defaults_match_current_configuration(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("OWNER_CHAT_ID", "7654321")
     monkeypatch.delenv("OWNER_CODEX_MODEL", raising=False)
@@ -13,8 +13,8 @@ def test_owner_codex_defaults_are_separate_from_client(monkeypatch, tmp_path) ->
 
     assert settings.codex_model == "gpt-5.6-luna"
     assert settings.codex_reasoning_effort == "xhigh"
-    assert settings.owner_codex_model == "gpt-5.6-sol"
-    assert settings.owner_codex_reasoning_effort == "low"
+    assert settings.owner_codex_model == "gpt-5.6-luna"
+    assert settings.owner_codex_reasoning_effort == "xhigh"
     assert settings.sepia_enabled is True
 
 

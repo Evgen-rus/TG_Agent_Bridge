@@ -8,7 +8,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
+import os
 from pathlib import Path
+import sys
 import time
 from types import SimpleNamespace
 from typing import Protocol
@@ -21,6 +23,7 @@ from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, C
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
 from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, purge_expired_media
+from agentbridge.restart import self_restart_supported, spawn_restart_helper
 from agentbridge.transcribe import TranscriptionError, transcribe_audio_file
 from .formatter import (
     format_learning_proposal,
@@ -286,6 +289,9 @@ def create_telegram_application(
     polling_stall_seconds: float = 90.0,
     polling_restart_timeout_seconds: float = 30.0,
     polling_bootstrap_retries: int = 5,
+    restart_project_root: Path | None = None,
+    restart_python_executable: Path | None = None,
+    restart_launcher=spawn_restart_helper,
 ) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
@@ -312,6 +318,7 @@ def create_telegram_application(
     retry_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     watchdog_task: asyncio.Task[None] | None = None
+    restart_ack_task: asyncio.Task[None] | None = None
     live_enabled = catchup_idle_seconds <= 0
     last_ingest_at = time.monotonic()
 
@@ -541,6 +548,26 @@ def create_telegram_application(
             await _retry_pending_deliveries(application.bot)
             await asyncio.sleep(delivery_retry_seconds)
 
+    async def _restart_ack_loop(application: Application) -> None:
+        await _wait_until_polling_ready(application)
+        pending = getattr(message_service, "pending_self_restart", None)
+        acknowledge = getattr(message_service, "acknowledge_self_restart", None)
+        if pending is None or acknowledge is None:
+            return
+        while marker := pending(os.getpid()):
+            try:
+                await _send(
+                    application.bot, chat_id=owner_chat_id,
+                    text="Я вернулся. Мозги обновил, реальность не развалилась. Работаем.",
+                    delivery_key=f"restart-ack:{marker.id}",
+                )
+                acknowledge(marker.id)
+            except (BadRequest, NetworkError):
+                await asyncio.sleep(delivery_retry_seconds)
+            except Exception:
+                logger.exception("event=self_restart_ack_pending")
+                await asyncio.sleep(delivery_retry_seconds)
+
     async def _wait_for_ingest_idle() -> None:
         if catchup_idle_seconds <= 0:
             return
@@ -598,7 +625,7 @@ def create_telegram_application(
             await _analyze_chat(chat_id, [], application.bot)
 
     async def _post_init(application: Application) -> None:
-        nonlocal retry_task, recovery_task, watchdog_task, last_ingest_at, live_enabled
+        nonlocal retry_task, recovery_task, watchdog_task, restart_ack_task, last_ingest_at, live_enabled
         await register_owner_command_menu(application.bot, owner_chat_id)
         last_ingest_at = time.monotonic()
         if catchup_idle_seconds > 0:
@@ -608,10 +635,11 @@ def create_telegram_application(
             live_enabled = True
         retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
         watchdog_task = asyncio.create_task(watchdog.run(application), name="agentbridge-polling-watchdog")
+        restart_ack_task = asyncio.create_task(_restart_ack_loop(application), name="agentbridge-restart-ack")
 
     async def _post_stop(application: Application) -> None:
-        nonlocal retry_task, recovery_task, watchdog_task
-        for task in (recovery_task, retry_task, watchdog_task):
+        nonlocal retry_task, recovery_task, watchdog_task, restart_ack_task
+        for task in (recovery_task, retry_task, watchdog_task, restart_ack_task):
             if task is None:
                 continue
             task.cancel()
@@ -619,6 +647,7 @@ def create_telegram_application(
         recovery_task = None
         retry_task = None
         watchdog_task = None
+        restart_ack_task = None
 
     def _ingest(update: Update, chat_id: int, is_owner_chat: bool) -> IncomingMessage:
         nonlocal last_ingest_at
@@ -1132,7 +1161,38 @@ def create_telegram_application(
             else:
                 async with _typing(context.bot, owner_chat_id):
                     result = await handler(task_id, action, owner_chat_id)
-                await _deliver_owner_query(context.bot, result)
+                if result.restart_marker_id is None:
+                    await _deliver_owner_query(context.bot, result)
+                else:
+                    finish = getattr(message_service, "finish_self_restart", None)
+                    if not self_restart_supported():
+                        if finish is not None:
+                            finish(result.restart_marker_id, launched=False)
+                        await _send(context.bot, chat_id=owner_chat_id, text="Локальный self-restart сейчас доступен только на Windows.")
+                    else:
+                        try:
+                            await _send(
+                                context.bot, chat_id=owner_chat_id, text=result.text,
+                                delivery_key=f"restart-start:{result.restart_marker_id}",
+                            )
+                            restart_launcher(
+                                old_pid=os.getpid(),
+                                project_root=restart_project_root or Path.cwd(),
+                                python_executable=restart_python_executable or Path(sys.executable),
+                            )
+                            if finish is None or not finish(result.restart_marker_id, launched=True):
+                                raise RuntimeError("self-restart marker could not be committed")
+                        except Exception:
+                            logger.exception("event=self_restart_launch_failed")
+                            if finish is not None:
+                                finish(result.restart_marker_id, launched=False)
+                            await _send(context.bot, chat_id=owner_chat_id, text="Не смог запустить безопасный перезапуск. Продолжаю работать.")
+                        else:
+                            marker = getattr(message_service, "mark_update_processed", None)
+                            if marker is not None:
+                                marker(update.update_id)
+                            context.application.stop_running()
+                            return
             marker = getattr(message_service, "mark_update_processed", None)
             if marker is not None:
                 marker(update.update_id)
@@ -1303,7 +1363,7 @@ def create_telegram_application(
     ))
     application.add_handler(CallbackQueryHandler(
         learning_callback,
-        pattern=r"^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$|^portfolio:(?:all|multi|single|done|reset|cancel):\d+$|^portfolio:item(?:_add|_remove)?:\d+:\d+$",
+        pattern=r"^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$|^general:(?:confirm|refine|cancel):\d+$|^portfolio:(?:all|multi|single|general|done|reset|cancel):\d+$|^portfolio:choose:\d+:\d+$|^portfolio:item(?:_add|_remove)?:\d+:\d+$",
     ))
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))
