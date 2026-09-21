@@ -40,20 +40,22 @@ async def test_restart_is_durable_and_only_created_after_confirmation(tmp_path, 
 
 def test_restart_helper_uses_current_project_python_and_old_pid(tmp_path, monkeypatch) -> None:
     root = tmp_path / "project"
-    helper = root / "scripts" / "restart_agentbridge.ps1"
     python = root / ".venv" / "Scripts" / "python.exe"
-    helper.parent.mkdir(parents=True)
     python.parent.mkdir(parents=True)
-    helper.touch()
     python.touch()
     calls = []
+    ready = root / "runtime" / "restart-helper-123.ready"
     monkeypatch.setattr("agentbridge.restart.self_restart_supported", lambda: True)
-    monkeypatch.setattr("agentbridge.restart.subprocess.Popen", lambda args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr("agentbridge.restart.time.sleep", lambda delay: ready.parent.mkdir(parents=True, exist_ok=True) or ready.touch())
+    monkeypatch.setattr(
+        "agentbridge.restart.subprocess.Popen",
+        lambda args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(poll=lambda: None),
+    )
 
     spawn_restart_helper(old_pid=123, project_root=root, python_executable=python)
 
     args, kwargs = calls[0]
-    assert ["-OldPid", "123"] == args[args.index("-OldPid"):args.index("-OldPid") + 2]
+    assert ["--old-pid", "123"] == args[args.index("--old-pid"):args.index("--old-pid") + 2]
     assert str(root.resolve()) in args and str(python.resolve()) in args
     assert kwargs["cwd"] == root.resolve()
     assert kwargs["creationflags"] & __import__("subprocess").CREATE_BREAKAWAY_FROM_JOB

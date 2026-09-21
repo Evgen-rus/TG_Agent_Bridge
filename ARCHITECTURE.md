@@ -58,7 +58,7 @@ Natural-language reminders are planned by Codex but, after confirmation, use
 the existing SQLite reminder API and delivery loop instead of an ad-hoc command.
 An explicit self-restart request is also planned there, but deterministic code
 performs it only after confirmation and only on Windows. SQLite keeps the
-pending restart marker; a detached PowerShell helper waits for the old PID,
+pending restart marker; a detached Python helper waits for the old PID,
 starts the same interpreter and project, and the new process acknowledges the
 restart to the owner through the existing durable delivery parts.
 ```

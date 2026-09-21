@@ -58,7 +58,7 @@ cancellation. This mode has one persistent Codex thread and no client context.
 Phrases such as `напомни через час проверить отчёт` use the same durable reminder
 store after confirmation; `/remind` remains available as the exact command form.
 On local Windows, an explicit request such as `Рик, перезагрузись` follows the
-same confirmation gate. A detached PowerShell helper waits for the old PID,
+same confirmation gate. A detached Python helper waits for the old PID,
 starts the same virtual-environment Python, and the new process reports its
 return to the owner chat.
 

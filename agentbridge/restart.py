@@ -3,6 +3,7 @@ from __future__ import annotations
 import platform
 from pathlib import Path
 import subprocess
+import time
 
 
 def self_restart_supported() -> bool:
@@ -14,14 +15,14 @@ def spawn_restart_helper(*, old_pid: int, project_root: Path, python_executable:
         raise RuntimeError("Self-restart is supported only on Windows.")
     root = project_root.resolve()
     python = python_executable.resolve()
-    helper = root / "scripts" / "restart_agentbridge.ps1"
-    if old_pid <= 0 or not helper.is_file() or not python.is_file():
+    ready = root / "runtime" / f"restart-helper-{old_pid}.ready"
+    if old_pid <= 0 or not python.is_file():
         raise RuntimeError("Self-restart paths or PID are invalid.")
-    subprocess.Popen(
+    ready.unlink(missing_ok=True)
+    helper = subprocess.Popen(
         [
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-            "-File", str(helper), "-OldPid", str(old_pid), "-ProjectRoot", str(root),
-            "-PythonExecutable", str(python),
+            str(python), "-m", "agentbridge.restart_helper",
+            "--old-pid", str(old_pid), "--project-root", str(root), "--ready-file", str(ready),
         ],
         cwd=root,
         creationflags=(
@@ -31,3 +32,10 @@ def spawn_restart_helper(*, old_pid: int, project_root: Path, python_executable:
         ),
         close_fds=True,
     )
+    for _ in range(30):
+        if ready.is_file():
+            return
+        if helper.poll() is not None:
+            raise RuntimeError(f"Self-restart helper exited with code {helper.returncode}.")
+        time.sleep(0.1)
+    raise RuntimeError("Self-restart helper did not become ready.")
