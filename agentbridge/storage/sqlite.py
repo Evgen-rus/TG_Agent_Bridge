@@ -1629,6 +1629,19 @@ class ChatThreadStore:
             row = connection.execute("SELECT * FROM owner_general_tasks WHERE id=?", (task_id,)).fetchone()
         return None if row is None else self._general_task(row)
 
+    def general_task_result_by_message(
+        self, owner_chat_id: int, owner_message_id: int,
+    ) -> tuple[GeneralTaskRecord, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT task.*, delivery.text AS result_text
+                FROM owner_query_deliveries AS delivery
+                JOIN owner_general_tasks AS task ON task.id=delivery.general_task_id
+                WHERE task.owner_chat_id=? AND delivery.owner_message_id=? AND task.status='done'""",
+                (owner_chat_id, owner_message_id),
+            ).fetchone()
+        return None if row is None else (self._general_task(row), str(row["result_text"]))
+
     def attach_general_task_message(self, task_id: int, message_id: int) -> None:
         with self._connect() as connection:
             connection.execute(

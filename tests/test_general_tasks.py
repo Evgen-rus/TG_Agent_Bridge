@@ -41,9 +41,31 @@ async def test_general_task_waits_for_confirmation_and_reuses_thread(tmp_path, c
 
     result = await service.handle_general_task_action(prepared.general_task_id, "confirm", 77)
     assert result.text == "Готово без клиентского контекста."
+    assert result.general_task_id == prepared.general_task_id
+    assert not service.general_task_needs_confirmation(prepared.general_task_id)
     assert provider.runs == ["Рик, проверь код"]
     repeated = await service.handle_general_task_action(prepared.general_task_id, "confirm", 77)
     assert "уже" in repeated.text
+
+
+@pytest.mark.asyncio
+async def test_reply_to_completed_general_task_starts_confirmable_followup(tmp_path, chat_registry) -> None:
+    provider = GeneralProvider()
+    store = ChatThreadStore(tmp_path / "followup.sqlite3")
+    service = AgentBridgeApplication(chat_registry, store, provider, owner_chat_id=77)
+    task_id = store.create_general_task(77, "Проверь VPS", "Проверить VPS", "general", {})
+    store.set_general_task_status(task_id, "confirming", "executing")
+    store.set_general_task_status(task_id, "executing", "done")
+    delivery_id = service.save_pending_owner_query_delivery("VPS проверен", None, general_task_id=task_id)
+    service.record_owner_query_delivery(delivery_id, 700)
+
+    followup = await service.handle_general_task_followup(77, 700, "Посмотри снапшоты", update_id=13)
+
+    assert followup is not None and followup.general_task_id != task_id
+    assert "Исходная задача:\nПроверь VPS" in provider.plans[-1]
+    assert "Предыдущий результат:\nVPS проверен" in provider.plans[-1]
+    assert "Новый запрос владельца:\nПосмотри снапшоты" in provider.plans[-1]
+    assert store.is_update_processed(13)
 
 
 @pytest.mark.asyncio

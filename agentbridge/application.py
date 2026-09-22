@@ -1029,6 +1029,10 @@ class AgentBridgeApplication:
     def mark_general_task_clarification(self, task_id: int, owner_message_id: int) -> bool:
         return self.store.mark_general_task_clarification(task_id, owner_message_id)
 
+    def general_task_needs_confirmation(self, task_id: int) -> bool:
+        task = self.store.get_general_task(task_id)
+        return task is not None and task.status == "confirming"
+
     async def handle_general_task_clarification(
         self, owner_chat_id: int, reply_to_message_id: int, text: str, update_id: int | None = None,
     ) -> OwnerQueryResult | None:
@@ -1038,6 +1042,22 @@ class AgentBridgeApplication:
         if update_id is not None and self.store.is_update_processed(update_id):
             return None
         result = await self._prepare_general_task(task.request_text + "\n\nУточнение владельца: " + text, task.id)
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        return result
+
+    async def handle_general_task_followup(
+        self, owner_chat_id: int, reply_to_message_id: int, text: str, update_id: int | None = None,
+    ) -> OwnerQueryResult | None:
+        source = self.store.general_task_result_by_message(owner_chat_id, reply_to_message_id)
+        if source is None or (update_id is not None and self.store.is_update_processed(update_id)):
+            return None
+        task, answer = source
+        request = (
+            f"Продолжение выполненной общей задачи.\n\nИсходная задача:\n{task.request_text}"
+            f"\n\nПредыдущий результат:\n{answer}\n\nНовый запрос владельца:\n{text}"
+        )
+        result = await self._prepare_general_task(request)
         if update_id is not None:
             self.store.mark_update_processed(update_id)
         return result
@@ -1067,7 +1087,10 @@ class AgentBridgeApplication:
                     return OwnerQueryResult("Не хватает точного времени или текста напоминания. Уточните задачу заново.")
                 reminder_id = self.create_reminder(remind_at, reminder_text)
                 self.store.set_general_task_status(task_id, "executing", "done")
-                return OwnerQueryResult(f"Напоминание #{reminder_id} сохранено на {task.payload.get('local_label') or remind_at} ({self.owner_timezone}).")
+                return OwnerQueryResult(
+                    f"Напоминание #{reminder_id} сохранено на {task.payload.get('local_label') or remind_at} ({self.owner_timezone}).",
+                    general_task_id=task_id,
+                )
             if task.kind == "restart":
                 import os
                 marker_id = self.store.create_self_restart(task.id, owner_chat_id, os.getpid(), task.request_text)
@@ -1087,7 +1110,7 @@ class AgentBridgeApplication:
             else:
                 answer = str(result)
             self.store.set_general_task_status(task_id, "executing", "done")
-            return OwnerQueryResult(answer)
+            return OwnerQueryResult(answer, general_task_id=task_id)
         except Exception:
             logger.exception("event=general_task_failed task_id=%s", task_id)
             self.store.set_general_task_status(task_id, "executing", "failed")

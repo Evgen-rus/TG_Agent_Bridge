@@ -405,11 +405,15 @@ def create_telegram_application(
             if selection_id is not None:
                 options_getter = getattr(message_service, "owner_query_selection_options", None)
                 selection_options = options_getter(selection_id) if options_getter is not None else None
+            confirmation_getter = getattr(message_service, "general_task_needs_confirmation", None)
+            needs_confirmation = general_task_id is not None and (
+                confirmation_getter is None or confirmation_getter(general_task_id)
+            )
             sent = await _send(
                 bot, chat_id=owner_chat_id, text=text,
                 reply_markup=(
                     _owner_query_selection_keyboard(selection_id, selection_options) if selection_id is not None
-                    else _general_task_keyboard(general_task_id) if general_task_id is not None else None
+                    else _general_task_keyboard(general_task_id) if needs_confirmation else None
                 ),
                 delivery_key=f"owner-query:{delivery_id}" if delivery_id is not None else None,
             )
@@ -955,6 +959,14 @@ def create_telegram_application(
             if general_clarifier is not None:
                 async with _typing(context.bot, owner_chat_id):
                     general_result = await general_clarifier(owner_chat_id, reply_id, owner_text, update.update_id)
+                if general_result is not None:
+                    await _deliver_owner_query(context.bot, general_result)
+                    return True
+        if replied_to_this_bot and reply_id is not None:
+            general_followup = getattr(message_service, "handle_general_task_followup", None)
+            if general_followup is not None:
+                async with _typing(context.bot, owner_chat_id):
+                    general_result = await general_followup(owner_chat_id, reply_id, owner_text, update.update_id)
                 if general_result is not None:
                     await _deliver_owner_query(context.bot, general_result)
                     return True
