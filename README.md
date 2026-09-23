@@ -21,24 +21,24 @@ notifies the owner only about the current outcome.
    Set `knowledge_pack: none` to opt out. Only `core.md` is injected each turn.
 5. Remove the example directory or change its placeholder chat ID.
 
-Client recommendations default to `gpt-5.6-luna` with reasoning effort `xhigh`.
+Client recommendations default to `gpt-6-luna` with reasoning effort `xhigh`.
 Their final wording is passed through the project-local Sepia `refactor` skill
 with the `client-chat` profile. Sepia receives only Rick's finished draft,
 communication state, and relevant facts/constraints, not the chat history.
 Set `SEPIA_ENABLED=false` to bypass this layer. Edit
 `.agents/skills/client-chat/SKILL.md` to change its client-chat style rules.
-The internal Owner contour has separate settings and defaults to `gpt-5.6-luna`
-with the minimum reasoning effort `xhigh`. Change them in `.env` without editing
+The internal Owner contour has separate settings and defaults to `gpt-6-luna`
+with reasoning effort `xhigh`. Change them in `.env` without editing
 code, for example when you want to reduce usage:
 
 ```dotenv
-OWNER_CODEX_MODEL=gpt-5.6-terra
+OWNER_CODEX_MODEL=gpt-6-luna
 OWNER_CODEX_REASONING_EFFORT=none
 OWNER_TIMEZONE=Asia/Novosibirsk
 ```
 
-`OWNER_CODEX_MODEL` can also be set back to `gpt-5.6-luna`. The official Python
-SDK reuses existing Codex authentication. To start browser login from Python
+The official Python SDK reuses existing Codex authentication. To start browser
+login from Python
 when no account is available:
 
 ```powershell

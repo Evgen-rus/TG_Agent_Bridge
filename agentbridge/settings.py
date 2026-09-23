@@ -15,9 +15,9 @@ class Settings:
     database_path: Path
     log_dir: Path
     log_retention_days: int = 7
-    codex_model: str = "gpt-5.6-luna"
+    codex_model: str = "gpt-6-luna"
     codex_reasoning_effort: str = "xhigh"
-    owner_codex_model: str = "gpt-5.6-luna"
+    owner_codex_model: str = "gpt-6-luna"
     owner_codex_reasoning_effort: str = "xhigh"
     owner_timezone: str = "Asia/Novosibirsk"
     sepia_enabled: bool = True
@@ -58,9 +58,9 @@ class Settings:
             database_path=root / os.getenv("DATABASE_PATH", "runtime/agentbridge.sqlite3"),
             log_dir=root / os.getenv("LOG_DIR", "runtime/logs"),
             log_retention_days=int(os.getenv("LOG_RETENTION_DAYS", "7")),
-            codex_model=os.getenv("CODEX_MODEL", "gpt-5.6-luna").strip(),
+            codex_model=os.getenv("CODEX_MODEL", "gpt-6-luna").strip(),
             codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "xhigh").strip(),
-            owner_codex_model=os.getenv("OWNER_CODEX_MODEL", "gpt-5.6-luna").strip(),
+            owner_codex_model=os.getenv("OWNER_CODEX_MODEL", "gpt-6-luna").strip(),
             owner_codex_reasoning_effort=os.getenv("OWNER_CODEX_REASONING_EFFORT", "xhigh").strip(),
             owner_timezone=os.getenv("OWNER_TIMEZONE", "Asia/Novosibirsk").strip() or "Asia/Novosibirsk",
             sepia_enabled=os.getenv("SEPIA_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},

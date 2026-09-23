@@ -318,7 +318,7 @@ AGENT_PROMPT_VERSION = 8
 class CodexProvider:
     prompt_version = AGENT_PROMPT_VERSION
 
-    def __init__(self, *, model: str = "gpt-5.6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False):
+    def __init__(self, *, model: str = "gpt-6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False):
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.sepia_enabled = sepia_enabled
