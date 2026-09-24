@@ -125,6 +125,9 @@ class OwnerQuerySelection:
     time_label: str
     detail_level: str
     owner_message_id: int | None = None
+    created_by_user_id: int | None = None
+    created_by_username: str | None = None
+    created_by_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,11 @@ class ReminderRecord:
     owner_chat_id: int
     remind_at_utc: str
     text: str
+    related_chat_id: int | None = None
+    related_chat_name: str | None = None
+    created_by_user_id: int | None = None
+    created_by_username: str | None = None
+    created_by_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -430,6 +438,9 @@ class ChatThreadStore:
                     time_label TEXT NOT NULL DEFAULT '',
                     detail_level TEXT NOT NULL DEFAULT 'short',
                     owner_message_id INTEGER,
+                    created_by_user_id INTEGER,
+                    created_by_username TEXT,
+                    created_by_name TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -449,7 +460,12 @@ class ChatThreadStore:
                     owner_chat_id INTEGER NOT NULL,
                     remind_at_utc TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    sent_at TEXT
+                    sent_at TEXT,
+                    related_chat_id INTEGER,
+                    related_chat_name TEXT,
+                    created_by_user_id INTEGER,
+                    created_by_username TEXT,
+                    created_by_name TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_reminders_due
                     ON reminders(owner_chat_id, sent_at, remind_at_utc);
@@ -553,6 +569,18 @@ class ChatThreadStore:
                 ("detail_level", "TEXT NOT NULL DEFAULT 'short'"),
             ),
             "owner_query_deliveries": (("selection_id", "INTEGER"), ("general_task_id", "INTEGER")),
+            "reminders": (
+                ("related_chat_id", "INTEGER"),
+                ("related_chat_name", "TEXT"),
+                ("created_by_user_id", "INTEGER"),
+                ("created_by_username", "TEXT"),
+                ("created_by_name", "TEXT"),
+            ),
+            "owner_query_selections": (
+                ("created_by_user_id", "INTEGER"),
+                ("created_by_username", "TEXT"),
+                ("created_by_name", "TEXT"),
+            ),
             "telegram_messages": (
                 ("media_kind", "TEXT NOT NULL DEFAULT ''"),
                 ("media_path", "TEXT NOT NULL DEFAULT ''"),
@@ -1448,16 +1476,20 @@ class ChatThreadStore:
         self, question: str, owner_chat_id: int, available_chat_ids: list[int] | tuple[int, ...],
         *, time_from_utc: str | None = None, time_to_utc: str | None = None,
         time_label: str = "", detail_level: str = "short",
+        created_by_user_id: int | None = None, created_by_username: str | None = None,
+        created_by_name: str | None = None,
     ) -> int:
         now = _now()
         with self._connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO owner_query_selections
                 (question, owner_chat_id, available_chat_ids, selected_chat_ids, mode, status,
-                 time_from_utc, time_to_utc, time_label, detail_level, created_at, updated_at)
-                VALUES (?, ?, ?, '[]', 'ambiguous', 'selecting', ?, ?, ?, ?, ?, ?)""",
+                 time_from_utc, time_to_utc, time_label, detail_level,
+                 created_by_user_id, created_by_username, created_by_name, created_at, updated_at)
+                VALUES (?, ?, ?, '[]', 'ambiguous', 'selecting', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (question.strip(), owner_chat_id, json.dumps(list(available_chat_ids)),
-                 time_from_utc, time_to_utc, time_label, detail_level, now, now),
+                 time_from_utc, time_to_utc, time_label, detail_level,
+                 created_by_user_id, created_by_username, created_by_name, now, now),
             )
             return int(cursor.lastrowid)
 
@@ -1474,6 +1506,9 @@ class ChatThreadStore:
             mode=row["mode"], status=row["status"], time_from_utc=row["time_from_utc"],
             time_to_utc=row["time_to_utc"], time_label=row["time_label"], detail_level=row["detail_level"],
             owner_message_id=row["owner_message_id"],
+            created_by_user_id=row["created_by_user_id"] if "created_by_user_id" in row.keys() else None,
+            created_by_username=row["created_by_username"] if "created_by_username" in row.keys() else None,
+            created_by_name=row["created_by_name"] if "created_by_name" in row.keys() else None,
         )
 
     def get_owner_query_selection(self, selection_id: int) -> OwnerQuerySelection | None:
@@ -1597,13 +1632,34 @@ class ChatThreadStore:
             ).fetchall()
         return [(int(row["id"]), row["text"], row["prompt_id"], row["selection_id"], row["general_task_id"]) for row in rows]
 
-    def create_reminder(self, owner_chat_id: int, remind_at_utc: str, text: str) -> int:
+    def create_reminder(
+        self, owner_chat_id: int, remind_at_utc: str, text: str, *,
+        related_chat_id: int | None = None, related_chat_name: str | None = None,
+        created_by_user_id: int | None = None, created_by_username: str | None = None,
+        created_by_name: str | None = None,
+    ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO reminders (owner_chat_id, remind_at_utc, text) VALUES (?, ?, ?)",
-                (owner_chat_id, remind_at_utc, text),
+                """INSERT INTO reminders
+                (owner_chat_id, remind_at_utc, text, related_chat_id, related_chat_name,
+                 created_by_user_id, created_by_username, created_by_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (owner_chat_id, remind_at_utc, text, related_chat_id, related_chat_name,
+                 created_by_user_id, created_by_username, created_by_name),
             )
             return int(cursor.lastrowid)
+
+    @staticmethod
+    def _reminder(row: sqlite3.Row) -> ReminderRecord:
+        keys = row.keys()
+        return ReminderRecord(
+            row["id"], row["owner_chat_id"], row["remind_at_utc"], row["text"],
+            row["related_chat_id"] if "related_chat_id" in keys else None,
+            row["related_chat_name"] if "related_chat_name" in keys else None,
+            row["created_by_user_id"] if "created_by_user_id" in keys else None,
+            row["created_by_username"] if "created_by_username" in keys else None,
+            row["created_by_name"] if "created_by_name" in keys else None,
+        )
 
     @staticmethod
     def _general_task(row: sqlite3.Row) -> GeneralTaskRecord:
@@ -1727,22 +1783,22 @@ class ChatThreadStore:
     def pending_due_reminders(self, owner_chat_id: int, now_utc: str | None = None) -> list[ReminderRecord]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT id, owner_chat_id, remind_at_utc, text FROM reminders
+                """SELECT * FROM reminders
                 WHERE owner_chat_id=? AND sent_at IS NULL AND remind_at_utc<=?
                 ORDER BY remind_at_utc, id""",
                 (owner_chat_id, now_utc or _now()),
             ).fetchall()
-        return [ReminderRecord(row["id"], row["owner_chat_id"], row["remind_at_utc"], row["text"]) for row in rows]
+        return [self._reminder(row) for row in rows]
 
     def pending_reminders(self, owner_chat_id: int) -> list[ReminderRecord]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT id, owner_chat_id, remind_at_utc, text FROM reminders
+                """SELECT * FROM reminders
                 WHERE owner_chat_id=? AND sent_at IS NULL
                 ORDER BY remind_at_utc, id""",
                 (owner_chat_id,),
             ).fetchall()
-        return [ReminderRecord(row["id"], row["owner_chat_id"], row["remind_at_utc"], row["text"]) for row in rows]
+        return [self._reminder(row) for row in rows]
 
     def mark_reminder_sent(self, reminder_id: int) -> bool:
         with self._connect() as connection:

@@ -207,3 +207,60 @@ update fails, the same recommendation can be sent twice.
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
 ```
+
+## Обновление OpenAI Codex
+
+Если AgentBridge внезапно перестал работать с новой моделью Codex и появляется ошибка вроде:
+
+```text
+The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.
+```
+
+сначала проверь версии Python SDK и встроенного Codex CLI:
+
+```powershell
+python -m pip list | findstr /I codex
+```
+
+Пример:
+
+```text
+openai-codex          0.154.0
+openai-codex-cli-bin  0.154.0
+```
+
+AgentBridge использует Codex через Python-пакет `openai-codex`. Глобальная команда `codex` для работы проекта не обязательна.
+
+Обновить Codex внутри активного `.venv`:
+
+```powershell
+python -m pip install -U openai-codex openai-codex-cli-bin
+```
+
+После обновления снова проверить версии:
+
+```powershell
+python -m pip list | findstr /I codex
+```
+
+Посмотреть доступные версии пакета:
+
+```powershell
+python -m pip index versions openai-codex
+```
+
+После обновления полностью остановить AgentBridge и запустить заново:
+
+```powershell
+python -m agentbridge.main
+```
+
+Если виртуальное окружение ещё не активировано:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U openai-codex openai-codex-cli-bin
+python -m agentbridge.main
+```
+
+Важно: при появлении новых моделей OpenAI локальная версия `openai-codex` / `openai-codex-cli-bin` может оказаться старой, даже если код AgentBridge не менялся. Поэтому при неожиданных ошибках доступности модели сначала проверять и обновлять именно эти два пакета.

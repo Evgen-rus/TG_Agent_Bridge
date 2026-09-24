@@ -56,6 +56,11 @@ client wiki, history, state, or scoped memory. It first stores a durable task
 plan and waits for «Да, чувак, погнали!», clarification, or cancellation.
 Natural-language reminders are planned by Codex but, after confirmation, use
 the existing SQLite reminder API and delivery loop instead of an ad-hoc command.
+A confidently resolved single client is planned the same way before any chat
+analysis: `kind=reminder` stores that chat as a label, and any other kind keeps
+the ordinary owner query. Delivery stays in `OWNER_CHAT_ID` and mentions the
+Telegram user who created that reminder. Old reminders without an author stay
+untagged.
 Replies to any delivered result of a completed general task start a new
 confirmable general task in the same persistent owner thread.
 An explicit self-restart request is also planned there, but deterministic code

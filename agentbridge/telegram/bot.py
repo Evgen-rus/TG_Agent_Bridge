@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import inspect
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -205,6 +207,51 @@ def _parse_reminder_args(args: list[str], timezone_name: str) -> tuple[str, str,
     return remind_at.isoformat(), local.strftime("%Y-%m-%d %H:%M"), text
 
 
+def _accepted_author_kwargs(func, user, prefix: str) -> dict:
+    if user is None or getattr(user, "is_bot", False):
+        return {}
+    username = getattr(user, "username", None) or None
+    name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or None
+    payload = {
+        f"{prefix}_user_id": getattr(user, "id", None),
+        f"{prefix}_username": username,
+        f"{prefix}_name": name,
+    }
+    if all(value is None for value in payload.values()):
+        return {}
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in params.values()):
+        return payload
+    return {key: value for key, value in payload.items() if key in params}
+
+
+def _format_reminder_message(reminder) -> tuple[str, str | None]:
+    text = getattr(reminder, "text", "") or ""
+    client = (getattr(reminder, "related_chat_name", None) or "").strip()
+    username = (getattr(reminder, "created_by_username", None) or "").strip().lstrip("@")
+    user_id = getattr(reminder, "created_by_user_id", None)
+    name = (getattr(reminder, "created_by_name", None) or "").strip()
+    if username:
+        parts = [f"🔔 @{username}, напоминание"]
+        if client:
+            parts.append(client)
+        parts.append(text)
+        return "\n\n".join(parts), None
+    if user_id is not None:
+        label = html.escape(name or str(user_id))
+        parts = [f'🔔 <a href="tg://user?id={int(user_id)}">{label}</a>, напоминание']
+        if client:
+            parts.append(html.escape(client))
+        parts.append(html.escape(text))
+        return "\n\n".join(parts), "HTML"
+    if client:
+        return f"🔔 Напоминание\n\n{client}\n\n{text}", None
+    return f"🔔 Напоминание\n{text}", None
+
+
 def _onboarding_keyboard(onboarding_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Да, сохранить", callback_data=f"onboard:yes:{onboarding_id}"),
@@ -322,7 +369,7 @@ def create_telegram_application(
     live_enabled = catchup_idle_seconds <= 0
     last_ingest_at = time.monotonic()
 
-    async def _send(bot, *, chat_id: int, text: str, reply_markup=None, delivery_key: str | None = None):
+    async def _send(bot, *, chat_id: int, text: str, reply_markup=None, delivery_key: str | None = None, parse_mode: str | None = None):
         if chat_id != owner_chat_id:
             raise ValueError("Outbound messages must target the owner chat")
         async with send_lock:
@@ -338,6 +385,8 @@ def create_telegram_application(
                     sent = SimpleNamespace(message_id=message_id)
                     continue
                 kwargs = {"chat_id": chat_id, "text": part}
+                if parse_mode:
+                    kwargs["parse_mode"] = parse_mode
                 if reply_markup is not None and index == len(parts) - 1:
                     kwargs["reply_markup"] = reply_markup
                 try:
@@ -442,11 +491,13 @@ def create_telegram_application(
 
     async def _deliver_reminder(bot, reminder) -> None:
         try:
+            text, parse_mode = _format_reminder_message(reminder)
             await _send(
                 bot,
                 chat_id=owner_chat_id,
-                text=f"🔔 Напоминание\n{reminder.text}",
+                text=text,
                 delivery_key=f"reminder:{reminder.id}",
+                parse_mode=parse_mode,
             )
             mark_sent = getattr(message_service, "mark_reminder_sent", None)
             if mark_sent is not None:
@@ -1019,7 +1070,10 @@ def create_telegram_application(
                 return True
             logger.info("event=owner_query_received owner_message_id=%s update_id=%s", getattr(message, "message_id", None), update.update_id)
             async with _typing(context.bot, owner_chat_id):
-                answer = await query(owner_text, reply_to_message_id=reply_id, update_id=update.update_id)
+                answer = await query(
+                    owner_text, reply_to_message_id=reply_id, update_id=update.update_id,
+                    **_accepted_author_kwargs(query, sender, "author"),
+                )
                 await _deliver_owner_query(context.bot, answer)
             return True
         if reply_id is None:
@@ -1331,7 +1385,7 @@ def create_telegram_application(
         if create is None:
             await _send(context.bot, chat_id=owner_chat_id, text="Напоминания в этом режиме недоступны.")
             return
-        reminder_id = create(remind_at_utc, text)
+        reminder_id = create(remind_at_utc, text, **_accepted_author_kwargs(create, update.effective_user, "created_by"))
         await _send(
             context.bot,
             chat_id=owner_chat_id,
