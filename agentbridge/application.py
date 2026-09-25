@@ -254,6 +254,36 @@ class AgentBridgeApplication:
             return "owner"
         return item.role
 
+    def _invalidate_unavailable_attachment_facts(self, chat_id: int) -> None:
+        available = [item for item in self.store.list_chat_attachments(chat_id) if media_file_ready(item.media_path)]
+        numbers = {number for item in available for number in re.findall(r"\d{3,}", item.media_filename)}
+        if not numbers:
+            return
+        state = self.store.get_chat_state(chat_id)
+        def stale(value: str) -> bool:
+            return bool(re.search(r"недоступ|нет доступа|не найден|не скач|отсутств", value, re.I)
+                        and numbers.intersection(re.findall(r"\d{3,}", value)))
+        def cleaned(value: str) -> str:
+            if not stale(value):
+                return value
+            clauses = re.split(r"(?<=[.!?])\s+(?=[А-ЯЁA-Z])|[;\n]\s*", value)
+            return " ".join(clause for clause in clauses if not stale(clause)).strip()
+        changed = False
+        for key, value in state.items():
+            if isinstance(value, str):
+                revised = cleaned(value)
+                if revised != value:
+                    state[key] = revised
+                    changed = True
+            elif isinstance(value, list):
+                kept = [cleaned(entry) if isinstance(entry, str) else entry for entry in value]
+                kept = [entry for entry in kept if entry]
+                if kept != value:
+                    state[key] = kept
+                    changed = True
+        if changed:
+            self.store.save_chat_state(chat_id, state)
+
     def pending_voice_messages(self, telegram_chat_id: int) -> list[StoredMessage]:
         return [
             item for item in self.store.pending_messages(telegram_chat_id)
@@ -388,7 +418,7 @@ class AgentBridgeApplication:
         for item in internal:
             self.store.record_internal_context(
                 chat.telegram_chat_id, chat.name, item.sender_name.strip() or "Внутренний участник",
-                _episode_text(item),
+                _forward_label(item.forward_origin).strip() + " " + _episode_text(item) if item.forward_origin else _episode_text(item),
             )
         if not external:
             logger.info("event=client_batch_context_only chat_id=%s count=%d", chat.telegram_chat_id, len(internal))
@@ -396,10 +426,10 @@ class AgentBridgeApplication:
         sender_names = list(dict.fromkeys(item.sender_name.strip() or "Неизвестный отправитель" for item in external))
         sender_name = sender_names[0] if len(sender_names) == 1 else ", ".join(sender_names)
         if len(messages) == 1:
-            combined_message = _episode_text(messages[0])
+            combined_message = _forward_label(messages[0].forward_origin).strip() + " " + _episode_text(messages[0]) if messages[0].forward_origin else _episode_text(messages[0])
         else:
             combined_message = "\n".join(
-                f"{item.sender_name.strip() or 'Неизвестный отправитель'}: {_episode_text(item)}" for item in messages
+                f"{item.sender_name.strip() or 'Неизвестный отправитель'}{_forward_label(item.forward_origin)}: {_episode_text(item)}" for item in messages
             )
         rules = self.store.active_rule_texts(chat.telegram_chat_id)
         thread_id = self._thread_id_for_provider(chat.telegram_chat_id)
@@ -575,7 +605,7 @@ class AgentBridgeApplication:
         parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2))
         if recent:
             history = "\n".join(
-                f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
+                f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}{_forward_label(item.forward_origin)}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
                 for item in recent
             )
             if time_from_utc is not None or time_to_utc is not None:
@@ -1381,7 +1411,7 @@ class AgentBridgeApplication:
             chat.telegram_chat_id, time_from_utc=scope.time_from_utc, time_to_utc=scope.time_to_utc, limit=200,
         )
         state = self.store.get_chat_state(chat.telegram_chat_id)
-        history = "\n".join(f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
+        history = "\n".join(f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}{_forward_label(item.forward_origin)}: {display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
         parts = [f"Клиент: {chat.name}", f"Период: {scope.time_label}", f"Wiki:\n{chat.wiki or '(пусто)'}"]
         shared = self._shared_knowledge(chat)
         if shared:
@@ -1399,6 +1429,7 @@ class AgentBridgeApplication:
     ) -> str:
         if self.attachment_fetcher is not None:
             await self.attachment_fetcher(chat.telegram_chat_id)
+        self._invalidate_unavailable_attachment_facts(chat.telegram_chat_id)
         answerer = getattr(self.owner_provider, "answer_owner_query", None)
         pack = self._context_pack(
             chat,
@@ -1741,6 +1772,10 @@ def _episode_text(item: IncomingMessage) -> str:
             return f"{label} {body}"
         return body or label
     return body
+
+
+def _forward_label(origin: str) -> str:
+    return f" (forwarded_from: {origin})" if origin else ""
 
 
 def _episode_attachments(messages: list[IncomingMessage]) -> tuple[MediaAttachment, ...]:

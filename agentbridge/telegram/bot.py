@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -49,6 +50,13 @@ _OWNER_BOT_COMMANDS = (
     BotCommand("reminders", "Показать напоминания"),
 )
 logger = logging.getLogger(__name__)
+
+
+def _telegram_safe_text(text: str) -> str:
+    text = re.sub(r"[ \t]*:codex-file-citation\{[^}]*\}", "", text)
+    text = re.sub(r"[\"'`][A-Za-z]:[\\/][^\"'`\n]+[\"'`]", "[локальный файл]", text)
+    text = re.sub(r"(?<!\w)[A-Za-z]:[\\/][^\s\"'<>]+", "[локальный файл]", text)
+    return re.sub(r"[ \t]+([.,;:])", r"\1", text)
 
 
 class IncomingMessageService(Protocol):
@@ -372,6 +380,7 @@ def create_telegram_application(
     async def _send(bot, *, chat_id: int, text: str, reply_markup=None, delivery_key: str | None = None, parse_mode: str | None = None):
         if chat_id != owner_chat_id:
             raise ValueError("Outbound messages must target the owner chat")
+        text = _telegram_safe_text(text)
         async with send_lock:
             texts = split_owner_message(text)
             prepare = getattr(message_service, "prepare_owner_delivery_parts", None)
@@ -437,6 +446,7 @@ def create_telegram_application(
         if result is None:
             return
         text = result.text if isinstance(result, OwnerQueryResult) else str(result)
+        text = _telegram_safe_text(text)
         prompt_id = result.prompt_id if isinstance(result, OwnerQueryResult) else None
         delivery_id = result.delivery_id if isinstance(result, OwnerQueryResult) else None
         selection_id = result.selection_id if isinstance(result, OwnerQueryResult) else None

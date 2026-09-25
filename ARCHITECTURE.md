@@ -248,7 +248,11 @@ failure leaves the inbox row pending.
   Owner queries list that chat's document metadata and attach only documents
   whose numbers are explicitly mentioned in the question. Missing copies of
   processed documents are re-downloaded from saved `file_id` when the owner
-  queries that chat. Photo and voice copies remain temporary. The bot cannot
+  queries that chat. The catalog's live file status takes precedence over old
+  `chat_state` availability claims; matching stale claims are cleared when a
+  copy is available. History and episodes keep the actual sender separate from
+  `forwarded_from`. Telegram delivery strips Codex file-citation markup and
+  local filesystem paths. Photo and voice copies remain temporary. The bot cannot
   scroll a group's history like a user account.
 - Voice notes follow the same persist-first path: the row is stored before any
   model work, then transcribed in the background during the batch window (or at

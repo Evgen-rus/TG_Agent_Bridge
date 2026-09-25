@@ -229,6 +229,7 @@ async def test_forwarded_owner_invoice_and_client_payment_remain_readable(tmp_pa
         ("Счёт №580.pdf", "owner"), ("Платежное поручение №195.pdf", "client"),
     ]
     assert files[0].forward_origin == "Дмитрий"
+    assert files[0].sender_name == "Owner"
     assert files[0].media_file_unique_id == "unique-pdf"
     assert files[0].telegram_date == "2026-09-25T05:04:19+00:00"
     assert files[1].telegram_date == "2026-09-25T05:46:59+00:00"
@@ -237,6 +238,8 @@ async def test_forwarded_owner_invoice_and_client_payment_remain_readable(tmp_pa
     assert len(owner_provider.calls[-1]["attachments"]) == 2
     assert "05:04:19" in owner_provider.calls[-1]["context_pack"]
     assert "05:46:59" in owner_provider.calls[-1]["context_pack"]
+    assert "sender=Owner; role=owner; forwarded_from=Дмитрий" in owner_provider.calls[-1]["context_pack"]
+    assert "Owner (forwarded_from: Дмитрий)" in service._context_pack(chat_registry.get(-100123456))
 
 
 def test_owner_document_without_forward_is_classified_and_listed(tmp_path, chat_registry) -> None:
@@ -311,6 +314,36 @@ async def test_failed_document_download_is_reported(tmp_path, chat_registry, mon
     assert row.download_status == "download_failed" and row.download_error
     assert "status=download_failed" in owner_provider.calls[-1]["context_pack"]
     assert "attachments" not in owner_provider.calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_available_document_invalidates_stale_unavailable_state(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(b"%PDF")
+    store.ingest_telegram_message(
+        update_id=13, chat_id=-100123456, message_id=12, sender_id=5, sender_name="Alice",
+        telegram_date="2026-09-25T05:00:00+00:00", text="", reply_to_message_id=None,
+        role="client", processing_status="processed", media_kind="document",
+        media_path=str(pdf), telegram_file_id="invoice-file", media_filename="Счёт №580.pdf",
+    )
+    store.save_chat_state(-100123456, {
+        "summary": "Счёт №580 недоступен. Клиент ждёт ответ.", "unknowns": ["Не найден PDF счёта №580", "Неизвестна дата оплаты"],
+    })
+    class OwnerProvider:
+        calls: list[dict] = []
+        async def answer_owner_query(self, **kwargs):
+            self.calls.append(kwargs)
+            return "ok"
+    owner_provider = OwnerProvider()
+    service = AgentBridgeApplication(chat_registry, store, FakeProvider(), owner_provider=owner_provider)
+    await service._answer_owner_query_for_chat(chat_registry.get(-100123456), "Где счёт 580?")
+    state = store.get_chat_state(-100123456)
+    assert state["summary"] == "Клиент ждёт ответ."
+    assert state["unknowns"] == ["Неизвестна дата оплаты"]
+    pack = owner_provider.calls[-1]["context_pack"]
+    assert "status=available" in pack
+    assert "Счёт №580 недоступен" not in pack
 
 
 @pytest.mark.asyncio

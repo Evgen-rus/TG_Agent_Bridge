@@ -170,6 +170,28 @@ async def test_owner_mention_asks_the_assistant() -> None:
 
 
 @pytest.mark.asyncio
+async def test_codex_file_citation_and_local_path_never_reach_telegram() -> None:
+    class CitationService(OwnerAssistantService):
+        async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
+            return OwnerQueryResult(
+                'Счёт проверен :codex-file-citation{path="D:\\Project\\runtime\\media\\invoice.pdf" purpose="source"}. '
+                'Копия: "D:\\My Project\\runtime\\media\\invoice.pdf"',
+            )
+    service = CitationService()
+    application = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0)
+    bot = FakeBot()
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent проверь счёт"), FakeChat(7654321), FakeUser()), FakeContext(bot),
+    )
+    sent = bot.sent[0]["text"]
+    assert "Счёт проверен" in sent
+    assert ":codex-file-citation" not in sent
+    assert "D:\\" not in sent
+    assert "My Project" not in sent
+    assert "[локальный файл]" in sent
+
+
+@pytest.mark.asyncio
 async def test_owner_rick_prefix_asks_the_assistant_without_telegram_tag() -> None:
     service = OwnerAssistantService()
     application = create_telegram_application(
