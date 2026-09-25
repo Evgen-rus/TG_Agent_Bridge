@@ -77,6 +77,10 @@ class StoredMessage:
     media_mime: str = ""
     media_filename: str = ""
     media_group_id: str = ""
+    media_file_unique_id: str = ""
+    forward_origin: str = ""
+    download_status: str = ""
+    download_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -588,6 +592,10 @@ class ChatThreadStore:
                 ("media_mime", "TEXT NOT NULL DEFAULT ''"),
                 ("media_filename", "TEXT NOT NULL DEFAULT ''"),
                 ("media_group_id", "TEXT NOT NULL DEFAULT ''"),
+                ("media_file_unique_id", "TEXT NOT NULL DEFAULT ''"),
+                ("forward_origin", "TEXT NOT NULL DEFAULT ''"),
+                ("download_status", "TEXT NOT NULL DEFAULT ''"),
+                ("download_error", "TEXT NOT NULL DEFAULT ''"),
             ),
         }
         for table, specs in columns.items():
@@ -1214,18 +1222,22 @@ class ChatThreadStore:
         media_mime: str = "",
         media_filename: str = "",
         media_group_id: str = "",
+        media_file_unique_id: str = "",
+        forward_origin: str = "",
     ) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO telegram_messages (
                     update_id, chat_id, message_id, sender_id, sender_name, telegram_date,
                     text, reply_to_message_id, role, processing_status, created_at,
-                    media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id,
+                    media_file_unique_id, forward_origin, download_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     update_id, chat_id, message_id, sender_id, sender_name, telegram_date,
                     text, reply_to_message_id, role, processing_status, _now(),
                     media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id,
+                    media_file_unique_id, forward_origin, "available" if media_path else "pending" if telegram_file_id else "",
                 ),
             )
             return cursor.rowcount == 1
@@ -1233,9 +1245,41 @@ class ChatThreadStore:
     def set_media_path(self, message_id: int, media_path: str) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE telegram_messages SET media_path=? WHERE id=?",
+                "UPDATE telegram_messages SET media_path=?, download_status='available', download_error='' WHERE id=?",
                 (media_path, message_id),
             )
+
+    def set_media_download_failure(self, message_id: int, error: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE telegram_messages SET media_path='', download_status='download_failed', download_error=? WHERE id=?",
+                (error, message_id),
+            )
+
+    def list_chat_attachments(self, chat_id: int) -> list[StoredMessage]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM telegram_messages WHERE chat_id=? AND media_kind='document' ORDER BY telegram_date, id",
+                (chat_id,),
+            ).fetchall()
+        return [self._stored_message(row) for row in rows]
+
+    def retained_document_paths(self) -> set[str]:
+        with self._connect() as connection:
+            return {str(row[0]) for row in connection.execute(
+                "SELECT media_path FROM telegram_messages WHERE media_kind='document' AND media_path<>''"
+            )}
+
+    def owner_sender_seen(self, owner_chat_id: int | None, sender_id: int | None) -> bool:
+        if owner_chat_id is None or sender_id is None:
+            return False
+        if owner_chat_id == sender_id:
+            return True
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM telegram_messages WHERE chat_id=? AND sender_id=? AND role='owner' LIMIT 1",
+                (owner_chat_id, sender_id),
+            ).fetchone() is not None
 
     def set_message_text(self, update_id: int, text: str) -> bool:
         """Записывает распознанный текст голосового; только пока сообщение pending."""
@@ -1270,7 +1314,7 @@ class ChatThreadStore:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""SELECT DISTINCT chat_id FROM telegram_messages
-                WHERE processing_status='pending' AND role IN ('client', 'internal')
+                WHERE processing_status='pending' AND role IN ('client', 'internal', 'owner')
                 AND chat_id IN ({placeholders}) ORDER BY chat_id""",
                 known_chat_ids,
             ).fetchall()
@@ -1278,7 +1322,7 @@ class ChatThreadStore:
 
     def pending_messages(self, chat_id: int, limit: int | None = None) -> list[StoredMessage]:
         sql = """SELECT * FROM telegram_messages
-            WHERE chat_id=? AND processing_status='pending' AND role IN ('client', 'internal')
+            WHERE chat_id=? AND processing_status='pending' AND role IN ('client', 'internal', 'owner')
             ORDER BY id"""
         params: tuple[object, ...] = (chat_id,)
         if limit is not None:
@@ -1335,7 +1379,7 @@ class ChatThreadStore:
         time_from_utc: str | None = None, time_to_utc: str | None = None,
     ) -> list[StoredMessage]:
         with self._connect() as connection:
-            clauses = ["chat_id=?", "role IN ('client', 'internal')"]
+            clauses = ["chat_id=?", "role IN ('client', 'internal', 'owner')"]
             params: list[object] = [chat_id]
             if time_from_utc is not None:
                 clauses.append("telegram_date >= ?"); params.append(time_from_utc)
@@ -1361,6 +1405,10 @@ class ChatThreadStore:
             media_mime=str(row["media_mime"] or "") if "media_mime" in keys else "",
             media_filename=str(row["media_filename"] or "") if "media_filename" in keys else "",
             media_group_id=str(row["media_group_id"] or "") if "media_group_id" in keys else "",
+            media_file_unique_id=str(row["media_file_unique_id"] or "") if "media_file_unique_id" in keys else "",
+            forward_origin=str(row["forward_origin"] or "") if "forward_origin" in keys else "",
+            download_status=str(row["download_status"] or "") if "download_status" in keys else "",
+            download_error=str(row["download_error"] or "") if "download_error" in keys else "",
         )
 
     def get_chat_state(self, telegram_chat_id: int) -> dict:
@@ -1592,7 +1640,7 @@ class ChatThreadStore:
         self, chat_id: int, *, time_from_utc: str | None = None, time_to_utc: str | None = None,
         limit: int = 200,
     ) -> tuple[list[StoredMessage], int, bool]:
-        clauses = ["chat_id=?", "role IN ('client', 'internal')"]
+        clauses = ["chat_id=?", "role IN ('client', 'internal', 'owner')"]
         params: list[object] = [chat_id]
         if time_from_utc is not None:
             clauses.append("telegram_date >= ?"); params.append(time_from_utc)

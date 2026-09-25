@@ -24,7 +24,7 @@ from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
-from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, purge_expired_media
+from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, media_file_ready, purge_expired_media
 from agentbridge.restart import self_restart_supported, spawn_restart_helper
 from agentbridge.transcribe import TranscriptionError, transcribe_audio_file
 from .formatter import (
@@ -559,7 +559,9 @@ def create_telegram_application(
 
     async def _retry_pending_deliveries(bot) -> None:
         if media_dir is not None:
-            purge_expired_media(media_dir, media_ttl_seconds)
+            store = getattr(message_service, "store", None)
+            retained = store.retained_document_paths() if store is not None else set()
+            purge_expired_media(media_dir, media_ttl_seconds, retained_paths=retained)
         pending = getattr(message_service, "pending_suggestions", None)
         if pending is not None:
             try:
@@ -710,6 +712,14 @@ def create_telegram_application(
         sender = update.effective_user
         reply = getattr(message, "reply_to_message", None) if message is not None else None
         media = describe_message_media(message)
+        source = getattr(message, "forward_origin", None)
+        forward_origin = ""
+        if source is not None:
+            origin_sender = getattr(source, "sender_user", None)
+            forward_origin = str(getattr(origin_sender, "full_name", "") or getattr(source, "sender_user_name", "") or type(source).__name__)
+        elif getattr(message, "forward_from", None) is not None:
+            forward_origin = str(getattr(message.forward_from, "full_name", "") or "")
+        document = getattr(message, "document", None)
         item = IncomingMessage(
             sender_name=getattr(sender, "full_name", "") if sender else "",
             text=message_text(message),
@@ -723,6 +733,8 @@ def create_telegram_application(
             media_mime=media.mime if media is not None else "",
             media_filename=media.filename if media is not None else "",
             media_group_id=media.media_group_id if media is not None else "",
+            media_file_unique_id=str(getattr(document, "file_unique_id", "") or ""),
+            forward_origin=forward_origin,
         )
         ingest = getattr(message_service, "ingest_telegram_message", None)
         if ingest is not None and message is not None:
@@ -741,6 +753,8 @@ def create_telegram_application(
                 media_mime=item.media_mime,
                 media_filename=item.media_filename,
                 media_group_id=item.media_group_id,
+                media_file_unique_id=item.media_file_unique_id,
+                forward_origin=item.forward_origin,
             )
             last_ingest_at = time.monotonic()
         return item
@@ -761,6 +775,27 @@ def create_telegram_application(
             path = await materialize_media_ref(bot, ref, media_dir, row.chat_id, row.message_id)
             if path is not None:
                 saver(row.id, str(path))
+            else:
+                failure = getattr(message_service, "set_message_media_failure", None)
+                if failure is not None:
+                    failure(row.id, "telegram_download_failed_or_size_limit")
+
+    async def _fetch_chat_documents(chat_id: int) -> None:
+        listing = getattr(message_service, "store", None)
+        if listing is None or media_dir is None:
+            return
+        for row in listing.list_chat_attachments(chat_id):
+            if media_file_ready(row.media_path) or not row.telegram_file_id:
+                continue
+            ref = MediaRef(kind="document", file_id=row.telegram_file_id, filename=row.media_filename, mime=row.media_mime)
+            path = await materialize_media_ref(application.bot, ref, media_dir, row.chat_id, row.message_id)
+            if path is None:
+                listing.set_media_download_failure(row.id, "telegram_download_failed_or_size_limit")
+            else:
+                listing.set_media_path(row.id, str(path))
+
+    if hasattr(message_service, "attachment_fetcher"):
+        message_service.attachment_fetcher = _fetch_chat_documents
 
     def _track_voice_task(chat_id: int, task: asyncio.Task[None]) -> None:
         voice_tasks.setdefault(chat_id, set()).add(task)

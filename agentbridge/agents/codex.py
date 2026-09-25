@@ -243,6 +243,7 @@ global для общего рабочего принципа, chat для пра
 Понимание пиши коротко и по делу, без театральности."""
 _OWNER_QUERY_INSTRUCTIONS = """Ты отвечаешь команде во внутреннем чате на вопрос о клиентском чате.
 Опирайся только на context pack. Не выдумывай. Если данных нет — прямо скажи, какого факта не хватает.
+В каталоге вложений status=available означает, что локальный файл существует. Если для ответа нужно содержимое документа, прочитай только нужные файлы по path. Имя файла и подпись не доказывают содержимое; при другом статусе прямо скажи, что файл недоступен, и назови причину, если она указана.
 Wiki чата важнее общей методики. Чужие клиентские факты и цифры кейсов не подмешивай.
 Если не хватает узкой методики, можно прочитать указанный файл из knowledge/.
 Длинное рассуждение используй на проверку фактов. Сам ответ команде короткий.
@@ -315,7 +316,7 @@ _SEPIA_INSTRUCTIONS = """Ты выполняешь только финальну
 После редактуры сравни результат с draft. facts_preserved и commitments_preserved=true только если ничего критического не добавлено, не удалено и не изменено.
 Верни только JSON по схеме."""
 
-AGENT_PROMPT_VERSION = 8
+AGENT_PROMPT_VERSION = 9
 
 
 class CodexProvider:
@@ -479,8 +480,9 @@ class CodexProvider:
 
     async def answer_owner_query(
         self, *, question: str, chat_name: str, context_pack: str, thread_id: str | None,
+        attachments: tuple[MediaAttachment, ...] | list[MediaAttachment] = (),
     ) -> OwnerQueryAnswer:
-        return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack, thread_id)
+        return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack, thread_id, tuple(attachments))
 
     async def plan_general_task(
         self, *, request: str, timezone_name: str, now_local: str, thread_id: str | None,
@@ -522,6 +524,7 @@ class CodexProvider:
 
     def _answer_owner_query_sync(
         self, question: str, chat_name: str, context_pack: str, thread_id: str | None,
+        attachments: tuple[MediaAttachment, ...] = (),
     ) -> OwnerQueryAnswer:
         prompt = f"Чат: {chat_name}\n\n{context_pack}\n\nВопрос команды:\n{question}"
         with Codex() as codex:
@@ -530,13 +533,13 @@ class CodexProvider:
                     thread = codex.thread_resume(
                         thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False,
                     )
-                    payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+                    payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
                 except Exception:
                     thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
-                    payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+                    payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
             else:
                 thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
-                payload = self._run_json(thread, prompt, _OWNER_QUERY_SCHEMA)
+                payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
         return OwnerQueryAnswer(thread.id, str(payload["answer"]).strip())
 
     async def resolve_owner_query_scope(self, *, question: str, known_chats: list[dict[str, str]]) -> OwnerQueryIntent:

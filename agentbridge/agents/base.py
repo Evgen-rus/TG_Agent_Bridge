@@ -134,6 +134,7 @@ class AgentProvider(Protocol):
         chat_name: str,
         context_pack: str,
         thread_id: str | None,
+        attachments: Sequence[MediaAttachment] = (),
     ) -> OwnerQueryAnswer: ...
 
     async def plan_general_task(

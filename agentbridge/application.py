@@ -72,6 +72,8 @@ class IncomingMessage:
     media_mime: str = ""
     media_filename: str = ""
     media_group_id: str = ""
+    media_file_unique_id: str = ""
+    forward_origin: str = ""
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,7 @@ class AgentBridgeApplication:
         self.provider = provider
         self.owner_provider = owner_provider or provider
         self.owner_chat_id = owner_chat_id
+        self.attachment_fetcher = None
         self.owner_timezone = owner_timezone
         self.episode_size = max(1, episode_size)
         self.chats_dir = chats_dir
@@ -192,6 +195,8 @@ class AgentBridgeApplication:
         media_mime: str = "",
         media_filename: str = "",
         media_group_id: str = "",
+        media_file_unique_id: str = "",
+        forward_origin: str = "",
     ) -> bool:
         if is_owner_chat:
             role = "owner"
@@ -201,10 +206,10 @@ class AgentBridgeApplication:
             if chat is None:
                 if not self.store.has_open_onboarding(chat_id):
                     return False
-                role = "internal" if self._is_internal_sender(chat_id, sender_name) else "client"
+                role = self._sender_role(chat_id, sender_id, sender_name)
                 status = "held"
             else:
-                role = "internal" if self._is_internal_sender(chat_id, sender_name) else "client"
+                role = self._sender_role(chat_id, sender_id, sender_name)
                 status = "pending"
         return self.store.ingest_telegram_message(
             update_id=update_id,
@@ -223,6 +228,8 @@ class AgentBridgeApplication:
             media_mime=media_mime,
             media_filename=media_filename,
             media_group_id=media_group_id,
+            media_file_unique_id=media_file_unique_id,
+            forward_origin=forward_origin,
         )
 
     def pending_media_downloads(self, telegram_chat_id: int) -> list[StoredMessage]:
@@ -233,6 +240,19 @@ class AgentBridgeApplication:
 
     def set_message_media_path(self, message_id: int, media_path: str) -> None:
         self.store.set_media_path(message_id, media_path)
+
+    def set_message_media_failure(self, message_id: int, error: str) -> None:
+        self.store.set_media_download_failure(message_id, error)
+
+    def _sender_role(self, chat_id: int, sender_id: int | None, sender_name: str) -> str:
+        if self.store.owner_sender_seen(self.owner_chat_id, sender_id):
+            return "owner"
+        return "internal" if self._is_internal_sender(chat_id, sender_name) else "client"
+
+    def _stored_role(self, item: StoredMessage) -> str:
+        if item.role == "client" and self.store.owner_sender_seen(self.owner_chat_id, item.sender_id):
+            return "owner"
+        return item.role
 
     def pending_voice_messages(self, telegram_chat_id: int) -> list[StoredMessage]:
         return [
@@ -324,7 +344,7 @@ class AgentBridgeApplication:
     def _ingest_incoming(self, telegram_chat_id: int, item: IncomingMessage) -> None:
         if item.update_id is None or not has_message_content(item.text, item.media_kind, item.telegram_file_id):
             return
-        role = "internal" if self._is_internal_sender(telegram_chat_id, item.sender_name) else "client"
+        role = self._sender_role(telegram_chat_id, item.sender_id, item.sender_name)
         self.store.ingest_telegram_message(
             update_id=item.update_id,
             chat_id=telegram_chat_id,
@@ -342,6 +362,8 @@ class AgentBridgeApplication:
             media_mime=item.media_mime,
             media_filename=item.media_filename,
             media_group_id=item.media_group_id,
+            media_file_unique_id=item.media_file_unique_id,
+            forward_origin=item.forward_origin,
         )
 
     def _claim_incoming(self, telegram_chat_id: int, messages: list[IncomingMessage]) -> list[StoredMessage]:
@@ -486,12 +508,14 @@ class AgentBridgeApplication:
 
     def _discard_local_media(self, rows: list[StoredMessage]) -> None:
         for row in rows:
-            delete_media_file(row.media_path)
-        self.store.clear_media_paths([row.id for row in rows])
+            if row.media_kind != "document":
+                delete_media_file(row.media_path)
+        self.store.clear_media_paths([row.id for row in rows if row.media_kind != "document"])
 
     def _discard_incoming_media(self, messages: list[IncomingMessage]) -> None:
         for item in messages:
-            delete_media_file(item.media_path)
+            if item.media_kind != "document":
+                delete_media_file(item.media_path)
 
     def _apply_state_update(self, telegram_chat_id: int, candidate_state: dict | None, situation: str) -> None:
         current = self.store.get_chat_state(telegram_chat_id)
@@ -551,7 +575,7 @@ class AgentBridgeApplication:
         parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2))
         if recent:
             history = "\n".join(
-                f"{item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
+                f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
                 for item in recent
             )
             if time_from_utc is not None or time_to_utc is not None:
@@ -1357,7 +1381,7 @@ class AgentBridgeApplication:
             chat.telegram_chat_id, time_from_utc=scope.time_from_utc, time_to_utc=scope.time_to_utc, limit=200,
         )
         state = self.store.get_chat_state(chat.telegram_chat_id)
-        history = "\n".join(f"{item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
+        history = "\n".join(f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}: {display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
         parts = [f"Клиент: {chat.name}", f"Период: {scope.time_label}", f"Wiki:\n{chat.wiki or '(пусто)'}"]
         shared = self._shared_knowledge(chat)
         if shared:
@@ -1373,6 +1397,8 @@ class AgentBridgeApplication:
     async def _answer_owner_query_for_chat(
         self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None,
     ) -> str:
+        if self.attachment_fetcher is not None:
+            await self.attachment_fetcher(chat.telegram_chat_id)
         answerer = getattr(self.owner_provider, "answer_owner_query", None)
         pack = self._context_pack(
             chat,
@@ -1380,11 +1406,34 @@ class AgentBridgeApplication:
             time_to_utc=scope.time_to_utc if scope else None,
             time_label=scope.time_label if scope else "",
         )
+        files = self.store.list_chat_attachments(chat.telegram_chat_id)
+        if files:
+            catalog = []
+            for item in files:
+                available = media_file_ready(item.media_path)
+                status = "available" if available else "attachment_missing" if item.download_status == "available" else item.download_status or "attachment_missing"
+                catalog.append(
+                    f"attachment_id={item.id}; chat_id={item.chat_id}; message_id={item.message_id}; "
+                    f"time={item.telegram_date}; sender={item.sender_name}; role={self._stored_role(item)}; "
+                    f"forwarded_from={item.forward_origin}; filename={item.media_filename}; mime={item.media_mime}; "
+                    f"file_id={item.telegram_file_id}; file_unique_id={item.media_file_unique_id}; "
+                    f"status={status}; error={item.download_error}; path={item.media_path if available else ''}"
+                )
+            pack += "\n\nВложения чата (открывай только файлы со status=available по указанному path; имя файла не доказывает содержимое):\n" + "\n".join(catalog)
         if answerer is not None:
             thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
-            result = await answerer(
-                question=question, chat_name=chat.name, context_pack=pack, thread_id=thread_id,
-            )
+            requested_numbers = set(re.findall(r"(?<!\d)\d{3,}(?!\d)", question))
+            selected = [
+                item for item in files if media_file_ready(item.media_path) and (
+                    requested_numbers.intersection(re.findall(r"\d{3,}", item.media_filename))
+                    or f"attachment_id={item.id}" in question
+                    or (item.media_filename and item.media_filename.casefold() in question.casefold())
+                )
+            ]
+            args = {"question": question, "chat_name": chat.name, "context_pack": pack, "thread_id": thread_id}
+            if selected:
+                args["attachments"] = tuple(MediaAttachment(item.media_path, item.media_kind, item.media_mime, item.media_filename) for item in selected)
+            result = await answerer(**args)
             if isinstance(result, OwnerQueryAnswer):
                 self.store.save_owner_query_thread(
                     chat.telegram_chat_id,
@@ -1648,7 +1697,7 @@ class AgentBridgeApplication:
     def _split_internal_messages(
         self, telegram_chat_id: int, messages: list[IncomingMessage],
     ) -> tuple[list[IncomingMessage], list[IncomingMessage]]:
-        internal = [item for item in messages if self._is_internal_sender(telegram_chat_id, item.sender_name)]
+        internal = [item for item in messages if self._sender_role(telegram_chat_id, item.sender_id, item.sender_name) in {"internal", "owner"}]
         return internal, [item for item in messages if item not in internal]
 
 
@@ -1678,6 +1727,8 @@ def _from_stored(item: StoredMessage) -> IncomingMessage:
         media_mime=item.media_mime,
         media_filename=item.media_filename,
         media_group_id=item.media_group_id,
+        media_file_unique_id=item.media_file_unique_id,
+        forward_origin=item.forward_origin,
     )
 
 

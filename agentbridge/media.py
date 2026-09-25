@@ -101,7 +101,7 @@ def delete_media_file(path: str | Path | None) -> None:
         return
 
 
-def purge_expired_media(root: Path, ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS, *, now: float | None = None) -> int:
+def purge_expired_media(root: Path, ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS, *, now: float | None = None, retained_paths: set[str] | None = None) -> int:
     """Удаляет локальные копии старше ttl. Метаданные и file_id в SQLite не трогает."""
     if ttl_seconds <= 0 or not root.exists():
         return 0
@@ -109,6 +109,8 @@ def purge_expired_media(root: Path, ttl_seconds: int = DEFAULT_MEDIA_TTL_SECONDS
     removed = 0
     for path in root.rglob("*"):
         if not path.is_file():
+            continue
+        if str(path) in (retained_paths or set()):
             continue
         try:
             if path.stat().st_mtime < cutoff:

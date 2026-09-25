@@ -12,14 +12,14 @@ Telegram long polling (drop_pending_updates=False)
   -> persist each relevant update in SQLite (durable inbox/history)
   -> transcribe voice notes in the background (TRANSCRIPTION_MODEL via
      AgentBridge.transcribe, transcript stored by update_id in SQLite)
-  -> download current-episode photos/PDFs via saved file_id into runtime/media
+  -> download current-episode photos/documents via saved file_id into runtime/media
   -> live debounce per chat, or catch-up after restart
   -> application: episode from stored messages, context pack, Rick model turn
   -> AgentProvider (images as LocalImageInput, other files as MentionInput)
   -> CodexProvider: start or resume the chat's Codex thread
   -> optional ephemeral Sepia refactor turn with draft + compact facts only
   -> lightweight fact/commitment flags + exact number/link guard
-  -> delete local media copies; keep file_id in SQLite
+  -> delete temporary photo/voice copies; retain documents and file_id in SQLite
   -> update chat_state
   -> telegram.formatter
   -> OWNER_CHAT_ID only
@@ -133,8 +133,8 @@ a series of outdated recommendations.
   `wiki.md` into a registry keyed by Telegram chat ID.
 - `agentbridge/knowledge.py`: compact shared knowledge pack loader (`core.md`
   plus an on-demand file index).
-- `agentbridge/media.py`: short-lived local copies of client photos/PDFs
-  (deleted after the episode, TTL 1 hour) plus labels for history.
+- `agentbridge/media.py`: temporary photos/voice copies (TTL 1 hour), retained
+  document copies, and labels for history.
 - `agentbridge/transcribe.py`: OpenAI speech-to-text call used for client voice
   notes; the configured `TRANSCRIPTION_MODEL` is the only transcription model.
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
@@ -242,11 +242,14 @@ failure leaves the inbox row pending.
 - A live Python process is not considered proof of Telegram polling health;
   `getUpdates` heartbeat progress is monitored independently and stale polling
   is recovered without dropping Telegram backlog.
-- Client photos, PDFs, and media albums are analysed in that chat's Codex
-  thread. Local files are working copies only (deleted after a successful
-  episode, and anyway after `MEDIA_TTL_SECONDS`, default 1 hour). SQLite keeps
-  Telegram `file_id` so a later turn can re-download. The bot cannot scroll a
-  group's history like a user account.
+- Client photos, documents, and media albums are analysed in that chat's Codex
+  thread. Document copies remain under `runtime/media`; SQLite keeps Telegram
+  `file_id`, timestamp, sender role, forwarding origin, and download status.
+  Owner queries list that chat's document metadata and attach only documents
+  whose numbers are explicitly mentioned in the question. Missing copies of
+  processed documents are re-downloaded from saved `file_id` when the owner
+  queries that chat. Photo and voice copies remain temporary. The bot cannot
+  scroll a group's history like a user account.
 - Voice notes follow the same persist-first path: the row is stored before any
   model work, then transcribed in the background during the batch window (or at
   catch-up after restart). The transcript is stored by `update_id`; Codex sees

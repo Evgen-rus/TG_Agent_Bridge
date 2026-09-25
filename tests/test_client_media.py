@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 
@@ -36,6 +37,7 @@ class FakeDocument:
     file_name: str = "scan.pdf"
     mime_type: str = "application/pdf"
     file_size: int = 2048
+    file_unique_id: str = "unique-pdf"
 
 
 @dataclass
@@ -46,6 +48,8 @@ class FakeMessage:
     document: object | None = None
     media_group_id: str | None = None
     message_id: int = 101
+    date: datetime | None = None
+    forward_origin: object | None = None
 
 
 @dataclass
@@ -108,6 +112,16 @@ def test_purge_expired_media_keeps_fresh_files(tmp_path) -> None:
     assert removed == 1
     assert not old.exists()
     assert fresh.exists()
+
+
+def test_purge_keeps_retained_document(tmp_path) -> None:
+    root = tmp_path / "media"
+    pdf = root / "123" / "invoice.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF")
+    os.utime(pdf, (1, 1))
+    assert purge_expired_media(root, ttl_seconds=60, now=1000, retained_paths={str(pdf)}) == 0
+    assert pdf.exists()
 
 
 def test_photo_and_pdf_are_detected_from_telegram_payload() -> None:
@@ -176,7 +190,127 @@ async def test_album_and_pdf_stay_in_one_chat_episode(tmp_path, chat_registry) -
     assert len(provider.calls[0]["attachments"]) == 3
     assert provider.calls[0]["attachments"][2].filename == "scan.pdf"
     assert "scan.pdf" in provider.calls[0]["message"]
-    assert not first.exists() and not second.exists() and not pdf.exists()
+    assert not first.exists() and not second.exists() and pdf.exists()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_owner_invoice_and_client_payment_remain_readable(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    store.ingest_telegram_message(
+        update_id=1, chat_id=7654321, message_id=1, sender_id=42, sender_name="Owner",
+        telegram_date="2026-09-25T05:00:00+00:00", text="привет", reply_to_message_id=None,
+        role="owner", processing_status="ignored",
+    )
+    class OwnerProvider:
+        calls: list[dict] = []
+        async def answer_owner_query(self, **kwargs):
+            self.calls.append(kwargs)
+            return "ok"
+    owner_provider = OwnerProvider()
+    service = AgentBridgeApplication(chat_registry, store, FakeProvider(), owner_chat_id=7654321, owner_provider=owner_provider)
+    app = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0, media_dir=tmp_path / "media")
+    bot = DownloadingBot()
+    callback = app.handlers[0][0].callback
+    invoice = FakeMessage(
+        document=FakeDocument("invoice-id", "Счёт №580.pdf"), caption="Счёт",
+        message_id=7300, date=datetime(2026, 9, 25, 5, 4, 19, tzinfo=timezone.utc),
+        forward_origin=type("Origin", (), {"sender_user": type("User", (), {"full_name": "Дмитрий"})()})(),
+    )
+    payment = FakeMessage(
+        document=FakeDocument("payment-id", "Платежное поручение №195.pdf"),
+        message_id=7305, date=datetime(2026, 9, 25, 5, 46, 59, tzinfo=timezone.utc),
+    )
+    context = type("Ctx", (), {"bot": bot})()
+    await callback(FakeUpdate(invoice, FakeChat(), FakeUser("Owner", id=42), 501), context)
+    await callback(FakeUpdate(payment, FakeChat(), FakeUser("Анатолий", id=55), 502), context)
+    await asyncio.sleep(0.1)
+    files = store.list_chat_attachments(-100123456)
+    assert [(row.media_filename, row.role) for row in files] == [
+        ("Счёт №580.pdf", "owner"), ("Платежное поручение №195.pdf", "client"),
+    ]
+    assert files[0].forward_origin == "Дмитрий"
+    assert files[0].media_file_unique_id == "unique-pdf"
+    assert files[0].telegram_date == "2026-09-25T05:04:19+00:00"
+    assert files[1].telegram_date == "2026-09-25T05:46:59+00:00"
+    assert all(row.download_status == "available" and Path(row.media_path).read_bytes() == b"fake-image" for row in files), [(row.download_status, row.media_path) for row in files]
+    await service._answer_owner_query_for_chat(chat_registry.get(-100123456), "Сравни счёт 580 и платежку 195")
+    assert len(owner_provider.calls[-1]["attachments"]) == 2
+    assert "05:04:19" in owner_provider.calls[-1]["context_pack"]
+    assert "05:46:59" in owner_provider.calls[-1]["context_pack"]
+
+
+def test_owner_document_without_forward_is_classified_and_listed(tmp_path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    store.ingest_telegram_message(
+        update_id=1, chat_id=7654321, message_id=1, sender_id=42, sender_name="Owner",
+        telegram_date="2026-09-25T05:00:00+00:00", text="ready", reply_to_message_id=None,
+        role="owner", processing_status="ignored",
+    )
+    service = AgentBridgeApplication(chat_registry, store, FakeProvider(), owner_chat_id=7654321)
+    service.ingest_telegram_message(
+        update_id=2, chat_id=-100123456, message_id=2, sender_id=42, sender_name="Owner",
+        telegram_date="2026-09-25T05:04:00+00:00", text="счёт", reply_to_message_id=None,
+        is_owner_chat=False, media_kind="document", telegram_file_id="invoice", media_filename="invoice.pdf",
+    )
+    row = store.list_chat_attachments(-100123456)[0]
+    assert (row.role, row.forward_origin, row.download_status) == ("owner", "", "pending")
+
+
+@pytest.mark.asyncio
+async def test_processed_document_is_refetched_for_owner_query(tmp_path, chat_registry, monkeypatch) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    store.ingest_telegram_message(
+        update_id=11, chat_id=-100123456, message_id=10, sender_id=5, sender_name="Alice",
+        telegram_date="2026-09-25T05:00:00+00:00", text="", reply_to_message_id=None,
+        role="client", processing_status="processed", media_kind="document",
+        telegram_file_id="old-file", media_filename="Счёт №580.pdf", media_mime="application/pdf",
+    )
+    class OwnerProvider:
+        calls: list[dict] = []
+        async def answer_owner_query(self, **kwargs):
+            self.calls.append(kwargs)
+            return "ok"
+    owner_provider = OwnerProvider()
+    service = AgentBridgeApplication(chat_registry, store, FakeProvider(), owner_chat_id=7654321, owner_provider=owner_provider)
+    create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0, media_dir=tmp_path / "media")
+    async def fetch(_bot, _ref, root, chat_id, message_id):
+        path = root / str(chat_id) / f"{message_id}_recovered.pdf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"%PDF recovered")
+        return path
+    monkeypatch.setattr("agentbridge.telegram.bot.materialize_media_ref", fetch)
+    await service._answer_owner_query_for_chat(chat_registry.get(-100123456), "Проверь счёт 580")
+    row = store.list_chat_attachments(-100123456)[0]
+    assert row.download_status == "available"
+    assert Path(row.media_path).read_bytes() == b"%PDF recovered"
+    assert len(owner_provider.calls[-1]["attachments"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_document_download_is_reported(tmp_path, chat_registry, monkeypatch) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    store.ingest_telegram_message(
+        update_id=12, chat_id=-100123456, message_id=11, sender_id=5, sender_name="Alice",
+        telegram_date="2026-09-25T05:00:00+00:00", text="", reply_to_message_id=None,
+        role="client", processing_status="processed", media_kind="document",
+        telegram_file_id="missing-file", media_filename="missing.pdf", media_mime="application/pdf",
+    )
+    class OwnerProvider:
+        calls: list[dict] = []
+        async def answer_owner_query(self, **kwargs):
+            self.calls.append(kwargs)
+            return "ok"
+    owner_provider = OwnerProvider()
+    service = AgentBridgeApplication(chat_registry, store, FakeProvider(), owner_chat_id=7654321, owner_provider=owner_provider)
+    create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0, media_dir=tmp_path / "media")
+    async def fail(_bot, _ref, _root, _chat_id, _message_id):
+        return None
+    monkeypatch.setattr("agentbridge.telegram.bot.materialize_media_ref", fail)
+    await service._answer_owner_query_for_chat(chat_registry.get(-100123456), "Проверь missing.pdf")
+    row = store.list_chat_attachments(-100123456)[0]
+    assert row.download_status == "download_failed" and row.download_error
+    assert "status=download_failed" in owner_provider.calls[-1]["context_pack"]
+    assert "attachments" not in owner_provider.calls[-1]
 
 
 @pytest.mark.asyncio
