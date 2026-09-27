@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from types import SimpleNamespace
 import asyncio
 
@@ -119,17 +120,55 @@ def test_restart_counts_as_done_when_the_process_is_already_dying(tmp_path, monk
     spawn_restart_helper(old_pid=1, project_root=tmp_path, python_executable=tmp_path / "unused")
 
 
-def test_restart_still_fails_when_the_process_survives_a_rejection(tmp_path, monkeypatch) -> None:
+def test_restart_treats_a_signalled_child_as_success(tmp_path, monkeypatch) -> None:
+    """Реальный механизм на VPS: KillMode=control-group убивает дочерний systemctl.
+
+    Юнит работает с `KillMode=control-group`, поэтому systemd останавливает весь
+    контрольный набор вместе с дочерним `systemctl`, который сам только что
+    отдал приказ. `subprocess.run` возвращает `-15`, хотя приказ отработал и
+    сервис штатно перезапустился. Раньше именно это читалось как отказ.
+
+    Именно этот сценарий воспроизводился на VPS, поэтому он проверяется
+    отдельным тестом, а не через `process_is_going_away`."""
+    monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Linux")
+    monkeypatch.setenv("INVOCATION_ID", "test")
+    # Минус в коде возврата = убит сигналом = нас уже остановили.
+    monkeypatch.setattr("agentbridge.restart.subprocess.run", lambda args, **kwargs: SimpleNamespace(returncode=-15))
+    # Процесс при этом ЖИВ: python-telegram-bot ловит SIGTERM и сначала гасит
+    # приложение, только потом завершается.
+    monkeypatch.setattr("agentbridge.restart.process_is_going_away", lambda pid: False)
+    # Ошибки нет: приказ systemctl отработал, нас убили уже после этого.
+    spawn_restart_helper(old_pid=1, project_root=tmp_path, python_executable=tmp_path / "unused")
+
+
+def test_restart_reports_a_real_rejection_while_the_process_survives(tmp_path, monkeypatch) -> None:
     """Настоящий отказ systemctl честно сообщается владельцу.
 
-    Если процесс жив и код возврата ненулевой, рестарт не начнётся сам —
-    молчать об этом нельзя, иначе владелец будет ждать перезапуска, которого
-    не будет."""
+    Если процесс жив, код возврата положительный и он ненулевой, рестарт не
+    начнётся сам — молчать об этом нельзя, иначе владелец будет ждать
+    перезапуска, которого не будет."""
     monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Linux")
     monkeypatch.setenv("INVOCATION_ID", "test")
     monkeypatch.setattr("agentbridge.restart.subprocess.run", lambda args, **kwargs: SimpleNamespace(returncode=1))
     monkeypatch.setattr("agentbridge.restart.process_is_going_away", lambda pid: False)
     with pytest.raises(RuntimeError, match="was rejected"):
+        spawn_restart_helper(old_pid=1, project_root=tmp_path, python_executable=tmp_path / "unused")
+
+
+def test_restart_reports_a_timeout_while_the_process_survives(tmp_path, monkeypatch) -> None:
+    """Зависший systemctl при живом процессе — тоже настоящий отказ.
+
+    `--no-block` возвращается почти мгновенно, поэтому зависание при живом
+    процессе означает, что запрос не ушёл и перезапуск не начнётся."""
+    monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Linux")
+    monkeypatch.setenv("INVOCATION_ID", "test")
+
+    def _timeout(args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=5)
+
+    monkeypatch.setattr("agentbridge.restart.subprocess.run", _timeout)
+    monkeypatch.setattr("agentbridge.restart.process_is_going_away", lambda pid: False)
+    with pytest.raises(RuntimeError, match="timed out"):
         spawn_restart_helper(old_pid=1, project_root=tmp_path, python_executable=tmp_path / "unused")
 
 

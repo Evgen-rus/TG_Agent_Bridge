@@ -13,11 +13,11 @@ def self_restart_supported() -> bool:
 def process_is_going_away(pid: int) -> bool:
     """Жив ли ещё процесс, который сейчас держит SQLite и Telegram.
 
-    Нужен, чтобы отличить состоявшийся перезапуск от отказа. `systemctl
-    --no-block restart` останавливает сервис, а значит и сам процесс Рика, и
-    возврата из `subprocess.run` может не быть вовсе:нас убивают в момент
-    вызова. Код возврата в такой ситуации — это не «systemctl отказал», а
-    «нас не дождались», поэтому по нему судить нельзя.
+    Вспомогательная проверка, а не основной критерий. Процесс при штатном
+    перезапуске остаётся жив ещё несколько секунд: python-telegram-botics
+    ловит SIGTERM через event loop и сначала корректно гасит приложение.
+    Поэтому на момент проверки процесс обычно ещё на месте, даже когда
+    перезапуск уже идёт.
     """
     try:
         os.kill(pid, 0)
@@ -32,26 +32,40 @@ def process_is_going_away(pid: int) -> bool:
 def spawn_restart_helper(*, old_pid: int, project_root: Path, python_executable: Path) -> None:
     """Запросить перезапуск и вернуться, только если он точно не состоялся.
 
-    Ошибка поднимается в одном-единственном случае: команда вернулась, процесс
-    на месте, и код возврата ненулевой. Тогда systemctl отказал по-настоящему
-    (например, правило sudoers снесли) и Рик должен честно сказать об этом.
+    Ключевой момент: юнит работает с `KillMode=control-group`, поэтому systemd
+    по сигналу останавливает весь контрольный набор, а вместе с ним и дочерний
+    `systemctl`, который сам же только что отдал приказ. Дочерний процесс
+    умирает от SIGTERM, и `subprocess.run` возвращает `-15`.
 
-    Все остальные исходы — успех. Процесс не дождал ответа, потому что его
-    остановили, и рестарт уже в работе. Раньше здесь поднималась ошибка по
-    любому ненулевому коду, и Рик после каждого удачного перезапуска писал
-    владельцу «не смог», хотя сервис штатно поднимался через пару секунд.
+    Минус в коде возврата — это не «systemctl отказал», а «нас остановили».
+    Считать минус отказом нельзя: именно это происходило при каждом удачном
+    перезапуске, и владелец получал «не смог запустить перезапуск» от живого
+    и исправного сервиса.
+
+    Настоящий отказ выглядит иначе: systemctl отвечает кодом 1 и при этом
+    никто не посылает нам сигнал. Только его и считаем отказом.
     """
     if not self_restart_supported():
         raise RuntimeError("Self-restart requires the rick systemd service.")
-    result = subprocess.run(
-        ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "--no-block", "restart", "rick.service"],
-        cwd=project_root.resolve(), stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        timeout=5, check=False,
-    )
-    if not result.returncode:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "--no-block", "restart", "rick.service"],
+            cwd=project_root.resolve(), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # `--no-block` возвращается почти мгновенно, поэтому зависание здесь
+        # означает, что запрос уже ушёл, а ответ мы не дождались.
+        if not process_is_going_away(old_pid):
+            raise RuntimeError("Fixed systemd restart request timed out") from exc
+        return
+    if result.returncode == 0:
+        return
+    if result.returncode < 0:
+        # Нас остановили по KillMode=control-group: перезапуск уже выполняется,
+        # просто дочерний systemctl умер вместе с нами.
         return
     if process_is_going_away(old_pid):
-        # Нас успели остановить: systemd рестарт уже выполняет.
         return
     raise RuntimeError("Fixed systemd restart request was rejected")
