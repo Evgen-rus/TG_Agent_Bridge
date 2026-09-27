@@ -64,8 +64,8 @@ untagged.
 Replies to any delivered result of a completed general task start a new
 confirmable general task in the same persistent owner thread.
 An explicit self-restart request is also planned there; deterministic code
-performs it only after confirmation. Windows uses a detached Python helper;
-Linux under systemd requests only `/usr/bin/sudo -n /usr/bin/systemctl --no-block restart rick.service`.
+performs it only after confirmation. Under Linux systemd it requests only
+`/usr/bin/sudo -n /usr/bin/systemctl --no-block restart rick.service`.
 SQLite keeps the restart marker and the new process acknowledges it to the
 owner through existing durable delivery parts.
 

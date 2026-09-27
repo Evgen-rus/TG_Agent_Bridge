@@ -1319,7 +1319,7 @@ def create_telegram_application(
                     if not self_restart_supported():
                         if finish is not None:
                             finish(result.restart_marker_id, launched=False)
-                        await _send(context.bot, chat_id=owner_chat_id, text="Self-restart доступен только на Windows или внутри systemd.")
+                        await _send(context.bot, chat_id=owner_chat_id, text="Self-restart доступен только внутри systemd.")
                     else:
                         try:
                             await _send(

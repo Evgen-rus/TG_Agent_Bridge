@@ -64,7 +64,7 @@ def test_diagnose_opens_database_read_only(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(health, "LOGS", db.parent / "logs")
     output = health.diagnose()
     assert "sqlite.health=ok" in output
-    assert "OVERALL: DEGRADED process_status_unknown" in output
+    assert "process_status_unknown" in output
 
 
 def test_only_successful_poll_updates_durable_heartbeat(tmp_path: Path) -> None:

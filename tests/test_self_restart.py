@@ -38,33 +38,9 @@ async def test_restart_is_durable_and_only_created_after_confirmation(tmp_path, 
     assert store.pending_self_restart(-1) is None
 
 
-def test_restart_helper_uses_current_project_python_and_old_pid(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "project"
-    python = root / ".venv" / "Scripts" / "python.exe"
-    python.parent.mkdir(parents=True)
-    python.touch()
-    calls = []
-    ready = root / "runtime" / "restart-helper-123.ready"
-    monkeypatch.setattr("agentbridge.restart.self_restart_supported", lambda: True)
+def test_restart_helper_refuses_outside_systemd(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Windows")
-    monkeypatch.setattr("agentbridge.restart.time.sleep", lambda delay: ready.parent.mkdir(parents=True, exist_ok=True) or ready.touch())
-    monkeypatch.setattr(
-        "agentbridge.restart.subprocess.Popen",
-        lambda args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(poll=lambda: None),
-    )
-
-    spawn_restart_helper(old_pid=123, project_root=root, python_executable=python)
-
-    args, kwargs = calls[0]
-    assert ["--old-pid", "123"] == args[args.index("--old-pid"):args.index("--old-pid") + 2]
-    assert str(root.resolve()) in args and str(python.resolve()) in args
-    assert kwargs["cwd"] == root.resolve()
-    assert kwargs["creationflags"] & __import__("subprocess").CREATE_BREAKAWAY_FROM_JOB
-
-
-def test_restart_helper_refuses_non_windows(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Linux")
-    with pytest.raises(RuntimeError, match="requires Windows or a systemd service"):
+    with pytest.raises(RuntimeError, match="requires the rick systemd service"):
         spawn_restart_helper(old_pid=1, project_root=tmp_path, python_executable=tmp_path / "python")
 
 
