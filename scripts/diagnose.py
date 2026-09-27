@@ -131,13 +131,18 @@ def _codex_verdict(limit_active: bool, active_failures: list[str], codex_success
     - `active_usage_limit` — метка активна, есть свежий отказ именно по лимиту,
       и успеха после него нет. Это обычное состояние исчерпанного лимита, а не
       поломка: следующий запрос владельца его проверит и снимет метку.
-    - `stale_limit_flag` — метка активна, но после соответствующего отказа был
-      успешный turn. Значит метка пережила восстановление и её пора снять.
+    - `stale_limit_flag` — метка активна и доказанно пережила восстановление:
+      после отказа по лимиту в логах есть успешный turn. Единственное
+      состояние, где метку можно назвать устаревшей.
+    - `active_limit_unknown` — метка активна, а доказательств в логах нет
+      вовсе: отказа по лимиту не видно либо успех был раньше него. Состояние
+      не диагностируется, а не считается поломкой.
     - `real_failure` — свежие отказы есть, а про лимит ничего не известно.
     - `ok` — свежих отказов нет.
 
-    Без различения отказов по лимиту verdict не может уверенно отделить одно
-    от другого, поэтому в сомнении он не называет метку устаревшей."""
+    Раньше `limit_active` с пустым списком отказов сразу давал
+    `stale_limit_flag`, хотя успеха после лимита в логах могло не быть вовсе:
+    отсутствие улик выдавалось за доказательство."""
     limit_failures = limit_failures or []
     if active_failures:
         recent_limit = [item for item in limit_failures if _is_recent(item, codex_success)]
@@ -145,7 +150,14 @@ def _codex_verdict(limit_active: bool, active_failures: list[str], codex_success
             return "active_usage_limit (no success after the limit failure; next owner request probes Codex)"
         return f"real_failure ({len(active_failures)} failed turns after the last success)"
     if limit_active:
-        return "stale_limit_flag (limit marked active but recent turns succeed) — clearing on next turn"
+        if not limit_failures:
+            return "active_limit_unknown (limit marked active, but no limit failure in the last 7 days of logs)"
+        if not codex_success:
+            return "active_limit_unknown (limit marked active, but no successful Codex turn in the last 7 days of logs)"
+        newest_limit = max((_epoch(item) or 0.0 for item in limit_failures), default=None)
+        if newest_limit is None or (_epoch(codex_success) or 0.0) <= newest_limit:
+            return "active_usage_limit (limit marked active, last success predates the limit failure; next owner request probes Codex)"
+        return "stale_limit_flag (successful turn after the limit failure — clearing on next turn)"
     return "ok"
 
 

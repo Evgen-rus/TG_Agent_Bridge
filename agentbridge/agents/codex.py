@@ -6,6 +6,7 @@ import logging
 import time
 import re
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
@@ -641,6 +642,11 @@ class CodexProvider:
 
     def _run_json(self, thread, prompt: RunInput, schema: dict) -> dict:
         started = time.monotonic()
+        # Момент старта в UTC, а не длительность: по нему получатель события
+        # поймёт, мог ли этот turn знать о лимите, который возник уже в пути.
+        # Одних `time.monotonic()` для этого мало — это шкала процесса, которую
+        # не с чем сравнивать в базе.
+        turn_started_at = datetime.now(timezone.utc).isoformat()
         logger.info("event=codex_turn_started component=codex thread_id=%s model=%s effort=%s", thread.id, self.model, self.reasoning_effort)
         try:
             result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
@@ -660,7 +666,7 @@ class CodexProvider:
         except (json.JSONDecodeError, TypeError) as exc:
             logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=InvalidJson duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
             raise RuntimeError("Codex returned an invalid structured response") from exc
-        self._note_success()
+        self._note_success(turn_started_at)
         logger.info("event=codex_turn_finished component=codex thread_id=%s duration_ms=%d result=ok", thread.id, (time.monotonic() - started) * 1000)
         return payload
 
@@ -681,7 +687,7 @@ class CodexProvider:
         if callable(self.on_usage_limit):
             self.on_usage_limit(reset_hint)
 
-    def _note_success(self) -> None:
+    def _note_success(self, turn_started_at: str | None = None) -> None:
         """Сообщить, что лимит восстановился, и синхронизировать локальный флаг.
 
         Событие уходит при каждом успешном turn, а не только когда локальный
@@ -689,14 +695,20 @@ class CodexProvider:
         память расходится с durable состоянием в обе стороны, и опираться на
         неё — значит либо потерять настоящее уведомление о восстановлении,
         либо снести уже созданное новое состояние лимита. Решение всё равно
-        принимает storage, где оно идемпотентно и стоит одну транзакцию."""
+        принимает storage, где оно идемпотентно и стоит одну транзакцию.
+
+        `turn_started_at` передаётся дальше именно как причинная граница: этот
+        turn мог уйти в модель до того, как лимит возник, и тогда его успех не
+        относится к текущему лимиту. Провайдер об этом не решает — границу
+        сверяет storage с моментом последнего отказа по лимиту.
+        """
         recovered = self._usage_exhausted
         self._usage_exhausted = False
         if not callable(self.on_usage_recovered):
             return
         if recovered:
             logger.info("event=codex_usage_limit_recovered component=codex")
-        self.on_usage_recovered()
+        self.on_usage_recovered(turn_started_at)
 
 
 def _turn_input(prompt: str, attachments: tuple[MediaAttachment, ...] = ()) -> RunInput:

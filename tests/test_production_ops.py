@@ -13,6 +13,8 @@ from agentbridge.storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
     _CODEX_LIMIT_KEY,
     _CODEX_LIMIT_REASON_KEY,
+    _CODEX_LIMIT_RESET_AT_KEY,
+    _CODEX_LIMIT_SEEN_AT_KEY,
     _CODEX_RECOVERED_KEY,
     ChatThreadStore,
     codex_limit_notice,
@@ -66,14 +68,15 @@ class LimitBridge:
         local_hint = codex_limit_reset_local(
             reset_hint, self.owner_timezone, session_timezone_name=self.session_timezone,
         )
-        self.store.clear_operational_state(_CODEX_RECOVERED_KEY)
+        # Метки жизненного цикла не трогаем: сброс метки восстановления делает
+        # сам storage внутри той же транзакции, как и в agentbridge.main.
         self.store.claim_codex_usage_limit(
             reset_hint, codex_limit_notice(local_hint),
             source_timezone_name=self.session_timezone, local_hint=local_hint,
         )
 
-    def _on_recovered(self) -> None:
-        self.store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE)
+    def _on_recovered(self, turn_started_at: str | None = None) -> None:
+        self.store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE, turn_started_at=turn_started_at)
 
     def provider(self) -> CodexProvider:
         """Новый процесс: стартовое состояние берётся из SQLite."""
@@ -85,6 +88,36 @@ class LimitBridge:
 
     def notices(self) -> tuple[list[str], list[str]]:
         return _limit_deliveries(self.store)
+
+
+def _after_limit_start(store: ChatThreadStore, seconds: int = 5) -> str:
+    """Момент старта turn, заведомо позже последнего отказа по лимиту.
+
+    Такой turn «знал» о лимите, поэтому его успех подтверждает восстановление."""
+    seen = store.codex_usage_limit_probe_state().seen_at
+    assert seen is not None
+    return (seen + timedelta(seconds=seconds)).isoformat()
+
+
+def _future_seen_at(hours: int = 1) -> str:
+    """Метка «когда заметили лимит» из будущего.
+
+    Нужна, чтобы смоделировать turn, который стартовал раньше лимита: время
+    отказа уходит вперёд, и наивное сравнение с текущим временем не сработает."""
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
+def _limit_keys(store: ChatThreadStore) -> set[str]:
+    with sqlite3.connect(store.database_path) as conn:
+        return {row[0] for row in conn.execute("SELECT key FROM operational_state WHERE key LIKE 'codex_usage_limit%'")}
+
+
+def _recovery_delivery_ids(store: ChatThreadStore) -> list[int]:
+    """ID доставок о восстановлении по порядку: их счёт и есть проверка."""
+    with sqlite3.connect(store.database_path) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT id FROM owner_query_deliveries WHERE text LIKE '%снова отвечает%' ORDER BY id",
+        )]
 
 
 def test_daily_report_moscow_boundary_and_catchup() -> None:
@@ -206,8 +239,9 @@ def test_diagnose_reports_limit_lifecycle_and_probe_verdict(tmp_path: Path, monk
     assert "codex.limit_seen_at=2" in output  # метка времени лимита записана
     assert f"codex.limit_reset_hint={hint}" in output
     assert "codex.limit_recovery_probe=WAIT (before_reset_time" in output
-    # Метка активна, а свежих падений в логах нет — вердикт про устаревшую метку.
-    assert "codex.verdict=stale_limit_flag" in output
+    # Метка активна, но в логах нет ни отказа по лимиту, ни успеха: доказательств
+    # нет, поэтому вердикт не вправе назвать метку устаревшей.
+    assert "codex.verdict=active_limit_unknown" in output
 
 
 def test_diagnose_separates_real_codex_failure_from_stale_flag(tmp_path: Path, monkeypatch) -> None:
@@ -292,18 +326,51 @@ def test_codex_verdict_never_names_stale_without_evidence() -> None:
     было» по построению."""
     # Метка активна, свежий отказ по лимиту, успеха после него нет → лимит активен.
     assert health._codex_verdict(True, ["2026-09-27T07:30:00+00:00"], "2026-09-27T07:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("active_usage_limit")
-    # Отказ по лимиту был, но после него уже прошёл успех → метка устарела,
-    # и отказа после этого успеха в active_failures не остаётся.
+    # Доказанное восстановление: отказ по лимиту был, успех после него прошёл.
     assert health._codex_verdict(True, [], "2026-09-27T08:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("stale_limit_flag")
-    # Свежий отказ есть, но про лимит ничего не известно → настоящая поломка,
-    # даже при активной метке: угадывать лимит по одной метке нельзя.
+    # Свежий отказ есть, но про лимит ничего не известно → настоящая поломка.
     assert health._codex_verdict(True, ["2026-09-27T07:30:00+00:00"], "2026-09-27T07:00:00+00:00", []).startswith("real_failure")
-    # Отказ по лимиту был, но позже успех, и свежих отказов нет → метка устарела.
-    assert health._codex_verdict(True, [], "2026-09-27T08:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("stale_limit_flag")
     # Всё спокойно.
     assert health._codex_verdict(False, [], "2026-09-27T08:00:00+00:00", []) == "ok"
     # Метки лимита нет даже при отказах — это поломка, а не лимит.
     assert health._codex_verdict(False, ["2026-09-27T07:30:00+00:00"], "2026-09-27T07:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("real_failure")
+
+
+def test_active_limit_is_never_called_stale_without_a_proven_later_success() -> None:
+    """Метка активна, а доказательств в логах нет — вердикт нейтральный.
+
+    Отсутствие улик не доказательство: раньше `limit_active` с пустым списком
+    отказов сразу давал `stale_limit_flag`, хотя успеха после лимита в логах
+    могло не быть вовсе."""
+    # Метка активна, отказов по лимиту в логах нет вовсе.
+    assert health._codex_verdict(True, [], "2026-09-27T08:00:00+00:00", []).startswith("active_limit_unknown")
+    # Метка активна, отказ по лимиту есть, но успеха в логах нет вообще.
+    assert health._codex_verdict(True, [], None, ["2026-09-27T07:30:00+00:00"]).startswith("active_limit_unknown")
+    # Метка активна, отказ по лимиту был, а последний успех РАНЬШЕ него —
+    # это активный лимит, а не устаревшая метка.
+    verdict = health._codex_verdict(True, [], "2026-09-27T07:00:00+00:00", ["2026-09-27T07:30:00+00:00"])
+    assert verdict.startswith("active_usage_limit")
+
+
+def test_diagnose_reports_active_limit_unknown_without_logs(tmp_path: Path, monkeypatch) -> None:
+    """Активный лимит без логов не объявляется устаревшей меткой."""
+    db = tmp_path / "runtime" / "agentbridge.sqlite3"
+    store = ChatThreadStore(db)
+    _note_limit(store, _future_reset_hint())
+    store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27"))
+    logs = tmp_path / "runtime" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "agentbridge.log").write_text(
+        "timestamp=2026-09-27T07:00:00.000+00:00 level=INFO component=application event=process_starting\n",
+        encoding="utf-8",
+    )
+    for name, value in {"ROOT": tmp_path, "RUNTIME": db.parent, "DB": db, "LOGS": logs}.items():
+        monkeypatch.setattr(health, name, value)
+
+    output = health.diagnose()
+    assert "codex.limit_active=true" in output
+    assert "codex.verdict=active_limit_unknown" in output
+    assert "stale_limit_flag" not in output
 
 
 def test_only_successful_poll_updates_durable_heartbeat(tmp_path: Path) -> None:
@@ -363,7 +430,7 @@ def test_usage_limit_reports_facts_and_owner_notifies_once(tmp_path: Path) -> No
     def build() -> CodexProvider:
         return CodexProvider(
             on_usage_limit=lambda hint: (reported.append(hint), bridge._on_limit(hint)),
-            on_usage_recovered=lambda: (recoveries.append(True), bridge._on_recovered()),
+            on_usage_recovered=lambda started=None: (recoveries.append(True), bridge._on_recovered(started)),
         )
 
     provider = build()
@@ -561,6 +628,168 @@ def test_new_limit_after_recovery_is_reported_once_even_by_stale_provider(tmp_pa
     state = store.codex_usage_limit_probe_state()
     assert state.active is True
     assert state.seen_at is not None
+
+
+def test_in_flight_success_from_before_the_limit_cannot_clear_it(tmp_path: Path) -> None:
+    """Главный race: успех turn, который стартовал ДО лимита, его не подтверждает.
+
+    Turn A ушёл в модель на остатке лимита, turn B упёрся в исчерпание и
+    записал новый лимит, после чего A вернулся успешным. A ничего не знает
+    про лимит, который возник в его полёте, поэтому подтверждать восстановление
+    он не вправе: иначе настоящий лимит был бы стёрт."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    provider = bridge.provider()
+
+    # Момент старта turn A фиксируем ДО появления лимита.
+    turn_a_started = datetime.now(timezone.utc).isoformat()
+    limit_seen = _future_seen_at()  # будущий момент: A стартовал заведомо раньше
+
+    # Turn B получает отказ по лимиту — он и создаёт текущий лимит.
+    with sqlite3.connect(store.database_path) as conn:
+        conn.execute("UPDATE operational_state SET value=? WHERE key=?", (limit_seen, _CODEX_LIMIT_SEEN_AT_KEY))
+    provider._note_failure(LIMIT_ERROR)
+    assert store.codex_usage_limit_active() is True
+
+    # Turn A завершается успехом уже после появления лимита.
+    provider._note_success(turn_a_started)
+
+    # Лимит остался: успех относится к другому моменту времени.
+    assert store.codex_usage_limit_active() is True
+    assert store.codex_usage_limit_reason() != ""
+    limit_texts, recovered_texts = bridge.notices()
+    assert len(recovered_texts) == 0
+    assert len(limit_texts) == 1
+
+
+def test_success_started_after_the_limit_clears_it_once(tmp_path: Path) -> None:
+    """Обычное восстановление: turn, начатый после лимита, его подтверждает.
+
+    Второй шаг предыдущего теста — чтобы убедиться, что причинная проверка
+    отсекает только в-flight turn, а не восстановление целиком."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    provider = bridge.provider()
+    provider._note_failure(LIMIT_ERROR)
+    limit_seen = store.codex_usage_limit_probe_state().seen_at
+    assert limit_seen is not None
+
+    # Turn C стартует после того, как лимит был зафиксирован.
+    turn_c_started = (limit_seen + timedelta(seconds=5)).isoformat()
+    provider._note_success(turn_c_started)
+
+    assert store.codex_usage_limit_active() is False
+    assert store.codex_usage_limit_reason() == ""
+    assert store.codex_usage_limit_probe_state().reset_at_utc is None
+    limit_texts, recovered_texts = bridge.notices()
+    assert len(limit_texts) == 1
+    assert len(recovered_texts) == 1
+    # Повторный успех того же turn не плодит уведомления.
+    provider._note_success(turn_c_started)
+    _, recovered_texts = bridge.notices()
+    assert len(recovered_texts) == 1
+
+
+def test_in_flight_turn_from_another_provider_cannot_clear_a_new_limit(tmp_path: Path) -> None:
+    """Причинная граница общая для обоих провайдеров, а не локальная привилегия.
+
+    Owner-контур начал turn до лимита, клиентский провайдер его зафиксировал.
+    Успех owner-контура не должен снимать чужой лимит — иначе один рано
+    завершившийся запрос глушил бы сигнал об исчерпании для всех."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    owner = bridge.provider()
+    client = bridge.provider()
+    turn_started_before = datetime.now(timezone.utc).isoformat()
+
+    client._note_failure(LIMIT_ERROR)
+    seen = store.codex_usage_limit_probe_state().seen_at
+    assert seen is not None
+
+    owner._note_success(turn_started_before)
+    assert store.codex_usage_limit_active() is True
+    _, recovered_texts = bridge.notices()
+    assert recovered_texts == []
+
+    # Turn, начатый после лимита, восстановление подтверждает.
+    owner._note_success((seen + timedelta(seconds=1)).isoformat())
+    assert store.codex_usage_limit_active() is False
+    _, recovered_texts = bridge.notices()
+    assert len(recovered_texts) == 1
+
+
+def test_recovery_without_a_known_start_time_still_works(tmp_path: Path) -> None:
+    """Неизвестный момент старта причинность не ломает, а проверяет её.
+
+    Старые вызовы и ручные проверки не передают момент старта. Запрещать по
+    ним восстановление нельзя: лимит завис бы в базе навсегда, а это хуже,
+    чем одно лишнее подтверждение."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    provider = bridge.provider()
+    provider._note_failure(LIMIT_ERROR)
+    assert store.codex_usage_limit_active() is True
+    provider._note_success()
+    assert store.codex_usage_limit_active() is False
+    _, recovered_texts = bridge.notices()
+    assert len(recovered_texts) == 1
+
+
+def test_new_limit_atomically_clears_the_previous_recovery_marker(tmp_path: Path) -> None:
+    """Переход в новый лимит атомарен: старая метка восстановления снимается
+    в той же транзакции, что и создание нового лимита.
+
+    Если эти шаги были бы разнесены, сбой между ними оставил бы базу в
+    состоянии, где следующий лимит уже не смог бы сообщить о своём
+    восстановлении. Проверяем итог: метки старого восстановления больше нет
+    ровно в момент появления нового лимита."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
+    bridge.provider()._note_success(_after_limit_start(store))
+    assert _limit_keys(store) == {_CODEX_RECOVERED_KEY}
+    first_delivery = _recovery_delivery_ids(store)
+
+    # Новый лимит: main.py больше не трогает метки, всё делает storage.
+    store.claim_codex_usage_limit("11:27", codex_limit_notice("x"), source_timezone_name="Europe/Moscow", local_hint="x")
+    assert _limit_keys(store) == {
+        _CODEX_LIMIT_KEY, _CODEX_LIMIT_REASON_KEY, _CODEX_LIMIT_RESET_AT_KEY, _CODEX_LIMIT_SEEN_AT_KEY,
+    }
+    # Метка восстановления снята, поэтому этот лимит сможет прислать своё.
+    store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE)
+    second_delivery = _recovery_delivery_ids(store)
+    # Новый лимит смог прислать своё восстановление: ровно одна новая доставка.
+    assert len(second_delivery) == len(first_delivery) + 1
+    _, recovered_texts = _limit_deliveries(store)
+    assert len(recovered_texts) == 2
+
+
+def test_repeat_failure_in_the_same_limit_does_not_touch_recovery_lifecycle(tmp_path: Path) -> None:
+    """Повторный отказ внутри активного лимита метку восстановления не трогает.
+
+    Иначе лимит, который ещё не завершился, преждевременно получил бы новое
+    окно для уведомления о восстановлении, и пара уведомлений разъехалась бы."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
+    bridge.provider()._note_success(_after_limit_start(store))
+    marker_after_recovery = _limit_keys(store)
+    assert _CODEX_RECOVERED_KEY in marker_after_recovery
+
+    # Новый лимит, затем серия отказов внутри него.
+    bridge.provider()._note_failure(LIMIT_ERROR)
+    assert _CODEX_RECOVERED_KEY not in _limit_keys(store)
+    for _ in range(5):
+        bridge.provider()._note_failure(LIMIT_ERROR)
+    assert _CODEX_RECOVERED_KEY not in _limit_keys(store)
+    # Лимит всё тот же: владельцу не пришло ни одного лишнего уведомления.
+    assert store.codex_usage_limit_active() is True
+    limit_texts, _ = bridge.notices()
+    assert len(limit_texts) == 2
+    # И восстановление по-прежнему можно прислать ровно один раз.
+    bridge.provider()._note_success(_after_limit_start(store))
+    _, recovered_texts = bridge.notices()
+    assert len(recovered_texts) == 2
 
 
 def test_recovery_notice_always_pairs_with_the_limit_notice(tmp_path: Path) -> None:

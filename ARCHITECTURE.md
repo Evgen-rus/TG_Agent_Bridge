@@ -47,12 +47,26 @@ extra model turn.
 Because two `CodexProvider` instances exist (client chats and owner contour) and
 their in-memory state diverges, SQLite alone decides whether a limit is new. A
 provider only reports facts: `on_usage_limit(reset_hint)` on every explicit
-usage-limit error and `on_usage_recovered()` on every successful turn. Storage
-resolves both into `claim_codex_usage_limit` and `claim_codex_usage_recovered`,
-each a single `BEGIN IMMEDIATE` transaction that checks and updates the notice
-key, so a provider that still remembers an old limit can neither suppress the
-notice for a new one nor duplicate a recovery notice. A provider never touches
-storage directly.
+usage-limit error and `on_usage_recovered(turn_started_at)` on every successful
+turn. Storage resolves both into `claim_codex_usage_limit` and
+`claim_codex_usage_recovered`, each a single `BEGIN IMMEDIATE` transaction that
+checks and updates the notice key, so a provider that still remembers an old
+limit can neither suppress the notice for a new one nor duplicate a recovery
+notice. A provider never touches storage directly.
+
+Recovery is causal, not just chronological. A turn that started before the
+current limit was recorded proves nothing about it — it may have been accepted
+on the last of the previous allowance and returned after a sibling turn was
+refused. `claim_codex_usage_recovered` therefore compares the turn's start
+moment with the limit's `seen_at` and refuses to clear the limit when the turn
+predates it, logging `codex_usage_limit_recovery_ignored
+reason=turn_started_before_limit`. A turn whose start moment is unknown is
+accepted, because refusing would strand the limit in the database forever.
+
+The transition into a new limit is atomic: clearing the previous recovery
+marker, queuing the owner notice, setting the active marker, and writing the
+reset/seen state all commit in that one transaction. Callers no longer touch
+lifecycle keys themselves.
 
 OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory

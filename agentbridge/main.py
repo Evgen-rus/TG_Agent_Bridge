@@ -11,7 +11,6 @@ from .logging import OperationalEventHandler, configure_logging
 from .settings import Settings
 from .storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
-    _CODEX_RECOVERED_KEY,
     ChatThreadStore,
     codex_limit_notice,
     codex_limit_reset_local,
@@ -39,6 +38,9 @@ def main() -> None:
         провайдера в решение не входит намеренно: клиентский и owner-провайдеры
         живут в разных потоках и могут помнить разное, поэтому опираться на их
         память было бы источником рассинхрона.
+
+        Метки жизненного цикла здесь не трогаются: сброс метки восстановления
+        при новом лимите storage делает сам, в той же транзакции.
         """
         # Codex печатает время сброса без зоны, поэтому пересчёт опирается на
         # CODEX_SESSION_TIMEZONE и подписывается как предположение.
@@ -46,9 +48,6 @@ def main() -> None:
             reset_hint, settings.owner_timezone,
             session_timezone_name=settings.codex_session_timezone,
         )
-        # Метку восстановления снимаем заранее: без этого второй по счёту лимит
-        # не смог бы прислать своё уведомление о восстановлении.
-        store.clear_operational_state(_CODEX_RECOVERED_KEY)
         if store.claim_codex_usage_limit(
             reset_hint, codex_limit_notice(local_hint),
             source_timezone_name=settings.codex_session_timezone, local_hint=local_hint,
@@ -57,19 +56,20 @@ def main() -> None:
         else:
             logging.warning("event=codex_usage_limit_refreshed component=application reset_hint=%s", local_hint or "UNKNOWN")
 
-    def note_owner_codex_recovered() -> None:
+    def note_owner_codex_recovered(turn_started_at: str | None = None) -> None:
         """Снять лимит и сообщить о восстановлении, если лимит ещё активен.
 
         Снова решает storage: второй провайдер, который помнит старый лимит и
         успевает позже, не пришлёт дубликат и не тронет уже созданное новое
-        состояние лимита."""
+        состояние лимита. `turn_started_at` — момент старта turn: успех,
+        начавшийся до нынешнего лимита, восстановлением считаться не может."""
         # Дешёвая предварительная проверка: успешных turn бывает много, а лимит
         # активен редко, поэтому не берём блокировку на запись ради каждого
         # запроса. Решение всё равно принимает storage внутри транзакции, так
         # что предварительная проверка на ответ не влияет.
         if not store.codex_usage_limit_active():
             return
-        if store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE):
+        if store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE, turn_started_at=turn_started_at):
             logging.info("event=codex_usage_limit_recovered component=application")
         else:
             logging.info("event=codex_usage_limit_recovery_noop component=application reason=limit_already_cleared")

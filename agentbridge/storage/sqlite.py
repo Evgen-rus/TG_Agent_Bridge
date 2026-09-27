@@ -45,6 +45,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _turn_can_see_limit(turn_started_at: str, limit_seen_at: str) -> bool:
+    """Мог ли turn, начавшийся в `turn_started_at`, знать о текущем лимите.
+
+    Ответ положительный, только если turn начался не раньше последнего
+    зафиксированного отказа по лимиту. Всё, что не разобралось, считаем
+    «может знать»: лишняя проверка привела бы к вечно висящему лимиту, что
+    хуже одного лишнего подтверждения восстановления.
+    """
+    try:
+        started = datetime.fromisoformat(turn_started_at)
+    except (TypeError, ValueError):
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    try:
+        seen = datetime.fromisoformat(limit_seen_at) if limit_seen_at else None
+    except (TypeError, ValueError):
+        return True
+    if seen is None:
+        return True
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return started >= seen
+
+
 # Ключ пары уведомлений об исчерпанном лимите Codex: пока он есть в
 # operational_state, владельцу не отправляются повторные сообщения о том же.
 _CODEX_LIMIT_KEY = "codex_usage_limit:notice"
@@ -441,8 +466,10 @@ class ChatThreadStore:
                 with connection:
                     yield connection
             except BaseException:
-                # `with connection` коммитит и при ошибке тела блока, поэтому
-                # откат делаем явно: иначе прерванная транзакция ушла бы в базу.
+                # `with connection` при исключении в теле блока сам откатывает
+                # транзакцию, но не закрывает соединение, поэтому явный откат
+                # оставлен как страховка: он безвреден, а при непривычной
+                # редакции stdlib не оставит транзакцию висеть.
                 connection.rollback()
                 raise
         finally:
@@ -516,12 +543,23 @@ class ChatThreadStore:
 
         Локальное состояние провайдера в решение не входит намеренно: SQLite
         остаётся единственным источником истины, поэтому provider, который
-        ещё помнит старый лимит, не может подавить уведомление о новом."""
+        ещё помнит старый лимит, не может подавить уведомление о новом.
+
+        Переход в новый лимит целиком атомарен: метка предыдущего
+        восстановления, доставка владельцу, метка активного лимита и метки
+        времени сброса либо появляются вместе, либо не появляются вовсе. Раньше
+        сброс метки восстановления жил в вызывающем коде и выполнялся до
+        создания лимита, поэтому падение между двумя шагами оставляло базу в
+        состоянии, где следующий лимит уже не смог бы сообщить о своём
+        восстановлении. При уже активном лимите метка восстановления не
+        трогается: этот лимит ещё не завершился, и рано открывать ему новое
+        окно для уведомления о восстановлении."""
         with self._write_locked() as connection:
             already_active = connection.execute(
                 "SELECT 1 FROM operational_state WHERE key=? LIMIT 1", (_CODEX_LIMIT_KEY,),
             ).fetchone() is not None
             if not already_active:
+                connection.execute("DELETE FROM operational_state WHERE key=?", (_CODEX_RECOVERED_KEY,))
                 cursor = connection.execute(
                     "INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (notice_text, _now()),
                 )
@@ -534,7 +572,7 @@ class ChatThreadStore:
             self._write_limit_state(connection, reset_hint, source_timezone_name, local_hint)
             return not already_active
 
-    def claim_codex_usage_recovered(self, notice_text: str) -> bool:
+    def claim_codex_usage_recovered(self, notice_text: str, *, turn_started_at: str | None = None) -> bool:
         """Снять лимит и уведомить о восстановлении, если он активен.
 
         Возвращает True ровно один раз за лимит: проверка и снятие метки идут
@@ -542,15 +580,30 @@ class ChatThreadStore:
         лимит и позже успешно отвечает, не пришлёт дубликат и не тронет уже
         созданное новое состояние лимита.
 
-        Метка восстановления ставится как доставка, а не просто как факт, и
-        `clear_operational_state` в `note_owner_codex_limit` снимает её перед
-        новым лимитом — иначе второй лимит не смог бы прислать своё
-        уведомление о восстановлении."""
+        `turn_started_at` — момент, когда провайдер начал turn, в UTC. Это
+        причинная граница, а не время завершения: turn, который стартовал до
+        того как лимит возник, ничего не говорит о текущем лимите. Он мог
+        уйти в модель на текущем остатке и вернуться с успехом уже после
+        отказа по лимиту у соседнего turn. Снимать по такому успеху лимит
+        нельзя, иначе настоящий лимит был бы стёрт успехом, который к нему
+        отношения не имеет.
+
+        Если момент старта неизвестен, причинность не проверяется: старые
+        вызовы и ручные проверки не должны ломаться, а лимит снимает только
+        успешный turn того же провайдера, который его и создал.
+        """
         with self._write_locked() as connection:
-            was_active = connection.execute(
-                "SELECT 1 FROM operational_state WHERE key=? LIMIT 1", (_CODEX_LIMIT_KEY,),
-            ).fetchone() is not None
-            if not was_active:
+            rows = dict(connection.execute(
+                "SELECT key, value FROM operational_state WHERE key IN (?, ?)",
+                (_CODEX_LIMIT_KEY, _CODEX_LIMIT_SEEN_AT_KEY),
+            ))
+            if _CODEX_LIMIT_KEY not in rows:
+                return False
+            if turn_started_at is not None and not _turn_can_see_limit(turn_started_at, rows.get(_CODEX_LIMIT_SEEN_AT_KEY, "")):
+                logger.warning(
+                    "event=codex_usage_limit_recovery_ignored component=storage reason=turn_started_before_limit "
+                    "turn_started_at=%s limit_seen_at=%s", turn_started_at, rows.get(_CODEX_LIMIT_SEEN_AT_KEY, "UNKNOWN"),
+                )
                 return False
             connection.execute("DELETE FROM operational_state WHERE key=?", (_CODEX_LIMIT_KEY,))
             cursor = connection.execute(
