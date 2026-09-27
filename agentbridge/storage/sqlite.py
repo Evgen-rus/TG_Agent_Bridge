@@ -2345,6 +2345,30 @@ class ChatThreadStore:
             )
             return True
 
+    def abort_self_restart(self, restart_id: int) -> bool:
+        """Откатить уже закоммиченный маркер, если systemctl отказал на деле.
+
+        Метка ставится до вызова systemctl, потому что процесс не доживает до
+        результата. Но если systemctl всё-таки вернул отказ и процесс выжил,
+        маркер обязан вернуться в `failed`, иначе база будет утверждать, что
+        перезапуск состоялся, а следующий процесс отправит владельцу
+        «Я вернулся», не перезапустив ничего.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT general_task_id FROM self_restarts WHERE id=? AND status='launched'", (restart_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE self_restarts SET status='failed', completed_at=? WHERE id=?", (_now(), restart_id),
+            )
+            connection.execute(
+                "UPDATE owner_general_tasks SET status='failed', updated_at=? WHERE id=? AND status='done'",
+                (_now(), int(row["general_task_id"])),
+            )
+            return True
+
     def acknowledge_self_restart(self, restart_id: int) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -2352,6 +2376,35 @@ class ChatThreadStore:
                 (_now(), restart_id),
             )
             return cursor.rowcount == 1
+
+    def fail_abandoned_self_restarts(self, current_pid: int) -> int:
+        """Закрыть маркеры, которые остались в статусе prepared.
+
+        `prepared` означает «решение принято, systemctl ещё не вызван». Процесс
+        умирает прямо на вызове, поэтому он не успевает дописать метку. Если
+        новый процесс видит такой маркер от уже мёртвого pid, значит рестарт
+        не состоялся: система при этом жива, ведь мы здесь.
+
+        Без этого маркеры копились бы вечно: `pending_self_restart` ищет
+        только `launched`, поэтому брошенный `prepared` не был бы виден никому.
+        Закрываем как `failed`, потому что подтвердить успех без живого
+        предыдущего процесса нельзя.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, general_task_id FROM self_restarts WHERE status='prepared' AND old_pid<>?",
+                (current_pid,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE self_restarts SET status='failed', completed_at=? WHERE id=? AND status='prepared'",
+                    (_now(), int(row["id"])),
+                )
+                connection.execute(
+                    "UPDATE owner_general_tasks SET status='failed', updated_at=? WHERE id=? AND status IN ('executing', 'confirming')",
+                    (_now(), int(row["general_task_id"])),
+                )
+            return len(rows)
 
     def pending_due_reminders(self, owner_chat_id: int, now_utc: str | None = None) -> list[ReminderRecord]:
         with self._connect() as connection:

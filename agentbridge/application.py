@@ -1300,6 +1300,9 @@ class AgentBridgeApplication:
     def finish_self_restart(self, restart_id: int, *, launched: bool) -> bool:
         return self.store.finish_self_restart(restart_id, launched=launched)
 
+    def abort_self_restart(self, restart_id: int) -> bool:
+        return self.store.abort_self_restart(restart_id)
+
     def acknowledge_self_restart(self, restart_id: int) -> bool:
         return self.store.acknowledge_self_restart(restart_id)
 

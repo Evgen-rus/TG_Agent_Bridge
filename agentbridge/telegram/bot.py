@@ -1321,24 +1321,49 @@ def create_telegram_application(
                             finish(result.restart_marker_id, launched=False)
                         await _send(context.bot, chat_id=owner_chat_id, text="Self-restart доступен только внутри systemd.")
                     else:
+                        # Метку коммитим ДО вызова systemctl, а не после.
+                        # `restart` останавливает сервис, а вместе с ним и этот
+                        # процесс, поэтому код после вызова может не выполниться
+                        # вовсе. Раньше метка ставилась после, и при гонке она
+                        # навсегда оставалась в статусе prepared, а владелец
+                        # получал ложное «не смог запустить перезапуск».
+                        if finish is not None and not finish(result.restart_marker_id, launched=True):
+                            logger.error("event=self_restart_marker_commit_failed restart_id=%s", result.restart_marker_id)
                         try:
                             await _send(
                                 context.bot, chat_id=owner_chat_id, text=result.text,
                                 delivery_key=f"restart-start:{result.restart_marker_id}",
                             )
+                        except Exception:
+                            # Сообщение о старте уходит до перезапуска: если его
+                            # не удалось доставить, перезапуск всё равно нужен,
+                            # иначе владелец не поймёт, что происходит.
+                            logger.exception("event=self_restart_notice_failed restart_id=%s", result.restart_marker_id)
+                        marker = getattr(message_service, "mark_update_processed", None)
+                        if marker is not None:
+                            marker(update.update_id)
+                        try:
                             restart_launcher(
                                 old_pid=os.getpid(),
                                 project_root=restart_project_root or Path.cwd(),
                                 python_executable=restart_python_executable or Path(sys.executable),
                             )
-                            if finish is None or not finish(result.restart_marker_id, launched=True):
-                                raise RuntimeError("self-restart marker could not be committed")
                         except Exception:
+                            # Достижимо только при настоящем отказе systemctl:
+                            # если бы нас успели остановить, мы сюда не дошли бы.
                             logger.exception("event=self_restart_launch_failed")
-                            if finish is not None:
+                            # Метка уже в launched, поэтому откатываем её откатом,
+                            # а не finish(launched=False): тот ждёт prepared.
+                            abort = getattr(message_service, "abort_self_restart", None)
+                            if abort is not None:
+                                abort(result.restart_marker_id)
+                            elif finish is not None:
                                 finish(result.restart_marker_id, launched=False)
                             await _send(context.bot, chat_id=owner_chat_id, text="Не смог запустить безопасный перезапуск. Продолжаю работать.")
                         else:
+                            # systemctl принял запрос, но процесс ещё жив: значит,
+                            # перезапуск не начнётся сам, и надо довести его до
+                            # конца вручную.
                             marker = getattr(message_service, "mark_update_processed", None)
                             if marker is not None:
                                 marker(update.update_id)

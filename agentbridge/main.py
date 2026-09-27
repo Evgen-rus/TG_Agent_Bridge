@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import sys
 
@@ -143,6 +144,13 @@ def main() -> None:
             store.codex_usage_limit_reason() or "UNKNOWN",
             str(retry.allowed).lower(), retry.reason, retry.wait_seconds,
         )
+    # Метка self-restart в статусе prepared означает, что прошлый процесс
+    # принял решение, но не успел дописать результат: systemctl останавливает и
+    # его тоже. Раз мы здесь, значит рестарт не состоялся и метку пора закрыть,
+    # иначе она навсегда останется невидимой для acknowledge-цикла.
+    abandoned = store.fail_abandoned_self_restarts(os.getpid())
+    if abandoned:
+        logging.warning("event=self_restart_abandoned component=application count=%d", abandoned)
     try:
         telegram_application.run_polling(
             allowed_updates=["message", "callback_query", "my_chat_member"],
