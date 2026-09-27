@@ -38,6 +38,19 @@ def _epoch(stamp: str) -> float | None:
         return None
 
 
+def _is_recent(stamp: str, success: str | None) -> bool:
+    """Случилось ли событие после последнего успешного turn Codex.
+
+    Метки, которые не разобрались, считаем свежими: иначе verdict рисковал бы
+    объявить реальный лимит устаревшей меткой только из-за формата записи в
+    логе."""
+    mark = _epoch(success) if success else None
+    if mark is None:
+        return True
+    value = _epoch(stamp)
+    return True if value is None else value > mark
+
+
 def _after_success(failures: list[str], success: str | None) -> list[str]:
     """Падения, случившиеся после последнего успеха Codex.
 
@@ -109,15 +122,27 @@ def _parse_stamp(stamp: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _codex_verdict(limit_active: bool, active_failures: list[str], codex_success: str | None) -> str:
-    """Одноразборный вывод: «Codex сломан» или «метка лимита устарела».
+def _codex_verdict(limit_active: bool, active_failures: list[str], codex_success: str | None, limit_failures: list[str] | None = None) -> str:
+    """Одноразборный вывод: лимит активен, метка устарела или Codex сломан.
 
-    Отказ после последнего успеха — реальная поломка. Отказ при отсутствии
-    успехов после него и сохранённой метке лимита — скорее всего устаревшая
-    метка, и следующий запрос владельца её проверит."""
+    Различать «метка лимита устарела» и «Codex сломан» можно только по
+    доказательствам, поэтому verdict не угадывает:
+
+    - `active_usage_limit` — метка активна, есть свежий отказ именно по лимиту,
+      и успеха после него нет. Это обычное состояние исчерпанного лимита, а не
+      поломка: следующий запрос владельца его проверит и снимет метку.
+    - `stale_limit_flag` — метка активна, но после соответствующего отказа был
+      успешный turn. Значит метка пережила восстановление и её пора снять.
+    - `real_failure` — свежие отказы есть, а про лимит ничего не известно.
+    - `ok` — свежих отказов нет.
+
+    Без различения отказов по лимиту verdict не может уверенно отделить одно
+    от другого, поэтому в сомнении он не называет метку устаревшей."""
+    limit_failures = limit_failures or []
     if active_failures:
-        if codex_success is None and limit_active:
-            return "likely_stale_limit_flag (no success after the limit; next owner request probes Codex)"
+        recent_limit = [item for item in limit_failures if _is_recent(item, codex_success)]
+        if limit_active and recent_limit:
+            return "active_usage_limit (no success after the limit failure; next owner request probes Codex)"
         return f"real_failure ({len(active_failures)} failed turns after the last success)"
     if limit_active:
         return "stale_limit_flag (limit marked active but recent turns succeed) — clearing on next turn"
@@ -201,6 +226,7 @@ def diagnose() -> str:
     poll = None
     codex_success = None
     codex_failures = []
+    codex_limit_failures = []
     poll_stalls = 0
     poll_restarts = 0
     for path in log_files[-7:]:
@@ -216,6 +242,11 @@ def diagnose() -> str:
                     codex_success = _stamp(line)
                 if "event=codex_turn_failed" in line:
                     codex_failures.append(_stamp(line))
+                # Отказ именно по лимиту отличается от прочих поломок: по нему
+                # verdict понимает, что метка лимита не устарела, а отвечает
+                # своему назначению.
+                if "event=codex_usage_limit_exhausted" in line:
+                    codex_limit_failures.append(_stamp(line))
                 if "level=ERROR" in line or "level=CRITICAL" in line or " ERROR " in line or " CRITICAL " in line:
                     event = next((part for part in line.split() if part.startswith("event=")), "event=UNKNOWN")
                     failures.append(f"{_stamp(line)} {event}")
@@ -232,9 +263,10 @@ def diagnose() -> str:
         # даже когда сервис, Telegram и SQLite здоровы. Сбой до последнего успеха
         # считается историческим: агент уже отвечает нормально.
         reasons.append("codex_turn_failures")
-    # Главный вопрос по лимиту: Codex сломан или метка устарела. Ответ строится
-    # из двух независимых источников — сохранённой метки и живых логов.
-    lines.append(f"codex.verdict={_codex_verdict(limit_active, active_failures, codex_success)}")
+    # Главный вопрос по лимиту: активен ли лимит, устарела ли метка или Codex сломан.
+    # Ответ строится из двух независимых источников — сохранённой метки и живых логов.
+    lines.append(f"codex.limit_failures_in_logs={len(codex_limit_failures)}")
+    lines.append(f"codex.verdict={_codex_verdict(limit_active, active_failures, codex_success, codex_limit_failures)}")
     lines.append(f"runtime.bytes={_size(RUNTIME)} media.bytes={_size(RUNTIME / 'media')} logs.bytes={_size(LOGS)} disk.free_bytes={shutil.disk_usage(ROOT).free}")
     lines.extend(f"recent_failure {item}" for item in failures[-10:])
     lines.append("OVERALL: " + ("DEGRADED " + ",".join(reasons) if reasons else "HEALTHY (unverified fields marked UNKNOWN)"))

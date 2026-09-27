@@ -13,6 +13,7 @@ from agentbridge.storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
     _CODEX_LIMIT_KEY,
     _CODEX_LIMIT_REASON_KEY,
+    _CODEX_RECOVERED_KEY,
     ChatThreadStore,
     codex_limit_notice,
     codex_limit_retry,
@@ -46,6 +47,44 @@ def _future_reset_hint(hours: int = 2) -> str:
     """Часы сброса из будущего в зоне Codex — иначе момент уже прошёл."""
     session = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow"))
     return (session + timedelta(hours=hours)).strftime("%H:%M")
+
+
+class LimitBridge:
+    """Связка провайдеров с SQLite ровно как в `agentbridge.main`.
+
+    Решение «новый лимит или продолжение» принимает storage по сохранённой
+    метке, а не локальный флаг провайдера. Тесты ходят через неё, иначе они
+    проверяли бы удобный, но не настоящий путь решения.
+    """
+
+    def __init__(self, store: ChatThreadStore, *, session_timezone: str = "Europe/Moscow", owner_timezone: str = "Asia/Novosibirsk") -> None:
+        self.store = store
+        self.session_timezone = session_timezone
+        self.owner_timezone = owner_timezone
+
+    def _on_limit(self, reset_hint: str) -> None:
+        local_hint = codex_limit_reset_local(
+            reset_hint, self.owner_timezone, session_timezone_name=self.session_timezone,
+        )
+        self.store.clear_operational_state(_CODEX_RECOVERED_KEY)
+        self.store.claim_codex_usage_limit(
+            reset_hint, codex_limit_notice(local_hint),
+            source_timezone_name=self.session_timezone, local_hint=local_hint,
+        )
+
+    def _on_recovered(self) -> None:
+        self.store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE)
+
+    def provider(self) -> CodexProvider:
+        """Новый процесс: стартовое состояние берётся из SQLite."""
+        return CodexProvider(
+            usage_limit_active=self.store.codex_usage_limit_active(),
+            on_usage_limit=self._on_limit,
+            on_usage_recovered=self._on_recovered,
+        )
+
+    def notices(self) -> tuple[list[str], list[str]]:
+        return _limit_deliveries(self.store)
 
 
 def test_daily_report_moscow_boundary_and_catchup() -> None:
@@ -193,6 +232,80 @@ def test_diagnose_separates_real_codex_failure_from_stale_flag(tmp_path: Path, m
     assert "codex.last_failure=2026-09-27T07:30:00.000+00:00" in output
 
 
+def _write_logs(logs: Path, *lines: str) -> None:
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "agentbridge.log").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+
+
+def test_diagnose_does_not_call_a_real_usage_limit_a_stale_flag(tmp_path: Path, monkeypatch) -> None:
+    """Активный лимит с отказом по лимиту и без успеха после него — не метка.
+
+    Прежний verdict называл это `likely_stale_limit_flag`, хотя состояние
+    полностью штатное: лимит исчерпан, и его проверяет следующий запрос."""
+    db = tmp_path / "runtime" / "agentbridge.sqlite3"
+    store = ChatThreadStore(db)
+    _note_limit(store, _future_reset_hint())
+    store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27"))
+    logs = tmp_path / "runtime" / "logs"
+    _write_logs(
+        logs,
+        "timestamp=2026-09-27T07:00:00.000+00:00 level=INFO component=codex event=codex_turn_finished",
+        "timestamp=2026-09-27T07:30:00.000+00:00 level=ERROR component=codex event=codex_turn_failed reason=limit",
+        "timestamp=2026-09-27T07:30:00.000+00:00 level=WARNING component=codex event=codex_usage_limit_exhausted reset_hint=11:27",
+    )
+    for name, value in {"ROOT": tmp_path, "RUNTIME": db.parent, "DB": db, "LOGS": logs}.items():
+        monkeypatch.setattr(health, name, value)
+
+    output = health.diagnose()
+    assert "codex.limit_active=true" in output
+    assert "codex.limit_failures_in_logs=1" in output
+    assert "codex.verdict=active_usage_limit" in output
+    assert "stale" not in output.split("codex.verdict=")[1].splitlines()[0]
+
+
+def test_diagnose_calls_the_flag_stale_only_after_a_later_success(tmp_path: Path, monkeypatch) -> None:
+    """Устаревшей метку можно назвать только доказательством: успех после отказа."""
+    db = tmp_path / "runtime" / "agentbridge.sqlite3"
+    store = ChatThreadStore(db)
+    _note_limit(store, _future_reset_hint())
+    store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27"))
+    logs = tmp_path / "runtime" / "logs"
+    _write_logs(
+        logs,
+        "timestamp=2026-09-27T07:00:00.000+00:00 level=WARNING component=codex event=codex_usage_limit_exhausted reset_hint=11:27",
+        "timestamp=2026-09-27T07:30:00.000+00:00 level=ERROR component=codex event=codex_turn_failed reason=limit",
+        # Успешный turn после отказа — метка лимита не должна была пережить.
+        "timestamp=2026-09-27T08:00:00.000+00:00 level=INFO component=codex event=codex_turn_finished",
+    )
+    for name, value in {"ROOT": tmp_path, "RUNTIME": db.parent, "DB": db, "LOGS": logs}.items():
+        monkeypatch.setattr(health, name, value)
+
+    output = health.diagnose()
+    assert "codex.verdict=stale_limit_flag" in output
+
+
+def test_codex_verdict_never_names_stale_without_evidence() -> None:
+    """Логика verdict проверяется напрямую: без доказательств — никакой ярлык.
+
+    `active_failures` приходит уже отфильтрованным — это отказы строго после
+    последнего успеха, поэтому непустой список означает «успеха после них не
+    было» по построению."""
+    # Метка активна, свежий отказ по лимиту, успеха после него нет → лимит активен.
+    assert health._codex_verdict(True, ["2026-09-27T07:30:00+00:00"], "2026-09-27T07:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("active_usage_limit")
+    # Отказ по лимиту был, но после него уже прошёл успех → метка устарела,
+    # и отказа после этого успеха в active_failures не остаётся.
+    assert health._codex_verdict(True, [], "2026-09-27T08:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("stale_limit_flag")
+    # Свежий отказ есть, но про лимит ничего не известно → настоящая поломка,
+    # даже при активной метке: угадывать лимит по одной метке нельзя.
+    assert health._codex_verdict(True, ["2026-09-27T07:30:00+00:00"], "2026-09-27T07:00:00+00:00", []).startswith("real_failure")
+    # Отказ по лимиту был, но позже успех, и свежих отказов нет → метка устарела.
+    assert health._codex_verdict(True, [], "2026-09-27T08:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("stale_limit_flag")
+    # Всё спокойно.
+    assert health._codex_verdict(False, [], "2026-09-27T08:00:00+00:00", []) == "ok"
+    # Метки лимита нет даже при отказах — это поломка, а не лимит.
+    assert health._codex_verdict(False, ["2026-09-27T07:30:00+00:00"], "2026-09-27T07:00:00+00:00", ["2026-09-27T07:30:00+00:00"]).startswith("real_failure")
+
+
 def test_only_successful_poll_updates_durable_heartbeat(tmp_path: Path) -> None:
     store = ChatThreadStore(tmp_path / "state.sqlite3")
     heartbeat = PollingHeartbeat(on_success=store.record_poll_success)
@@ -240,13 +353,20 @@ def test_limit_notice_mentions_reset_time_and_omits_it_when_unknown() -> None:
     assert "восстановление в" not in codex_limit_notice("")
 
 
-def test_usage_limit_notifies_once_and_recovery_once() -> None:
-    notices: list[tuple[str, bool]] = []
+def test_usage_limit_reports_facts_and_owner_notifies_once(tmp_path: Path) -> None:
+    """Провайдер сообщает факты, а уведомления считает storage."""
+    reported: list[str] = []
     recoveries: list[bool] = []
-    provider = CodexProvider(
-        on_usage_limit=lambda hint, notify=True: notices.append((hint, notify)),
-        on_usage_recovered=lambda: recoveries.append(True),
-    )
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+
+    def build() -> CodexProvider:
+        return CodexProvider(
+            on_usage_limit=lambda hint: (reported.append(hint), bridge._on_limit(hint)),
+            on_usage_recovered=lambda: (recoveries.append(True), bridge._on_recovered()),
+        )
+
+    provider = build()
     provider._note_failure(LIMIT_ERROR)
     provider._note_failure(LIMIT_ERROR)
     provider._note_failure(LIMIT_ERROR)
@@ -255,9 +375,15 @@ def test_usage_limit_notifies_once_and_recovery_once() -> None:
     provider._note_failure(LIMIT_ERROR)
     provider._note_success()
     assert provider._usage_exhausted is False
-    # Владельцу сообщают только о первом лимите; повторы лишь обновляют метку.
-    assert [notify for _, notify in notices] == [True, False, False, True]
-    assert len(recoveries) == 2
+    # Каждый отказ сообщается наружу, но владельцу уходит одно сообщение на лимит.
+    assert len(reported) == 4
+    limit_texts, recovered_texts = bridge.notices()
+    assert len(limit_texts) == 2
+    assert len(recovered_texts) == 2
+    # Успех сообщается всегда: решение о том, был ли лимит активен, принимает
+    # storage по метке, а не провайдер по своей памяти. Два лишних успеха —
+    # это два no-op, а не два уведомления.
+    assert len(recoveries) == 3
 
 
 def test_durable_limit_notice_pair_survives_restart(tmp_path: Path) -> None:
@@ -288,36 +414,16 @@ def test_limit_restart_probe_and_recovery_clears_persistent_state(tmp_path: Path
     Это и есть production-баг без фикса: после рестарта новый провайдер не
     знал о прошлом лимите, метка в SQLite оставалась навсегда, а уведомление
     о восстановлении не приходило."""
-    notices: list[bool] = []
-    recoveries: list[bool] = []
     store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
 
-    def on_limit(hint: str, notify: bool = True) -> None:
-        notices.append(notify)
-        _note_limit(store, hint)
-        if notify:
-            store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(f"{hint} Moscow (UTC+03:00)"))
-
-    def on_recovered() -> None:
-        store.clear_codex_usage_limit()
-        recoveries.append(True)
-        store.queue_operational_notice("codex_usage_limit:recovered", CODEX_RECOVERED_NOTICE)
-
-    def first_process() -> CodexProvider:
-        return CodexProvider(
-            usage_limit_active=store.codex_usage_limit_active(),
-            on_usage_limit=on_limit,
-            on_usage_recovered=on_recovered,
-        )
-
-    before_restart = first_process()
+    before_restart = bridge.provider()
     before_restart._note_failure(LIMIT_ERROR)
     assert store.codex_usage_limit_active() is True
-    assert notices == [True]
 
     # Рестарт: SQLite — источник истины, поэтому новый провайдер стартует
     # «с лимитом», а не с чистого состояния.
-    after_restart = first_process()
+    after_restart = bridge.provider()
     assert after_restart.usage_limit_active is True
     # Первая успешная попытка после восстановления снимает метку и присылает
     # ровно одно уведомление о восстановлении.
@@ -326,8 +432,7 @@ def test_limit_restart_probe_and_recovery_clears_persistent_state(tmp_path: Path
     assert store.codex_usage_limit_active() is False
     assert store.codex_usage_limit_reason() == ""
     assert store.codex_usage_limit_probe_state().reset_at_utc is None
-    assert recoveries == [True]
-    limit_texts, recovered_texts = _limit_deliveries(store)
+    limit_texts, recovered_texts = bridge.notices()
     assert len(limit_texts) == 1
     assert len(recovered_texts) == 1
 
@@ -338,89 +443,229 @@ def test_failed_recovery_probe_rearms_cooldown_without_new_notice(tmp_path: Path
     Отказ заново ставит паузу (иначе Рик долбил бы модель на каждый запрос),
     но владельцу второе уведомление о том же лимите не уходит."""
     store = ChatThreadStore(tmp_path / "state.sqlite3")
-    notified: list[bool] = []
-
-    def on_limit(hint: str, notify: bool = True) -> None:
-        notified.append(notify)
-        _note_limit(store, hint)
-        if notify:
-            store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(hint))
-
-    def on_recovered() -> None:
-        store.clear_codex_usage_limit()
-        store.queue_operational_notice("codex_usage_limit:recovered", CODEX_RECOVERED_NOTICE)
-
-    provider = CodexProvider(
-        usage_limit_active=store.codex_usage_limit_active(),
-        on_usage_limit=on_limit,
-        on_usage_recovered=on_recovered,
-    )
+    bridge = LimitBridge(store)
+    provider = bridge.provider()
     provider._note_failure(LIMIT_ERROR)
-    assert notified == [True]
     # Пауза после первого отказа.
     first_seen = store.codex_usage_limit_probe_state().seen_at
     assert store.codex_usage_limit_retry(now=first_seen + timedelta(minutes=5)).allowed is False
     # Контрольная попытка разрешена, но лимит ещё не восстановился.
     assert store.codex_usage_limit_retry(now=first_seen + CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN).allowed is True
     provider._note_failure(LIMIT_ERROR)
-    assert notified == [True, False]
     # Пауза снова на месте от нового отказа, а уведомление не продублировано.
     second_seen = store.codex_usage_limit_probe_state().seen_at
     assert second_seen > first_seen
     assert store.codex_usage_limit_retry(now=second_seen + timedelta(minutes=5)).allowed is False
-    limit_texts, _ = _limit_deliveries(store)
+    limit_texts, _ = bridge.notices()
     assert len(limit_texts) == 1
 
 
 def test_repeated_failures_after_restart_do_not_duplicate_notice(tmp_path: Path) -> None:
     """Рестарт при всё ещё активном лимите не должен слать второе уведомление."""
-    sent: list[bool] = []
     store = ChatThreadStore(tmp_path / "state.sqlite3")
-
-    def on_limit(hint: str, notify: bool = True) -> None:
-        _note_limit(store, hint)
-        if notify:
-            sent.append(store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(hint)) > 0)
-
-    def build() -> CodexProvider:
-        return CodexProvider(
-            usage_limit_active=store.codex_usage_limit_active(),
-            on_usage_limit=on_limit,
-            on_usage_recovered=store.clear_codex_usage_limit,
-        )
-
-    build()._note_failure(LIMIT_ERROR)
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
     for _ in range(3):
         # Каждый отказ — как в новом процессе: провайдер сразу «exhausted».
-        build()._note_failure(LIMIT_ERROR)
-    assert sent == [True]
-    limit_texts, _ = _limit_deliveries(store)
+        bridge.provider()._note_failure(LIMIT_ERROR)
+    limit_texts, _ = bridge.notices()
     assert len(limit_texts) == 1
     assert store.codex_usage_limit_active() is True
 
 
 def test_other_failures_do_not_touch_the_limit_notice() -> None:
-    notified: list[bool] = []
-    provider = CodexProvider(on_usage_limit=lambda hint, notify=True: notified.append(notify))
+    reported: list[str] = []
+    provider = CodexProvider(on_usage_limit=reported.append)
     provider._note_failure(RuntimeError("connection reset by peer"))
     assert provider._usage_exhausted is False
-    assert notified == []
+    assert reported == []
 
 
-def test_provider_restored_as_exhausted_keeps_owner_silent() -> None:
-    """Провайдер, собранный с сохранённой меткой, молчит про лимит.
+def test_provider_restored_as_exhausted_still_reports_new_failures() -> None:
+    """Провайдер, собранный с сохранённой меткой, обязан сообщать об отказах.
 
-    Иначе после каждого рестарта владелец получал бы «Лимит Codex исчерпан»
-    заново, хотя про это уже сказано в прошлом процессе."""
-    notified: list[bool] = []
-    provider = CodexProvider(usage_limit_active=True, on_usage_limit=lambda hint, notify=True: notified.append(notify))
+    Раньше он молчал, полагаясь на локальный флаг, и новый лимит мог пройти
+    без уведомления. Теперь решение принимает storage, а провайдер всегда
+    докладывает факт."""
+    reported: list[str] = []
+    provider = CodexProvider(usage_limit_active=True, on_usage_limit=reported.append)
     assert provider.usage_limit_active is True
     provider._note_failure(LIMIT_ERROR)
-    assert notified == [False]
-    # Без стартовой метки тот же отказ, наоборот, один раз сообщает владельцу.
-    fresh = CodexProvider(on_usage_limit=lambda hint, notify=True: notified.append(notify))
-    fresh._note_failure(LIMIT_ERROR)
-    assert notified == [False, True]
+    assert reported == ["11:27"]
+
+
+def test_two_providers_start_exhausted_and_stay_consistent(tmp_path: Path) -> None:
+    """Оба провайдера стартуют «с лимитом» и снимают флаг при своём успехе."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
+
+    owner = bridge.provider()
+    client = bridge.provider()
+    assert (owner.usage_limit_active, client.usage_limit_active) == (True, True)
+
+    owner._note_success()
+    assert owner.usage_limit_active is False
+    assert client.usage_limit_active is True  # локальная память ещё старая
+    limit_texts, recovered_texts = bridge.notices()
+    assert (len(limit_texts), len(recovered_texts)) == (1, 1)
+
+
+def test_second_provider_success_does_not_duplicate_recovery_notice(tmp_path: Path) -> None:
+    """Поздний успех второго провайдера безопасен: дубликата нет, состояние цело.
+
+    Это и был баг: provider B помнил старый лимит и мог либо прислать второе
+    уведомление о восстановлении, либо снести уже созданное новое состояние."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
+    owner = bridge.provider()
+    client = bridge.provider()
+    owner._note_success()
+
+    # Успех второго провайдера: storage уже без лимита, поэтому это no-op.
+    client._note_success()
+    assert client.usage_limit_active is False
+    assert store.codex_usage_limit_active() is False
+    _, recovered_texts = bridge.notices()
+    assert len(recovered_texts) == 1
+
+
+def test_new_limit_after_recovery_is_reported_once_even_by_stale_provider(tmp_path: Path) -> None:
+    """Главный edge-case: новый лимит после чужого восстановления.
+
+    Provider B локально помнит старый лимит, но authoritative состояние уже
+    снято. Новый отказ обязан быть новым лимитом: состояние создаётся заново,
+    владелец получает ровно одно новое уведомление."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
+    owner = bridge.provider()
+    client = bridge.provider()
+
+    # Owner-контур восстанавливается первым и снимает persistent state.
+    owner._note_success()
+    assert store.codex_usage_limit_active() is False
+    assert client.usage_limit_active is True  # B об этом ещё не знает
+
+    # Позже B упирается в уже НОВЫЙ usage limit.
+    client._note_failure(LIMIT_ERROR)
+
+    # Это новый лимит, а не продолжение: состояние создано и владельцу ушло
+    # ровно одно новое сообщение.
+    assert store.codex_usage_limit_active() is True
+    limit_texts, recovered_texts = bridge.notices()
+    assert len(limit_texts) == 2
+    assert len(recovered_texts) == 1
+    # Cooldown нового лимита считается от нового отказа, а не от старого.
+    state = store.codex_usage_limit_probe_state()
+    assert state.active is True
+    assert state.seen_at is not None
+
+
+def test_recovery_notice_always_pairs_with_the_limit_notice(tmp_path: Path) -> None:
+    """Восстановлений ровно столько же, сколько завершившихся лимитов.
+
+    Пара приходит из одного хранилища, поэтому разъехаться не может: каждый
+    лимит, который владельцу заявили и который потом сняли, обязан быть
+    закрыт ровно одним уведомлением о восстановлении. Лимит, оставшийся
+    активным, закрытия ещё не получил — поэтому лимитов на один больше.
+    Это и есть контракт, который раньше мог разъехаться между двумя
+    провайдерами."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    for _ in range(3):
+        bridge.provider()._note_failure(LIMIT_ERROR)
+        bridge.provider()._note_success()
+    bridge.provider()._note_failure(LIMIT_ERROR)  # лимит, оставшийся активным
+    limit_texts, recovered_texts = bridge.notices()
+    assert (len(limit_texts), len(recovered_texts)) == (4, 3)
+    assert store.codex_usage_limit_active() is True
+
+
+def test_successful_turn_always_clears_a_durable_limit(tmp_path: Path) -> None:
+    """Успешный turn — достоверное свидетельство, что Codex снова отвечает.
+
+    Даже если провайдер локально не считал себя исчерпанным, метка лимита в
+    SQLite обязана исчезнуть: иначе после рестарта Рик продолжил бы отвечать
+    «лимит исчерпан», хотя модель давно работает."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    bridge.provider()._note_failure(LIMIT_ERROR)
+    assert store.codex_usage_limit_active() is True
+    # Провайдер, собранный без стартовой метки, локально «чист».
+    unaware = CodexProvider(
+        usage_limit_active=False,
+        on_usage_limit=bridge._on_limit,
+        on_usage_recovered=bridge._on_recovered,
+    )
+    unaware._note_success()
+    assert store.codex_usage_limit_active() is False
+    assert store.codex_usage_limit_reason() == ""
+    assert store.codex_usage_limit_probe_state().reset_at_utc is None
+    limit_texts, recovered_texts = bridge.notices()
+    assert (len(limit_texts), len(recovered_texts)) == (1, 1)
+
+
+def test_concurrent_limit_claims_create_single_notice(tmp_path: Path) -> None:
+    """Два провайдера в разных потоках не удваивают уведомление.
+
+    Проверка и запись метки идут в одной транзакции, поэтому второй поток
+    видит уже созданный лимит и молчит."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    results: list[bool] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(store.claim_codex_usage_limit, "11:27", codex_limit_notice("11:27 Moscow"),
+                        source_timezone_name="Europe/Moscow", local_hint="11:27 Moscow")
+            for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+    assert sorted(results) == [False, True]
+    limit_texts, _ = _limit_deliveries(store)
+    assert len(limit_texts) == 1
+
+
+def test_concurrent_recovery_claims_create_single_notice(tmp_path: Path) -> None:
+    """Два провайдера не присылают два уведомления о восстановлении."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    _note_limit(store)
+    store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(store.claim_codex_usage_recovered, CODEX_RECOVERED_NOTICE) for _ in range(2)]
+        results = [future.result() for future in futures]
+    assert sorted(results) == [False, True]
+    _, recovered_texts = _limit_deliveries(store)
+    assert len(recovered_texts) == 1
+    assert store.codex_usage_limit_active() is False
+
+
+def test_failed_claim_rolls_back_and_leaves_no_partial_state(tmp_path: Path) -> None:
+    """Прерванная транзакция не оставляет половину записанного лимита.
+
+    Уведомление и метка пишутся вместе, поэтому сбой посередине не должен ни
+    оставить метку без сообщения, ни повесить блокировку на базе."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    with pytest.raises(RuntimeError, match="boom"):
+        with store._write_locked() as connection:
+            connection.execute(
+                "INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", ("полузапись", "2026-01-01T00:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES(?, '1')", (_CODEX_LIMIT_KEY,),
+            )
+            raise RuntimeError("boom")
+
+    assert store.codex_usage_limit_active() is False
+    limit_texts, _ = _limit_deliveries(store)
+    assert limit_texts == []
+    # База осталась пригодной для следующей записи.
+    store.claim_codex_usage_limit("11:27", codex_limit_notice("11:27"), source_timezone_name="Europe/Moscow", local_hint="11:27")
+    assert store.codex_usage_limit_active() is True
 
 
 def test_known_reset_time_prevents_premature_retry(tmp_path: Path) -> None:

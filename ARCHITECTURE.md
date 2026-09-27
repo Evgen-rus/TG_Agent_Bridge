@@ -44,6 +44,16 @@ bounded cooldown when Codex named no reset time, the next real owner request is
 allowed through as the recovery probe. There is no background polling and no
 extra model turn.
 
+Because two `CodexProvider` instances exist (client chats and owner contour) and
+their in-memory state diverges, SQLite alone decides whether a limit is new. A
+provider only reports facts: `on_usage_limit(reset_hint)` on every explicit
+usage-limit error and `on_usage_recovered()` on every successful turn. Storage
+resolves both into `claim_codex_usage_limit` and `claim_codex_usage_recovered`,
+each a single `BEGIN IMMEDIATE` transaction that checks and updates the notice
+key, so a provider that still remembers an old limit can neither suppress the
+notice for a new one nor duplicate a recovery notice. A provider never touches
+storage directly.
+
 OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
      A substantive owner correction may also create a pending memory draft;

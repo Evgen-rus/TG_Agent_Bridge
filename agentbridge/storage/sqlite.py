@@ -56,6 +56,9 @@ _CODEX_LIMIT_RESET_AT_KEY = "codex_usage_limit:reset_at_utc"
 # Когда лимит заметили в последний раз. Служит запасным интервалом ожидания,
 # когда время сброса от Codex не пришло.
 _CODEX_LIMIT_SEEN_AT_KEY = "codex_usage_limit:seen_at"
+# Парная метка уведомления о восстановлении. Живёт в том же состоянии, что и
+# метка лимита, поэтому и решение «уже восстанавливались?» принимает storage.
+_CODEX_RECOVERED_KEY = "codex_usage_limit:recovered"
 
 # Codex не печатает зону времени сброса: в тексте ошибки есть только «11:27 AM».
 # Поэтому часы нельзя выдавать за достоверные — зона приходит сверху, из
@@ -420,6 +423,31 @@ class ChatThreadStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def _write_locked(self) -> Iterator[sqlite3.Connection]:
+        """Открыть транзакцию, взяв блокировку записи сразу.
+
+        Обычная `_connect` в Python не начинает транзакцию на чтении, поэтому
+        два потока успевают прочитать одно и то же состояние до записи. Здесь
+        блокировка берётся до первого SELECT: без неё решение «новый лимит или
+        продолжение» вычислялось бы по снимку, который второй поток уже успел
+        испортить. Единственное место, где это действительно нужно, — атомарные
+        проверка-и-запись метки лимита."""
+        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                with connection:
+                    yield connection
+            except BaseException:
+                # `with connection` коммитит и при ошибке тела блока, поэтому
+                # откат делаем явно: иначе прерванная транзакция ушла бы в базу.
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+
     def start_run(self) -> str | None:
         """Return the previous unclean run's start time, if known."""
         with self._connect() as connection:
@@ -473,21 +501,90 @@ class ChatThreadStore:
         зона, в которой эти часы предполагаются, `local_hint` — уже
         пересчитанное время для владельца (может быть пустым, если Codex
         времени не назвал)."""
-        now = _now()
-        reset_at = codex_reset_moment_utc(reset_hint, source_timezone_name)
         with self._connect() as connection:
-            connection.executemany(
+            self._write_limit_state(connection, reset_hint, source_timezone_name, local_hint)
+
+    def claim_codex_usage_limit(
+        self, reset_hint: str, notice_text: str, *, source_timezone_name: str, local_hint: str,
+    ) -> bool:
+        """Создать лимит и уведомить владельца, если его ещё нет.
+
+        Возвращает True, если это новый лимит и владельцу нужно сообщение.
+        Проверка метки и её запись идут в одной транзакции: два провайдера
+        (клиентский и owner-контур) работают в разных потоках, и раздельные
+        чтение с записью дали бы два уведомления об одном лимите.
+
+        Локальное состояние провайдера в решение не входит намеренно: SQLite
+        остаётся единственным источником истины, поэтому provider, который
+        ещё помнит старый лимит, не может подавить уведомление о новом."""
+        with self._write_locked() as connection:
+            already_active = connection.execute(
+                "SELECT 1 FROM operational_state WHERE key=? LIMIT 1", (_CODEX_LIMIT_KEY,),
+            ).fetchone() is not None
+            if not already_active:
+                cursor = connection.execute(
+                    "INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (notice_text, _now()),
+                )
+                connection.execute(
+                    "INSERT INTO operational_state(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (_CODEX_LIMIT_KEY, str(cursor.lastrowid)),
+                )
+                logger.info("event=delivery_queued component=storage delivery_id=%s operation=operational_notice", cursor.lastrowid)
+            self._write_limit_state(connection, reset_hint, source_timezone_name, local_hint)
+            return not already_active
+
+    def claim_codex_usage_recovered(self, notice_text: str) -> bool:
+        """Снять лимит и уведомить о восстановлении, если он активен.
+
+        Возвращает True ровно один раз за лимит: проверка и снятие метки идут
+        в одной транзакции, поэтому второй провайдер, который помнит старый
+        лимит и позже успешно отвечает, не пришлёт дубликат и не тронет уже
+        созданное новое состояние лимита.
+
+        Метка восстановления ставится как доставка, а не просто как факт, и
+        `clear_operational_state` в `note_owner_codex_limit` снимает её перед
+        новым лимитом — иначе второй лимит не смог бы прислать своё
+        уведомление о восстановлении."""
+        with self._write_locked() as connection:
+            was_active = connection.execute(
+                "SELECT 1 FROM operational_state WHERE key=? LIMIT 1", (_CODEX_LIMIT_KEY,),
+            ).fetchone() is not None
+            if not was_active:
+                return False
+            connection.execute("DELETE FROM operational_state WHERE key=?", (_CODEX_LIMIT_KEY,))
+            cursor = connection.execute(
+                "INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (notice_text, _now()),
+            )
+            connection.execute(
                 "INSERT INTO operational_state(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [
-                    (_CODEX_LIMIT_REASON_KEY, local_hint or reset_hint or ""),
-                    (_CODEX_LIMIT_RESET_AT_KEY, reset_at.isoformat() if reset_at else ""),
-                    # Отсчёт паузы идёт от последнего отказа: сдвинутый вперёд
-                    # момент сброса всё равно заставит ждать до него, а если
-                    # время сброса неизвестно, пауза ограничит частоту попыток.
-                    (_CODEX_LIMIT_SEEN_AT_KEY, now),
-                ],
+                (_CODEX_RECOVERED_KEY, str(cursor.lastrowid)),
             )
+            for key in (_CODEX_LIMIT_REASON_KEY, _CODEX_LIMIT_RESET_AT_KEY, _CODEX_LIMIT_SEEN_AT_KEY):
+                connection.execute("DELETE FROM operational_state WHERE key=?", (key,))
+            logger.info("event=delivery_queued component=storage delivery_id=%s operation=operational_notice", cursor.lastrowid)
+            return True
+
+    @staticmethod
+    def _write_limit_state(
+        connection: sqlite3.Connection, reset_hint: str, source_timezone_name: str, local_hint: str,
+    ) -> None:
+        """Обновить метки лимита в уже открытой транзакции.
+
+        Отсчёт паузы идёт от последнего отказа: сдвинутый вперёд момент сброса
+        всё равно заставит ждать до него, а если время сброса неизвестно, пауза
+        ограничит частоту попыток."""
+        reset_at = codex_reset_moment_utc(reset_hint, source_timezone_name)
+        connection.executemany(
+            "INSERT INTO operational_state(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [
+                (_CODEX_LIMIT_REASON_KEY, local_hint or reset_hint or ""),
+                (_CODEX_LIMIT_RESET_AT_KEY, reset_at.isoformat() if reset_at else ""),
+                (_CODEX_LIMIT_SEEN_AT_KEY, _now()),
+            ],
+        )
 
     def clear_operational_state(self, key: str) -> None:
         """Снять метку, чтобы следующий такой же случай снова сработал.

@@ -332,10 +332,10 @@ class CodexProvider:
         self.cwd = str((cwd or Path.cwd()).resolve())
         self.on_usage_limit = on_usage_limit
         self.on_usage_recovered = on_usage_recovered
-        # Состояние лимита живёт в SQLite, а не в памяти процесса: перезапуск
-        # не должен стирать факт исчерпания и заставлять прислать второе
-        # уведомление. Провайдер сам SQLite не знает — начальное значение
-        # приходит снаружи, из composition root.
+        # Локальный флаг — только для удобства и для «нового процесса»: решение
+        # о том, новый ли лимит и уведомлять ли владельца, принимает получатель
+        # события по сохранённому состоянию. Поэтому провайдер сам SQLite не
+        # знает, а начальное значение приходит снаружи, из composition root.
         self._usage_exhausted = bool(usage_limit_active)
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
@@ -665,33 +665,38 @@ class CodexProvider:
         return payload
 
     def _note_failure(self, error: object) -> None:
-        """Сообщить владельцу об исчерпанном лимите Codex ровно один раз.
+        """Сообщить наружу факт исчерпания лимита Codex.
 
-        Дальше повторные отказы молчат: при десяти подряд неудачных запросах
-        владельцу нужна одна причина, а не десять одинаковых сообщений. Если
-        лимит был известен ещё до старта процесса, уведомление не повторяется,
-        но время сброса обновляется — владельцу полезно видеть свежий сброс."""
+        Провайдер знает только одно: этот конкретный turn получил отказ по
+        лимиту. Новый это лимит или продолжение старого — решает получатель
+        события по сохранённому состоянию, а не локальный флаг: у клиентского
+        и owner-провайдера память о лимите расходится (один мог уже
+        восстановиться, пока второй нет), и решение по ней было бы источником
+        пропущенных уведомлений."""
         if not is_usage_limit_error(error):
             return
-        reset_hint = limit_reset_hint(error)
-        if self._usage_exhausted:
-            logger.warning("event=codex_usage_limit_still_active component=codex reset_hint=%s", reset_hint or "UNKNOWN")
-            if callable(self.on_usage_limit):
-                self.on_usage_limit(reset_hint, False)
-            return
         self._usage_exhausted = True
+        reset_hint = limit_reset_hint(error)
         logger.warning("event=codex_usage_limit_exhausted component=codex reset_hint=%s", reset_hint or "UNKNOWN")
         if callable(self.on_usage_limit):
-            self.on_usage_limit(reset_hint, True)
+            self.on_usage_limit(reset_hint)
 
     def _note_success(self) -> None:
-        """Первая удачная попытка после отказа означает, что лимит восстановлен."""
-        if not self._usage_exhausted:
-            return
+        """Сообщить, что лимит восстановился, и синхронизировать локальный флаг.
+
+        Событие уходит при каждом успешном turn, а не только когда локальный
+        флаг стоял: после рестарта и после чужого восстановления локальная
+        память расходится с durable состоянием в обе стороны, и опираться на
+        неё — значит либо потерять настоящее уведомление о восстановлении,
+        либо снести уже созданное новое состояние лимита. Решение всё равно
+        принимает storage, где оно идемпотентно и стоит одну транзакцию."""
+        recovered = self._usage_exhausted
         self._usage_exhausted = False
-        logger.info("event=codex_usage_limit_recovered component=codex")
-        if callable(self.on_usage_recovered):
-            self.on_usage_recovered()
+        if not callable(self.on_usage_recovered):
+            return
+        if recovered:
+            logger.info("event=codex_usage_limit_recovered component=codex")
+        self.on_usage_recovered()
 
 
 def _turn_input(prompt: str, attachments: tuple[MediaAttachment, ...] = ()) -> RunInput:

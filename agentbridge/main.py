@@ -11,14 +11,12 @@ from .logging import OperationalEventHandler, configure_logging
 from .settings import Settings
 from .storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
-    _CODEX_LIMIT_KEY,
+    _CODEX_RECOVERED_KEY,
     ChatThreadStore,
     codex_limit_notice,
     codex_limit_reset_local,
 )
 from .telegram.bot import create_telegram_application
-
-_CODEX_RECOVERED_KEY = "codex_usage_limit:recovered"
 
 
 def main() -> None:
@@ -33,7 +31,15 @@ def main() -> None:
     # состояния, которое пережило рестарт, а не с «лимита никогда не было».
     limit_active = store.codex_usage_limit_active()
 
-    def notify_owner_codex_limit(reset_hint: str, notify_owner: bool = True) -> None:
+    def note_owner_codex_limit(reset_hint: str) -> None:
+        """Отразить отказ по лимиту в SQLite и сообщить владельцу ровно один раз.
+
+        Провайдер сюда приходит с фактом отказа, а решение «это тот же лимит или
+        новый» принимает storage по сохранённой метке. Локальное состояние
+        провайдера в решение не входит намеренно: клиентский и owner-провайдеры
+        живут в разных потоках и могут помнить разное, поэтому опираться на их
+        память было бы источником рассинхрона.
+        """
         # Codex печатает время сброса без зоны, поэтому пересчёт опирается на
         # CODEX_SESSION_TIMEZONE и подписывается как предположение.
         local_hint = codex_limit_reset_local(
@@ -43,26 +49,38 @@ def main() -> None:
         # Метку восстановления снимаем заранее: без этого второй по счёту лимит
         # не смог бы прислать своё уведомление о восстановлении.
         store.clear_operational_state(_CODEX_RECOVERED_KEY)
-        store.note_codex_usage_limit(
-            reset_hint, source_timezone_name=settings.codex_session_timezone, local_hint=local_hint,
-        )
-        # `notify_owner=False` — лимит владельцу уже заявлен: молча обновляем
-        # метки, чтобы время сброса не устарело, но не шлём второе уведомление.
-        if notify_owner:
-            store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(local_hint))
+        if store.claim_codex_usage_limit(
+            reset_hint, codex_limit_notice(local_hint),
+            source_timezone_name=settings.codex_session_timezone, local_hint=local_hint,
+        ):
+            logging.warning("event=codex_usage_limit_notice_queued component=application reset_hint=%s", local_hint or "UNKNOWN")
+        else:
+            logging.warning("event=codex_usage_limit_refreshed component=application reset_hint=%s", local_hint or "UNKNOWN")
 
-    def notify_owner_codex_recovered() -> None:
-        # Метку лимита снимаем, иначе следующий лимит не даст уведомления.
-        store.clear_codex_usage_limit()
-        store.queue_operational_notice(_CODEX_RECOVERED_KEY, CODEX_RECOVERED_NOTICE)
+    def note_owner_codex_recovered() -> None:
+        """Снять лимит и сообщить о восстановлении, если лимит ещё активен.
+
+        Снова решает storage: второй провайдер, который помнит старый лимит и
+        успевает позже, не пришлёт дубликат и не тронет уже созданное новое
+        состояние лимита."""
+        # Дешёвая предварительная проверка: успешных turn бывает много, а лимит
+        # активен редко, поэтому не берём блокировку на запись ради каждого
+        # запроса. Решение всё равно принимает storage внутри транзакции, так
+        # что предварительная проверка на ответ не влияет.
+        if not store.codex_usage_limit_active():
+            return
+        if store.claim_codex_usage_recovered(CODEX_RECOVERED_NOTICE):
+            logging.info("event=codex_usage_limit_recovered component=application")
+        else:
+            logging.info("event=codex_usage_limit_recovery_noop component=application reason=limit_already_cleared")
 
     provider = CodexProvider(
         model=settings.codex_model,
         reasoning_effort=settings.codex_reasoning_effort,
         cwd=root,
         sepia_enabled=settings.sepia_enabled,
-        on_usage_limit=notify_owner_codex_limit,
-        on_usage_recovered=notify_owner_codex_recovered,
+        on_usage_limit=note_owner_codex_limit,
+        on_usage_recovered=note_owner_codex_recovered,
         usage_limit_active=limit_active,
     )
     owner_provider = CodexProvider(
@@ -70,8 +88,8 @@ def main() -> None:
         reasoning_effort=settings.owner_codex_reasoning_effort,
         cwd=root,
         sepia_enabled=False,
-        on_usage_limit=notify_owner_codex_limit,
-        on_usage_recovered=notify_owner_codex_recovered,
+        on_usage_limit=note_owner_codex_limit,
+        on_usage_recovered=note_owner_codex_recovered,
         usage_limit_active=limit_active,
     )
     service = AgentBridgeApplication(
