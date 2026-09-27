@@ -3,10 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
+import logging
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CHAT_STATE = {
     "participants": [],
@@ -243,6 +246,88 @@ class ChatThreadStore:
         finally:
             connection.close()
 
+    def start_run(self) -> str | None:
+        """Return the previous unclean run's start time, if known."""
+        with self._connect() as connection:
+            previous = connection.execute("SELECT value FROM operational_state WHERE key='run_status'").fetchone()
+            started = connection.execute("SELECT value FROM operational_state WHERE key='run_started_at'").fetchone()
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES('run_status', 'running') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES('run_started_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_now(),),
+            )
+            return started[0] if previous is not None and previous[0] == "running" and started else None
+
+    def stop_run(self) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE operational_state SET value='stopped' WHERE key='run_status'")
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES('run_stopped_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_now(),),
+            )
+
+    def record_poll_success(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES('poll_success_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_now(),),
+            )
+
+    def queue_operational_notice(self, key: str, text: str) -> int:
+        with self._connect() as connection:
+            existing = connection.execute("SELECT value FROM operational_state WHERE key=?", (key,)).fetchone()
+            if existing:
+                return int(existing[0])
+            cursor = connection.execute(
+                "INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (text, _now()),
+            )
+            connection.execute("INSERT INTO operational_state(key, value) VALUES(?, ?)", (key, str(cursor.lastrowid)))
+            logger.info("event=delivery_queued component=storage delivery_id=%s operation=operational_notice", cursor.lastrowid)
+            return cursor.lastrowid
+
+    def record_operational_event(self, event: str, level: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO operational_events(event, level, created_at) VALUES(?, ?, ?)",
+                (event, level, _now()),
+            )
+            connection.execute("DELETE FROM operational_events WHERE created_at<?",
+                               ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),))
+
+    def queue_daily_report(self, report_date: str, start_utc: str, end_utc: str) -> int:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT delivery_id FROM daily_reports WHERE report_date=?", (report_date,),
+            ).fetchone()
+            if existing:
+                return existing[0]
+            def count(sql: str) -> int:
+                return connection.execute(sql, (start_utc, end_utc)).fetchone()[0]
+            facts = count("SELECT count(*) FROM memory_entries WHERE status='active' AND kind='fact' AND created_at>=? AND created_at<?")
+            rules = count("SELECT count(*) FROM learning_rules WHERE status='active' AND created_at>=? AND created_at<?")
+            experience = count("SELECT count(*) FROM experience_entries WHERE status='active' AND created_at>=? AND created_at<?")
+            errors = count("SELECT count(*) FROM operational_events WHERE level IN ('ERROR','CRITICAL') AND created_at>=? AND created_at<?")
+            restarts = count("SELECT count(*) FROM operational_events WHERE event='previous_run_unclean' AND created_at>=? AND created_at<?")
+            pending = connection.execute("SELECT count(*) FROM telegram_messages WHERE processing_status IN ('pending','processing')").fetchone()[0]
+            pending += connection.execute("SELECT count(*) FROM owner_query_deliveries WHERE owner_message_id IS NULL").fetchone()[0]
+            text = (f"Рик на связи. Отчёт за {report_date}.\n"
+                    f"Новых фактов: {facts}; правил: {rules}; опыта: {experience}.\n"
+                    f"Техника: ошибок {errors}; восстановлений после сбоя {restarts}; сейчас pending {pending}." +
+                    ("\nЗа вчера нового ничего не узнал." if not any((facts, rules, experience)) else ""))
+            cursor = connection.execute("INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (text, _now()))
+            connection.execute("INSERT INTO daily_reports(report_date, delivery_id, created_at) VALUES(?, ?, ?)",
+                               (report_date, cursor.lastrowid, _now()))
+            logger.info("event=daily_report_queued component=storage report_date=%s delivery_id=%s", report_date, cursor.lastrowid)
+            return cursor.lastrowid
+
+    def last_daily_report_date(self) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT max(report_date) FROM daily_reports").fetchone()
+            return row[0]
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(
@@ -429,6 +514,22 @@ class ChatThreadStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_owner_query_deliveries_pending
                     ON owner_query_deliveries(owner_message_id);
+                CREATE TABLE IF NOT EXISTS operational_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operational_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    report_date TEXT PRIMARY KEY,
+                    delivery_id INTEGER NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(delivery_id) REFERENCES owner_query_deliveries(id)
+                );
                 CREATE TABLE IF NOT EXISTS owner_query_selections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     question TEXT NOT NULL,

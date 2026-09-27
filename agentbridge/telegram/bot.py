@@ -52,6 +52,23 @@ _OWNER_BOT_COMMANDS = (
 logger = logging.getLogger(__name__)
 
 
+def due_report_windows(now_utc: datetime, last_date: str | None, report_time: str, timezone_name: str) -> list[tuple[str, str, str]]:
+    zone = ZoneInfo(timezone_name)
+    hour, minute = map(int, report_time.split(":"))
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        raise ValueError("DAILY_REPORT_TIME must be HH:MM")
+    local = now_utc.astimezone(zone)
+    due = local.date() - timedelta(days=1 if local.time() >= datetime.min.replace(hour=hour, minute=minute).time() else 2)
+    first = datetime.fromisoformat(last_date).date() + timedelta(days=1) if last_date else due
+    result = []
+    while first <= due:
+        start = datetime.combine(first, datetime.min.time(), zone).astimezone(timezone.utc)
+        end = datetime.combine(first + timedelta(days=1), datetime.min.time(), zone).astimezone(timezone.utc)
+        result.append((first.isoformat(), start.isoformat(), end.isoformat()))
+        first += timedelta(days=1)
+    return result
+
+
 def _telegram_safe_text(text: str) -> str:
     text = re.sub(r"[ \t]*:codex-file-citation\{[^}]*\}", "", text)
     text = re.sub(r"[\"'`][A-Za-z]:[\\/][^\"'`\n]+[\"'`]", "[локальный файл]", text)
@@ -347,6 +364,9 @@ def create_telegram_application(
     restart_project_root: Path | None = None,
     restart_python_executable: Path | None = None,
     restart_launcher=spawn_restart_helper,
+    daily_report_enabled: bool = False,
+    daily_report_time: str = "07:30",
+    daily_report_timezone: str = "Europe/Moscow",
 ) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
@@ -356,7 +376,8 @@ def create_telegram_application(
         raise ValueError("Delivery retry interval must be positive.")
     if polling_stall_seconds <= polling_hard_timeout_seconds:
         raise ValueError("Telegram polling stall threshold must exceed the hard polling timeout.")
-    heartbeat = PollingHeartbeat()
+    store = getattr(message_service, "store", None)
+    heartbeat = PollingHeartbeat(on_success=getattr(store, "record_poll_success", None))
     watchdog = PollingWatchdog(
         heartbeat=heartbeat,
         check_interval_seconds=polling_watchdog_seconds,
@@ -398,6 +419,8 @@ def create_telegram_application(
                     kwargs["parse_mode"] = parse_mode
                 if reply_markup is not None and index == len(parts) - 1:
                     kwargs["reply_markup"] = reply_markup
+                started = time.monotonic()
+                logger.info("event=delivery_attempt component=telegram chat_id=%s delivery_key=%s part=%s", chat_id, key, index + 1)
                 try:
                     sent = await bot.send_message(**kwargs)
                 except BadRequest as exc:
@@ -413,6 +436,7 @@ def create_telegram_application(
                     if message_id is None:
                         raise RuntimeError("Telegram send returned no message ID")
                     record(chat_id, key, index, message_id)
+                logger.info("event=delivery_success component=telegram chat_id=%s delivery_key=%s owner_message_id=%s duration_ms=%d", chat_id, key, message_id, (time.monotonic() - started) * 1000)
                 if len(parts) > 1:
                     logger.info("event=owner_delivery_part_sent part=%s/%s owner_message_id=%s", index + 1, len(parts), message_id)
             return sent
@@ -568,6 +592,16 @@ def create_telegram_application(
                 return False
 
     async def _retry_pending_deliveries(bot) -> None:
+        if daily_report_enabled and live_enabled:
+            store = getattr(message_service, "store", None)
+            if store is not None:
+                try:
+                    for report_date, start, end in due_report_windows(
+                        datetime.now(timezone.utc), store.last_daily_report_date(), daily_report_time, daily_report_timezone,
+                    ):
+                        store.queue_daily_report(report_date, start, end)
+                except Exception:
+                    logger.exception("event=daily_report_queue_failed component=telegram")
         if media_dir is not None:
             store = getattr(message_service, "store", None)
             retained = store.retained_document_paths() if store is not None else set()
@@ -682,7 +716,9 @@ def create_telegram_application(
         try:
             await _wait_until_polling_ready(application)
             await _wait_for_ingest_idle()
+            logger.info("event=catchup_started component=telegram")
             await _run_catchup(application.bot)
+            logger.info("event=catchup_finished component=telegram result=ok")
         finally:
             live_enabled = True
         leftover = getattr(message_service, "pending_client_chat_ids", None)
@@ -703,6 +739,8 @@ def create_telegram_application(
         retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
         watchdog_task = asyncio.create_task(watchdog.run(application), name="agentbridge-polling-watchdog")
         restart_ack_task = asyncio.create_task(_restart_ack_loop(application), name="agentbridge-restart-ack")
+        application.bot_data["agentbridge_bootstrapped"] = True
+        logger.info("event=process_started component=telegram")
 
     async def _post_stop(application: Application) -> None:
         nonlocal retry_task, recovery_task, watchdog_task, restart_ack_task
@@ -748,7 +786,7 @@ def create_telegram_application(
         )
         ingest = getattr(message_service, "ingest_telegram_message", None)
         if ingest is not None and message is not None:
-            ingest(
+            inserted = ingest(
                 update_id=update.update_id,
                 chat_id=chat_id,
                 message_id=item.message_id if item.message_id is not None else update.update_id,
@@ -766,6 +804,8 @@ def create_telegram_application(
                 media_file_unique_id=item.media_file_unique_id,
                 forward_origin=item.forward_origin,
             )
+            if inserted:
+                logger.info("event=telegram_update_persisted component=telegram chat_id=%s update_id=%s", chat_id, update.update_id)
             last_ingest_at = time.monotonic()
         return item
 
@@ -1279,7 +1319,7 @@ def create_telegram_application(
                     if not self_restart_supported():
                         if finish is not None:
                             finish(result.restart_marker_id, launched=False)
-                        await _send(context.bot, chat_id=owner_chat_id, text="Локальный self-restart сейчас доступен только на Windows.")
+                        await _send(context.bot, chat_id=owner_chat_id, text="Self-restart доступен только на Windows или внутри systemd.")
                     else:
                         try:
                             await _send(

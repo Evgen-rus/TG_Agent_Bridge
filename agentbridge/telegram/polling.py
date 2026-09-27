@@ -20,6 +20,7 @@ class PollingHeartbeat:
     """Monotonic progress marker updated around every Telegram ``getUpdates`` call."""
 
     clock: Callable[[], float] = time.monotonic
+    on_success: Callable[[], None] | None = None
     last_progress_at: float = field(init=False)
     attempts: int = 0
     completions: int = 0
@@ -31,9 +32,14 @@ class PollingHeartbeat:
         self.attempts += 1
         self.last_progress_at = self.clock()
 
-    def mark_finished(self) -> None:
+    def mark_finished(self, success: bool = False) -> None:
         self.completions += 1
         self.last_progress_at = self.clock()
+        if success and self.on_success is not None:
+            try:
+                self.on_success()
+            except Exception:
+                logger.error("event=telegram_poll_heartbeat_store_failed component=polling")
 
     def touch(self) -> None:
         self.last_progress_at = self.clock()
@@ -54,13 +60,16 @@ class HeartbeatHTTPXRequest(HTTPXRequest):
 
     async def do_request(self, *args, **kwargs):
         self.heartbeat.mark_started()
+        success = False
         try:
             async with asyncio.timeout(self.hard_timeout_seconds):
-                return await super().do_request(*args, **kwargs)
+                response = await super().do_request(*args, **kwargs)
+                success = isinstance(response, tuple) and response[0] == 200
+                return response
         except TimeoutError as exc:
             raise TimedOut("Telegram getUpdates exceeded the hard polling deadline.") from exc
         finally:
-            self.heartbeat.mark_finished()
+            self.heartbeat.mark_finished(success)
 
 
 @dataclass
@@ -91,7 +100,7 @@ class PollingWatchdog:
                 now = self.heartbeat.clock()
                 if now - last_health_log_at >= _HEALTH_LOG_SECONDS:
                     logger.info(
-                        "event=telegram_polling_healthy last_progress_age=%.1f attempts=%d completions=%d",
+                        "event=telegram_poll_ok component=polling last_progress_age=%.1f attempts=%d completions=%d",
                         age,
                         self.heartbeat.attempts,
                         self.heartbeat.completions,
@@ -99,7 +108,7 @@ class PollingWatchdog:
                     last_health_log_at = now
                 continue
             logger.critical(
-                "event=telegram_polling_stalled last_progress_age=%.1f attempts=%d completions=%d",
+                "event=telegram_poll_stalled component=polling last_progress_age=%.1f attempts=%d completions=%d",
                 age,
                 self.heartbeat.attempts,
                 self.heartbeat.completions,
@@ -116,6 +125,7 @@ class PollingWatchdog:
             await asyncio.sleep(min(0.1, self.check_interval_seconds))
 
     async def _restart(self, application) -> bool:
+        logger.warning("event=telegram_poll_restart_started component=polling")
         updater = getattr(application, "updater", None)
         if updater is None:
             return self._fail(application, "missing_updater")
@@ -132,10 +142,10 @@ class PollingWatchdog:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("event=telegram_polling_restart_failed")
+            logger.exception("event=telegram_poll_restart_failed component=polling")
             return self._fail(application, "restart_failed")
         self.heartbeat.touch()
-        logger.warning("event=telegram_polling_restarted")
+        logger.warning("event=telegram_poll_restart_success component=polling")
         return True
 
     def _fail(self, application, reason: str) -> bool:

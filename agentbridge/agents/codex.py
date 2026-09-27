@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -627,15 +628,26 @@ class CodexProvider:
         )
 
     def _run_json(self, thread, prompt: RunInput, schema: dict) -> dict:
-        result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
+        started = time.monotonic()
+        logger.info("event=codex_turn_started component=codex thread_id=%s model=%s effort=%s", thread.id, self.model, self.reasoning_effort)
+        try:
+            result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
+        except Exception as exc:
+            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=%s duration_ms=%d", thread.id, type(exc).__name__, (time.monotonic() - started) * 1000)
+            raise RuntimeError(f"Codex turn failed ({type(exc).__name__})") from None
         if result.error is not None:
-            raise RuntimeError(f"Codex turn failed: {result.error}")
+            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=CodexResultError duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
+            raise RuntimeError("Codex turn failed (CodexResultError)")
         if not result.final_response:
+            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=EmptyResponse duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
             raise RuntimeError("Codex returned no final response")
         try:
-            return json.loads(result.final_response)
+            payload = json.loads(result.final_response)
         except (json.JSONDecodeError, TypeError) as exc:
+            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=InvalidJson duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
             raise RuntimeError("Codex returned an invalid structured response") from exc
+        logger.info("event=codex_turn_finished component=codex thread_id=%s duration_ms=%d result=ok", thread.id, (time.monotonic() - started) * 1000)
+        return payload
 
 
 def _turn_input(prompt: str, attachments: tuple[MediaAttachment, ...] = ()) -> RunInput:

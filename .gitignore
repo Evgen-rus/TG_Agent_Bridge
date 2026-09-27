@@ -104,6 +104,8 @@ Docs/*
 !Docs/context_memory_optimization_plan.md
 !Docs/temporary_tunnel_runbook.md
 !Docs/github_actions_vps_cicd_guide.md
+!Docs/VPS_DEPLOY.md
+!Docs/OPERATIONS.md
 
 # Benchmark fixtures and results are local-only because they may reference
 # customer workspaces and generated ROP artifacts.

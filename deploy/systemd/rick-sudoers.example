@@ -1,0 +1,3 @@
+# Install as /etc/sudoers.d/rick-restart with mode 0440, then visudo -cf.
+# Keep the command path and unit name identical to agentbridge/restart.py.
+rick ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart rick.service

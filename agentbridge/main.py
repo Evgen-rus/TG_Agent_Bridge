@@ -7,7 +7,7 @@ import sys
 from .agents.codex import CodexProvider
 from .application import AgentBridgeApplication
 from .chats.loader import ChatRegistry
-from .logging import configure_logging
+from .logging import OperationalEventHandler, configure_logging
 from .settings import Settings
 from .storage.sqlite import ChatThreadStore
 from .telegram.bot import create_telegram_application
@@ -17,8 +17,10 @@ def main() -> None:
     root = Path.cwd()
     settings = Settings.from_env(root)
     configure_logging(settings.log_dir, settings.log_retention_days)
+    logging.info("event=process_starting component=application")
     registry = ChatRegistry.load(settings.chats_dir)
     store = ChatThreadStore(settings.database_path)
+    logging.getLogger().addHandler(OperationalEventHandler(store.record_operational_event))
     provider = CodexProvider(
         model=settings.codex_model,
         reasoning_effort=settings.codex_reasoning_effort,
@@ -55,16 +57,36 @@ def main() -> None:
         polling_bootstrap_retries=settings.telegram_bootstrap_retries,
         restart_project_root=root,
         restart_python_executable=Path(sys.executable),
+        daily_report_enabled=settings.daily_report_enabled,
+        daily_report_time=settings.daily_report_time,
+        daily_report_timezone=settings.daily_report_timezone,
     )
-    logging.info("AgentBridge started with %d monitored chat(s)", len(registry))
-    telegram_application.run_polling(
-        allowed_updates=["message", "callback_query", "my_chat_member"],
-        drop_pending_updates=False,
-        bootstrap_retries=settings.telegram_bootstrap_retries,
-    )
-    fatal_polling_reason = telegram_application.bot_data.get("agentbridge_polling_fatal")
-    if fatal_polling_reason:
-        raise RuntimeError(f"Telegram polling watchdog stopped AgentBridge: {fatal_polling_reason}")
+    previous_unclean = store.start_run()
+    if previous_unclean:
+        store.queue_operational_notice(
+            f"crash:{previous_unclean}",
+            f"Я снова на связи. Предыдущий запуск от {previous_unclean} завершился без clean shutdown. "
+            "Причину смотрите в журнале и systemd; точный сигнал пока неизвестен.",
+        )
+        logging.warning("event=previous_run_unclean component=application run_started_at=%s", previous_unclean)
+        store.record_operational_event("previous_run_unclean", "WARNING")
+    try:
+        telegram_application.run_polling(
+            allowed_updates=["message", "callback_query", "my_chat_member"],
+            drop_pending_updates=False,
+            bootstrap_retries=settings.telegram_bootstrap_retries,
+        )
+        fatal_polling_reason = telegram_application.bot_data.get("agentbridge_polling_fatal")
+        if fatal_polling_reason:
+            raise RuntimeError(f"Telegram polling watchdog stopped AgentBridge: {fatal_polling_reason}")
+    except Exception:
+        event = "process_failed" if telegram_application.bot_data.get("agentbridge_bootstrapped") else "startup_failed"
+        logging.exception("event=%s component=application result=failed", event)
+        raise
+    else:
+        logging.info("event=process_stopping component=application result=clean")
+        store.stop_run()
+        logging.info("event=process_stopped component=application result=clean")
 
 
 if __name__ == "__main__":

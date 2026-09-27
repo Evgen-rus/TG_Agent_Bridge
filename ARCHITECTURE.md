@@ -63,11 +63,19 @@ Telegram user who created that reminder. Old reminders without an author stay
 untagged.
 Replies to any delivered result of a completed general task start a new
 confirmable general task in the same persistent owner thread.
-An explicit self-restart request is also planned there, but deterministic code
-performs it only after confirmation and only on Windows. SQLite keeps the
-pending restart marker; a detached Python helper waits for the old PID,
-starts the same interpreter and project, and the new process acknowledges the
-restart to the owner through the existing durable delivery parts.
+An explicit self-restart request is also planned there; deterministic code
+performs it only after confirmation. Windows uses a detached Python helper;
+Linux under systemd requests only `/usr/bin/sudo -n /usr/bin/systemctl --no-block restart rick.service`.
+SQLite keeps the restart marker and the new process acknowledges it to the
+owner through existing durable delivery parts.
+
+At startup SQLite records `operational_state.run_status=running`; a clean
+shutdown writes `stopped`. A previous `running` value means an unclean stop,
+so the new process queues one owner notice in `owner_query_deliveries`. The
+exact cause may remain unknown until systemd logs are inspected. The same
+delivery queue stores the deterministic 07:30 Europe/Moscow daily report.
+`daily_reports.report_date` prevents duplicate creation and advances missed
+reports after downtime. Operational error counts are stored without messages.
 ```
 
 Each monitored chat has isolated persistent Codex threads: the client thread

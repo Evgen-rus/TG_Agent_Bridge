@@ -46,6 +46,7 @@ def test_restart_helper_uses_current_project_python_and_old_pid(tmp_path, monkey
     calls = []
     ready = root / "runtime" / "restart-helper-123.ready"
     monkeypatch.setattr("agentbridge.restart.self_restart_supported", lambda: True)
+    monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Windows")
     monkeypatch.setattr("agentbridge.restart.time.sleep", lambda delay: ready.parent.mkdir(parents=True, exist_ok=True) or ready.touch())
     monkeypatch.setattr(
         "agentbridge.restart.subprocess.Popen",
@@ -63,8 +64,18 @@ def test_restart_helper_uses_current_project_python_and_old_pid(tmp_path, monkey
 
 def test_restart_helper_refuses_non_windows(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Linux")
-    with pytest.raises(RuntimeError, match="only on Windows"):
+    with pytest.raises(RuntimeError, match="requires Windows or a systemd service"):
         spawn_restart_helper(old_pid=1, project_root=tmp_path, python_executable=tmp_path / "python")
+
+
+def test_linux_restart_uses_only_fixed_systemd_unit_after_systemd_check(tmp_path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr("agentbridge.restart.platform.system", lambda: "Linux")
+    monkeypatch.setenv("INVOCATION_ID", "test")
+    monkeypatch.setattr("agentbridge.restart.subprocess.run", lambda args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(returncode=0))
+    spawn_restart_helper(old_pid=123, project_root=tmp_path, python_executable=tmp_path / "unused")
+    assert calls[0][0] == ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "--no-block", "restart", "rick.service"]
+    assert calls[0][1]["stdin"] == __import__("subprocess").DEVNULL
 
 
 def test_callback_handler_accepts_current_general_and_portfolio_buttons() -> None:

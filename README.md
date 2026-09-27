@@ -89,6 +89,12 @@ required before a real suggestion can be generated.
 .\.venv\Scripts\python.exe -m agentbridge.main
 ```
 
+Ubuntu production uses `rick.service`; see [VPS deployment](Docs/VPS_DEPLOY.md)
+and [operations](Docs/OPERATIONS.md). Read-only health check:
+`python scripts/diagnose.py`. Daily owner report settings are
+`DAILY_REPORT_ENABLED`, `DAILY_REPORT_TIME` (07:30), and
+`DAILY_REPORT_TIMEZONE` (Europe/Moscow).
+
 The SQLite mapping is created at `runtime/agentbridge.sqlite3`. It stores
 Telegram history, one Codex thread ID per monitored chat, compact `chat_state`,
 recommendations, rules, and memory. Client photos and files are downloaded only

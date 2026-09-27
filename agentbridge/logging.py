@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from logging.handlers import TimedRotatingFileHandler
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any
 
 _TELEGRAM_TOKEN = re.compile(r"(?P<prefix>bot)?(?P<id>\d{6,}):(?P<secret>[A-Za-z0-9_-]{20,})")
+_API_KEY = re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b")
+_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{12,}")
 
 
 def redact_secrets(value: Any) -> Any:
@@ -17,7 +20,7 @@ def redact_secrets(value: Any) -> Any:
         secret = match.group("secret")
         return f"{match.group('prefix') or ''}{match.group('id')[:6]}…:{secret[:4]}…{secret[-4:]}"
 
-    return _TELEGRAM_TOKEN.sub(replace, value)
+    return _BEARER.sub("Bearer [REDACTED]", _API_KEY.sub("sk-[REDACTED]", _TELEGRAM_TOKEN.sub(replace, value)))
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -31,21 +34,38 @@ class SecretRedactionFilter(logging.Filter):
 
 
 class RedactingFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        return datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds")
+
     def format(self, record: logging.LogRecord) -> str:
         return redact_secrets(super().format(record))
+
+
+class OperationalEventHandler(logging.Handler):
+    def __init__(self, record_event):
+        super().__init__(logging.ERROR)
+        self.record_event = record_event
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            match = re.search(r"\bevent=([a-z_]+)", record.getMessage())
+            self.record_event(match.group(1) if match else "unclassified_error", record.levelname)
+        except Exception:
+            # A broken DB must not turn logging into a second crash.
+            pass
 
 
 def configure_logging(log_dir: Path | None = None, retention_days: int = 7) -> None:
     target_dir = (log_dir or Path.cwd() / "runtime" / "logs").resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
-    formatter = RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    formatter = RedactingFormatter("timestamp=%(asctime)s level=%(levelname)s component=%(name)s %(message)s")
     redaction = SecretRedactionFilter()
     console = logging.StreamHandler()
     console.addFilter(redaction)
     console.setFormatter(formatter)
     daily = TimedRotatingFileHandler(
         target_dir / "agentbridge.log", when="midnight", interval=1,
-        backupCount=max(0, retention_days - 1), encoding="utf-8", utc=False,
+        backupCount=max(0, retention_days - 1), encoding="utf-8", utc=True,
     )
     daily.suffix = "%Y-%m-%d"
     daily.addFilter(redaction)

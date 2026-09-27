@@ -1,0 +1,25 @@
+[Unit]
+Description=Rick AgentBridge Telegram bridge
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=rick
+Group=rick
+WorkingDirectory=/home/rick/TG_Agent_Bridge
+ExecStart=/home/rick/TG_Agent_Bridge/.venv/bin/python -m agentbridge.main
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

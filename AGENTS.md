@@ -81,3 +81,14 @@ linking, and secret redaction.
 
 Runtime state belongs under `runtime/`. Secrets belong only in `.env`; document
 new non-secret settings in `.env.example` and `README.md`.
+
+## Production incident route
+
+Read `Docs/OPERATIONS.md` and `Docs/VPS_DEPLOY.md`, then run
+`.venv/bin/python scripts/diagnose.py` on the VPS. Inspect the UTC structured
+events in `runtime/logs/agentbridge.log*` and `systemctl status rick.service`.
+Check Telegram polling heartbeat, SQLite integrity and pending queues, Codex
+failures, and owner delivery IDs before naming a root cause. Source of truth is
+`runtime/agentbridge.sqlite3`; Codex threads are continuity only. Do not alter
+other VPS projects, `/etc`, or credentials during incident investigation.
+After an authorized fix, run the verification commands above and diagnose again.

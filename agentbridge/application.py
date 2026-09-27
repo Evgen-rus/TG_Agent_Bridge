@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 import json
 import re
 import logging
+import time
 from pathlib import Path
 
 from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
@@ -411,6 +412,9 @@ class AgentBridgeApplication:
         notify: bool,
         ignore_internal_filter: bool = False,
     ) -> Suggestion | None:
+        batch_id = next((item.update_id for item in messages if item.update_id is not None), None)
+        started = time.monotonic()
+        logger.info("event=batch_started component=application chat_id=%s batch_id=%s count=%s", chat.telegram_chat_id, batch_id, len(messages))
         if ignore_internal_filter:
             internal, external = [], messages
         else:
@@ -422,6 +426,7 @@ class AgentBridgeApplication:
             )
         if not external:
             logger.info("event=client_batch_context_only chat_id=%s count=%d", chat.telegram_chat_id, len(internal))
+            logger.info("event=batch_finished component=application chat_id=%s batch_id=%s result=context_only duration_ms=%d", chat.telegram_chat_id, batch_id, (time.monotonic() - started) * 1000)
             return None
         sender_names = list(dict.fromkeys(item.sender_name.strip() or "Неизвестный отправитель" for item in external))
         sender_name = sender_names[0] if len(sender_names) == 1 else ", ".join(sender_names)
@@ -475,6 +480,7 @@ class AgentBridgeApplication:
         action = reply.resolved_action()
         if not notify or not reply.notifies_owner():
             logger.info("event=codex_suggestion_suppressed chat_id=%s action=%s notify=%s", chat.telegram_chat_id, action, notify)
+            logger.info("event=batch_finished component=application chat_id=%s batch_id=%s result=suppressed duration_ms=%d", chat.telegram_chat_id, batch_id, (time.monotonic() - started) * 1000)
             return None
         recommendation_id = self.store.create_recommendation(
             chat.telegram_chat_id, chat.name, sender_name, combined_message, reply.situation,
@@ -484,6 +490,7 @@ class AgentBridgeApplication:
             question = (reply.owner_question or reply.unknowns or reply.situation).strip()
             self.store.create_owner_question(chat.telegram_chat_id, question, recommendation_id)
         logger.info("event=codex_suggest_done chat_id=%s recommendation_id=%s action=%s", chat.telegram_chat_id, recommendation_id, action)
+        logger.info("event=batch_finished component=application chat_id=%s batch_id=%s recommendation_id=%s result=%s duration_ms=%d", chat.telegram_chat_id, batch_id, recommendation_id, action, (time.monotonic() - started) * 1000)
         return Suggestion(
             chat.name, sender_name, combined_message, reply.situation, reply.suggested_reply,
             recommendation_id, chat.telegram_chat_id, action, reply.observation, reply.unknowns, reply.owner_question,
