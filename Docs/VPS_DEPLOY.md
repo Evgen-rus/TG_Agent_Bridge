@@ -1,29 +1,267 @@
-# Rick on Ubuntu (manual deployment)
+# Установка Рика на Ubuntu (с нуля)
 
-Target: one Ubuntu VPS, Python virtualenv, SQLite, `rick.service`, no Docker. Commands below run on the VPS; replace the repository URL if necessary. Do not deploy until the owner schedules a maintenance window and identifies the current live bot process: Telegram permits only one `getUpdates` poller per token.
+Нужно, если VPS пересоздали или проект переносите на другую машину. Описывает
+полный цикл: пользователь, Python, зависимости, настройки, авторизация,
+системный сервис.
 
-## Prepare
+**Схема на сервере:** без Docker, чистый `systemd`, виртуальное окружение в
+`.venv`, база SQLite, всё состояние в каталоге `runtime/`.
 
-1. Provide Ubuntu with outbound HTTPS to Telegram/OpenAI, enough disk for `runtime/media`, and daily VPS snapshots. Install `git`, `python3`, `python3-venv`, `python3-pip`, `tzdata`, and `sudo` using apt. Ubuntu 22.04 ships Python 3.10; use an isolated Python 3.12 under the `rick` home rather than replacing the system Python.
-2. Create a dedicated unprivileged `rick` user with home `/home/rick`. Clone `https://github.com/Evgen-rus/TG_Agent_Bridge.git` as that user into `/home/rick/TG_Agent_Bridge`.
-3. As `rick` on Ubuntu 22.04, run `python3 -m venv ~/.bootstrap-venv`, `~/.bootstrap-venv/bin/python -m pip install uv`, `~/.bootstrap-venv/bin/uv python install 3.12`, and `~/.bootstrap-venv/bin/uv venv --seed --python 3.12 .venv`. On hosts with Python 3.11 or newer already available, `python3 -m venv .venv` is sufficient. Then run `.venv/bin/python -m pip install -r requirements.txt`. Check `.venv/bin/python -m pip check` and `.venv/bin/python -m pytest -q tests`.
-4. Copy `.env.example` to `.env`, set the Telegram token and owner chat ID privately, and set the non-secret options. Keep `DAILY_REPORT_ENABLED=true`, `DAILY_REPORT_TIME=07:30`, `DAILY_REPORT_TIMEZONE=Europe/Moscow`. Set `chmod 600 .env`; never commit or print its contents.
-5. Create `runtime/logs` and `runtime/media`, owned by `rick`, with restrictive permissions (`chmod 700 runtime runtime/logs runtime/media`). `runtime/` and `.env` are ignored by Git. `chats/*` is also local and ignored; copy actual `config.yaml` and `wiki.md` directories from the old host. Copy any other local knowledge files those chat configs refer to.
-6. Stop the old bot before starting Rick on the VPS. Transfer `runtime/agentbridge.sqlite3` plus retained files under `runtime/media`. A consistent SQLite transfer is made while the old process is stopped; if not possible, use SQLite's backup API rather than copying a live file. Do not transfer stale `runtime/pytest-tmp*` or logs unless needed for investigation. Keep a separate snapshot before schema changes.
+## Что должно быть на сервере
 
-## Codex authentication
+Ubuntu с исходящим доступом к `api.telegram.org` и `api.openai.com` по HTTPS,
+свободное место под `runtime/media` и ежедневные снимки диска.
 
-Run Codex authentication as the **rick** Unix user so the service sees the same home and auth cache. The Python dependency bundles the CLI. Locate it with `.venv/bin/python -c 'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())'`; run that printed executable with `login --device-auth`, then `login status`. Enable device-code login in ChatGPT settings if needed. Device code login and headless fallback are described in the [official OpenAI authentication guide](https://learn.chatgpt.com/docs/auth). Never paste a device code, `auth.json`, or tokens into logs, chat, or Git. If using a copied auth cache, protect `~/.codex/auth.json` with mode 600 and ownership `rick`. Do one explicitly authorized test turn only after service startup.
+## Шаг 1. Системные пакеты
 
-## Service
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip tzdata sudo
+```
 
-1. Review `deploy/systemd/rick.service`; its project path and user must match the actual checkout. Copy it to `/etc/systemd/system/rick.service` with root ownership, then `sudo systemctl daemon-reload`.
-2. For confirmed owner self-restart, install `deploy/systemd/rick-sudoers.example` as `/etc/sudoers.d/rick-restart` with owner root and mode 0440. Validate with `sudo visudo -cf /etc/sudoers.d/rick-restart`. It permits only `/usr/bin/systemctl --no-block restart rick.service`; no shell or arbitrary service name.
-3. Run `sudo systemctl enable --now rick.service`. Check `systemctl status rick.service`, `journalctl -u rick.service -n 100 --no-pager`, and `sudo -u rick /home/rick/TG_Agent_Bridge/.venv/bin/python /home/rick/TG_Agent_Bridge/scripts/diagnose.py`.
-4. Validate owner-only delivery, real Telegram polling heartbeat, one monitored-chat fake or authorized live event, pending queues, Codex authentication, and the next 07:30 Moscow report. `daily_reports` in SQLite records the date and delivery ID. Restart gracefully with `sudo systemctl restart rick.service`; this must not create a crash notice. An unclean process exit should create one durable notice after recovery.
+> На Ubuntu 22.04 системный Python — 3.10, а проекту нужен **3.12**.
+> Системный Python менять не надо: 3.12 ставится отдельно, рядом (шаг 3).
 
-## Updates and rollback
+## Шаг 2. Пользователь и код
 
-Before updating, inspect changes, stop the service, and snapshot the SQLite file. Pull code, install requirements if changed, run tests and diagnose, then start and check the service. For rollback, stop, restore the previous Git revision and matching SQLite snapshot if a schema change occurred, then start and diagnose. `git pull` does not touch ignored `.env`, `runtime/`, `chats/*`, or auth under the service user's home. After VPS reboot, `systemctl is-enabled rick.service` and `systemctl status rick.service` show whether startup succeeded; diagnose and inspect the owner delivery queue.
+```bash
+sudo adduser rick
+sudo -u rick git clone https://github.com/Evgen-rus/TG_Agent_Bridge.git /home/rick/TG_Agent_Bridge
+```
 
-Do not add an application-level daily SQLite backup scheduler; external VPS snapshots are the backup policy. Any destructive migration requires a separate maintenance decision.
+Все дальнейшие команды выполняются **от `rick`** и **из `/home/rick/TG_Agent_Bridge`**.
+Проект не запускается из другой директории — рабочий каталог задан жёстко.
+
+## Шаг 3. Python 3.12 и виртуальное окружение
+
+На машине, где уже есть Python 3.11+, шаг с `bootstrap-venv` можно пропустить и
+создать `.venv` обычным `python3 -m venv .venv`. На Ubuntu 22.04 нужен полный
+вариант:
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+python3 -m venv ~/.bootstrap-venv
+~/.bootstrap-venv/bin/python -m pip install uv
+~/.bootstrap-venv/bin/uv python install 3.12
+~/.bootstrap-venv/bin/uv venv --seed --python 3.12 .venv
+```
+
+**Что здесь происходит.** `~/.bootstrap-venv` — отдельное, «одноразовое»
+окружение только ради установки `uv`: системный Python 3.10 не умеет создать
+окружение 3.12. Дальше `uv` ставит собственный Python 3.12 в
+`~/.local/share/uv/python/` и создаёт основное `.venv`, который уже ссылается на
+него:
+
+```text
+.venv/bin/python -> /home/rick/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12
+```
+
+Проверить, что всё на месте:
+
+```bash
+.venv/bin/python -V                 # Python 3.12.x
+cat .venv/pyvenv.cfg                 # version_info = 3.12, uv = <версия>
+```
+
+## Шаг 4. Зависимости
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip check
+.venv/bin/python -m pytest -q tests
+```
+
+Из `requirements.txt` ключевые пакеты: `openai-codex` (SDK и встроенный CLI
+Codex), `openai-codex-cli-bin` (тот самый исполняемый файл), `python-telegram-bot`,
+`openai`, `PyYAML`, `python-dotenv`, `pytest`.
+
+**Отдельного `pip install codex` не нужно** — CLI лежит внутри пакета.
+
+## Шаг 5. Настройки
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+cp .env.example .env
+chmod 600 .env
+nano .env
+```
+
+Обязательно заполнить:
+
+| Переменная | Что вписать |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Токен бота от BotFather |
+| `OWNER_CHAT_ID` | ID чата владельца (отрицательный для группы) |
+| `OPENAI_API_KEY` | Для распознавания голосовых и утреннего отчёта |
+
+Остальное имеет рабочие значения по умолчанию — см. `.env.example`. Проверить,
+что ключи заданы, можно не показывая значений:
+
+```bash
+cut -d= -f1 .env
+```
+
+`.env` и каталог `runtime/` в Git не попадают. Значения оттуда нельзя
+показывать в чате, логах или коммитах.
+
+## Шаг 6. Каталоги и рабочие данные
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+mkdir -p runtime/logs runtime/media
+chmod 700 runtime runtime/logs runtime/media
+```
+
+Подключённые чаты лежат в `chats/<имя>/` — по два файла на чат:
+
+- `config.yaml` — `telegram_chat_id`, название, при необходимости `memory_project`;
+- `wiki.md` — устойчивый контекст этого чата.
+
+Каталог `chats/*` в Git **не входит**, поэтому при переносе с другого сервера
+его нужно перенести отдельно. То же касается связанных файлов знаний,
+на которые ссылаются конфиги.
+
+## Шаг 7. Перенос базы (если переносите существующего Рика)
+
+Источник истины — `runtime/agentbridge.sqlite3`.
+
+1. **На старом сервере остановить процесс** бота.
+2. Скопировать `runtime/agentbridge.sqlite3` и нужные файлы из `runtime/media`.
+3. На новом сервере положить базу на место и выставить владельца:
+
+```bash
+sudo chown -R rick:rick /home/rick/TG_Agent_Bridge/runtime
+```
+
+Копировать базу при работающем процессе нельзя: файл может оказаться
+нецелостным. Если остановить невозможно — использовать штатный механизм
+SQLite для резервных копий вместо простого копирования. Снимок базы перед
+изменением схемы сделать стоит заранее.
+
+## Шаг 8. Авторизация Codex
+
+Выполнять **от пользователя `rick`** — сервис видит тот же домашний каталог и ту
+же папку `~/.codex`.
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+.venv/bin/python -c 'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())'
+```
+
+Путь из вывода — встроенный исполняемый файл. С ним:
+
+```bash
+<путь> login --device-auth
+<путь> login status
+```
+
+Если в настройках ChatGPT отключён вход по коду устройства — включите его.
+Подробности в [официальной инструкции OpenAI](https://learn.chatgpt.com/docs/auth).
+
+Готовый токен лежит в `~/.codex/auth.json` — права `600`, владелец `rick`. Если
+переносите этот файл, проверьте права после копирования. **Код авторизации,
+`auth.json` и токены нельзя публиковать.**
+
+## Шаг 9. Системный сервис
+
+```bash
+sudo cp /home/rick/TG_Agent_Bridge/deploy/systemd/rick.service /etc/systemd/system/rick.service
+sudo chown root:root /etc/systemd/system/rick.service
+sudo systemctl daemon-reload
+```
+
+Проверьте, что в юните верные путь и пользователь:
+
+```ini
+[Service]
+User=rick
+Group=rick
+WorkingDirectory=/home/rick/TG_Agent_Bridge
+ExecStart=/home/rick/TG_Agent_Bridge/.venv/bin/python -m agentbridge.main
+```
+
+Право Рику перезапускать самого себя (по одной команде, без шелла):
+
+```bash
+sudo cp /home/rick/TG_Agent_Bridge/deploy/systemd/rick-sudoers.example /etc/sudoers.d/rick-restart
+sudo chown root:root /etc/sudoers.d/rick-restart
+sudo chmod 0440 /etc/sudoers.d/rick-restart
+sudo visudo -cf /etc/sudoers.d/rick-restart
+```
+
+Правило разрешает **только** `/usr/bin/systemctl --no-block restart rick.service`.
+Никаких других команд и сервисов. Расширять его нельзя.
+
+## Шаг 10. Запуск
+
+```bash
+sudo systemctl enable --now rick.service
+systemctl status rick.service --no-pager
+journalctl -u rick.service -n 100 --no-pager
+sudo -u rick -H /home/rick/TG_Agent_Bridge/.venv/bin/python /home/rick/TG_Agent_Bridge/scripts/diagnose.py
+```
+
+В журнале ожидаемо:
+
+```text
+event=process_started component=telegram
+event=catchup_finished result=ok
+```
+
+В диагностике — `OVERALL: HEALTHY`.
+
+**Не запускайте второй процесс вручную**, пока сервис работает: на один токен
+Telegram допускается только один получатель `getUpdates`, и второй процесс упадёт.
+Если старый бот ещё где-то работает — остановите его **до** старта.
+
+## Шаг 11. Проверка
+
+- бот появился в чате владельца и отвечает на `@spare_eyes_bot`;
+- в диагностике `telegram.poll_status=RECENT`;
+- `~/.codex/auth.json` на месте, тестовый запрос проходит;
+- в рабочем чате бот предлагает вариант ответа, но **не пишет в сам чат**;
+- утром в 07:30 МСК пришёл отчёт; в базе появилась запись в `daily_reports`.
+
+Мягкий рестарт не должен создавать уведомление о сбое:
+
+```bash
+sudo systemctl restart rick.service
+```
+
+Резкое завершение процесса, наоборот, должно создать его после восстановления.
+
+## Обновление и откат
+
+Обычное обновление кода описано в [README](../README.md#обновление-кода).
+Коротко: остановить сервис, сделать снимок базы, `git pull`, при изменении
+`requirements.txt` — установка, тесты, запуск сервиса, диагностика.
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+sudo systemctl stop rick.service
+cp runtime/agentbridge.sqlite3 runtime/agentbridge.sqlite3.bak
+git pull && .venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pytest -q
+sudo systemctl start rick.service
+```
+
+`git pull` не затрагивает `.env`, `runtime/`, `chats/*` и авторизацию — всё это
+в Git не входит.
+
+Откат: остановить сервис, вернуть предыдущий коммит
+(`git checkout <коммит>`), при изменении схемы — вернуть снимок базы, запустить
+сервис, выполнить диагностику.
+
+После перезагрузки VPS:
+
+```bash
+systemctl is-enabled rick.service
+systemctl status rick.service
+```
+
+## Резервные копии
+
+Отдельного встроенного планировщика копий базы в проекте нет и не требуется:
+политика — внешние ежедневные снимки VPS. Разрушающие изменения схемы
+требуют отдельного решения и окна обслуживания.

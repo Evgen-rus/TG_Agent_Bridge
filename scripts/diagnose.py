@@ -30,6 +30,28 @@ def _stamp(line: str) -> str:
     return parts[0].removeprefix("timestamp=") if parts and parts[0].startswith("timestamp=") else " ".join(parts[:2])
 
 
+def _epoch(stamp: str) -> float | None:
+    """Числовое время метки для сравнения событий; None если разобрать нельзя."""
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _after_success(failures: list[str], success: str | None) -> list[str]:
+    """Падения, случившиеся после последнего успеха Codex.
+
+    Логи живут 7 суток, поэтому падение, случившееся до первого успешного
+    turn, не должно вечно держать OVERALL в DEGRADED: агент уже оправился.
+    """
+    if not failures:
+        return []
+    mark = _epoch(success) if success else None
+    if mark is None:
+        return failures
+    return [item for item in failures if (_epoch(item) or 0) > mark]
+
+
 def diagnose() -> str:
     lines = ["AGENTBRIDGE DIAGNOSE (read-only)"]
     reasons = []
@@ -103,6 +125,7 @@ def diagnose() -> str:
     failures = []
     poll = None
     codex_success = None
+    codex_failures = []
     poll_stalls = 0
     poll_restarts = 0
     for path in log_files[-7:]:
@@ -116,6 +139,8 @@ def diagnose() -> str:
                     poll_restarts += 1
                 if "event=codex_turn_finished" in line:
                     codex_success = _stamp(line)
+                if "event=codex_turn_failed" in line:
+                    codex_failures.append(_stamp(line))
                 if "level=ERROR" in line or "level=CRITICAL" in line or " ERROR " in line or " CRITICAL " in line:
                     event = next((part for part in line.split() if part.startswith("event=")), "event=UNKNOWN")
                     failures.append(f"{_stamp(line)} {event}")
@@ -124,7 +149,14 @@ def diagnose() -> str:
     lines.append(f"telegram.poll_last_log={poll or 'UNKNOWN'}")
     lines.append(f"telegram.stalls_in_logs={poll_stalls} telegram.restarts_in_logs={poll_restarts}")
     lines.append(f"codex.model={os.getenv('CODEX_MODEL', 'UNKNOWN')} effort={os.getenv('CODEX_REASONING_EFFORT', 'UNKNOWN')} defaults=gpt-6-luna/xhigh (.env not read)")
+    active_failures = _after_success(codex_failures, codex_success)
     lines.append(f"codex.auth_file_present={(Path.home() / '.codex' / 'auth.json').is_file()} codex.last_success={codex_success or 'UNKNOWN'}")
+    lines.append(f"codex.turn_failures_in_logs={len(codex_failures)} codex.active_failures={len(active_failures)} codex.last_failure={codex_failures[-1] if codex_failures else 'NONE'}")
+    if active_failures:
+        # Агент молча деградирует в фолбэк-ответы, поэтому падение Codex — это DEGRADED,
+        # даже когда сервис, Telegram и SQLite здоровы. Сбой до последнего успеха
+        # считается историческим: агент уже отвечает нормально.
+        reasons.append("codex_turn_failures")
     lines.append(f"runtime.bytes={_size(RUNTIME)} media.bytes={_size(RUNTIME / 'media')} logs.bytes={_size(LOGS)} disk.free_bytes={shutil.disk_usage(ROOT).free}")
     lines.extend(f"recent_failure {item}" for item in failures[-10:])
     lines.append("OVERALL: " + ("DEGRADED " + ",".join(reasons) if reasons else "HEALTHY (unverified fields marked UNKNOWN)"))

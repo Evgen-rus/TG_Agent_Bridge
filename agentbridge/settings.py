@@ -23,6 +23,7 @@ class Settings:
     owner_codex_model: str = "gpt-6-luna"
     owner_codex_reasoning_effort: str = "xhigh"
     owner_timezone: str = "Asia/Novosibirsk"
+    codex_session_timezone: str = "Europe/Moscow"
     sepia_enabled: bool = True
     message_batch_seconds: float = 20.0
     delivery_retry_seconds: float = 30.0
@@ -69,6 +70,7 @@ class Settings:
             owner_codex_model=os.getenv("OWNER_CODEX_MODEL", "gpt-6-luna").strip(),
             owner_codex_reasoning_effort=os.getenv("OWNER_CODEX_REASONING_EFFORT", "xhigh").strip(),
             owner_timezone=os.getenv("OWNER_TIMEZONE", "Asia/Novosibirsk").strip() or "Asia/Novosibirsk",
+            codex_session_timezone=os.getenv("CODEX_SESSION_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
             sepia_enabled=os.getenv("SEPIA_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
             message_batch_seconds=float(os.getenv("MESSAGE_BATCH_SECONDS", "20")),
             delivery_retry_seconds=float(os.getenv("DELIVERY_RETRY_SECONDS", "30")),

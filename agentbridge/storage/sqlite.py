@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
 import logging
 import sqlite3
@@ -42,6 +43,63 @@ MEMORY_KINDS = (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Ключ пары уведомлений об исчерпанном лимите Codex: пока он есть в
+# operational_state, владельцу не отправляются повторные сообщения о том же.
+_CODEX_LIMIT_KEY = "codex_usage_limit:notice"
+_CODEX_LIMIT_REASON_KEY = "codex_usage_limit:reset_hint"
+
+CODEX_LIMIT_NOTICE = (
+    "Лимит Codex исчерпан. Я продолжаю принимать сообщения и распознавать голос, "
+    "но не могу анализировать чаты и отвечать по существу.{reset}"
+    " Пока лимит не восстановится, полезных подсказок не будет. "
+    "Он восстановится автоматически: как только первая попытка пройдёт, я сообщу."
+)
+
+CODEX_RECOVERED_NOTICE = (
+    "Codex снова отвечает — лимит восстановился, я снова могу анализировать чаты "
+    "и предлагать ответы."
+)
+
+
+def codex_limit_notice(reset_hint: str) -> str:
+    """Текст уведомления о лимите.
+
+    reset_hint — уже переведённое в зону владельца время, либо пустая строка,
+    если Codex не назвал время сброса."""
+    if not reset_hint:
+        return CODEX_LIMIT_NOTICE.format(reset="")
+    return CODEX_LIMIT_NOTICE.format(reset=f" По данным Codex восстановление в {reset_hint}.")
+
+
+def codex_limit_reset_local(reset_hint: str, timezone_name: str, *, session_timezone_name: str) -> str:
+    """Перевести время сброса из зоны сессии Codex в зону владельца.
+
+    Codex печатает время в зоне своей сессии — на этом VPS это Europe/Moscow,
+    потому что сервер и сессия живут в ней. Считать это время за UTC нельзя:
+    получилось бы на три часа позже. Подпись зоны берётся из OWNER_TIMEZONE,
+    а не пишется константой. Если перевести не удалось, исходная подсказка
+    остаётся в ответе, чтобы уведомление всё равно объяснило ситуацию."""
+    if not reset_hint:
+        return ""
+    parts = reset_hint.replace("UTC", "").strip().split(":")
+    if len(parts) < 2:
+        return reset_hint
+    try:
+        source = ZoneInfo(session_timezone_name)
+        hour, minute = int(parts[0]), int(parts[1])
+        today = datetime.now(timezone.utc).astimezone(source)
+        moment = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        zone = ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError, TypeError):
+        return reset_hint
+    local = moment.astimezone(zone)
+    offset = local.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    zone_label = timezone_name.split("/")[-1].replace("_", " ")
+    return f"{local:%H:%M} {zone_label} (UTC{sign}{abs(total_minutes) // 60:02d}:{abs(total_minutes) % 60:02d})"
 
 
 @dataclass(frozen=True)
@@ -287,6 +345,43 @@ class ChatThreadStore:
             connection.execute("INSERT INTO operational_state(key, value) VALUES(?, ?)", (key, str(cursor.lastrowid)))
             logger.info("event=delivery_queued component=storage delivery_id=%s operation=operational_notice", cursor.lastrowid)
             return cursor.lastrowid
+
+    def note_codex_usage_limit(self, reset_hint: str) -> None:
+        """Запомнить активный лимит и время сброса, не отправляя сообщение.
+
+        Вызывается на каждый отказ: сам текст уведомления уходит только
+        один раз, а время сброса нужно приложению, чтобы отвечать внятно
+        дальше, не тратя ещё одну попытку на заведомо отказный запрос."""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_CODEX_LIMIT_REASON_KEY, reset_hint or ""),
+            )
+
+    def clear_operational_state(self, key: str) -> None:
+        """Снять метку, чтобы следующий такой же случай снова сработал.
+
+        Используется для парных уведомлений: восстановился лимит — и ключ
+        снят, чтобы следующий лимит снова привёл ровно одно сообщение."""
+        with self._connect() as connection:
+            connection.execute("DELETE FROM operational_state WHERE key=?", (key,))
+
+    def codex_usage_limit_active(self) -> bool:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM operational_state WHERE key=? LIMIT 1", (_CODEX_LIMIT_KEY,),
+            ).fetchone() is not None
+
+    def codex_usage_limit_reason(self) -> str:
+        """Время сброса лимита, сохранённое вместе с уведомлением.
+
+        Нужно, чтобы внятное объяснение не зависело от того, успеет ли
+        пройти новая попытка: при уже известном лимите повторный запрос
+        к Codex не делаем, а отвечаем сразу."""
+        with self._connect() as connection:
+            row = connection.execute("SELECT value FROM operational_state WHERE key=?", (_CODEX_LIMIT_REASON_KEY,)).fetchone()
+        return row[0] if row else ""
 
     def record_operational_event(self, event: str, level: str) -> None:
         with self._connect() as connection:

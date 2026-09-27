@@ -1,12 +1,25 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import sqlite3
 
-from agentbridge.storage.sqlite import ChatThreadStore
+import pytest
+
+from agentbridge.agents.codex import CodexProvider, is_usage_limit_error, limit_reset_hint
+from agentbridge.application import AgentBridgeApplication
+from agentbridge.storage.sqlite import (
+    CODEX_RECOVERED_NOTICE,
+    _CODEX_LIMIT_KEY,
+    _CODEX_LIMIT_REASON_KEY,
+    ChatThreadStore,
+    codex_limit_notice,
+    codex_limit_reset_local,
+)
 from agentbridge.logging import redact_secrets
 from agentbridge.telegram.bot import due_report_windows
 from agentbridge.telegram.polling import PollingHeartbeat
 from scripts import diagnose as health
+from tests.test_application import QueryProvider
 
 
 def test_daily_report_moscow_boundary_and_catchup() -> None:
@@ -83,3 +96,127 @@ def test_openai_credentials_are_redacted() -> None:
     redacted = redact_secrets(sample)
     assert "ABCDEFGHIJKLMNOPQRST" not in redacted
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
+
+
+def test_only_explicit_usage_limit_is_treated_as_limit() -> None:
+    limit = SimpleNamespace(message="You've hit your usage limit. try again at 11:27 AM.")
+    assert is_usage_limit_error(limit) is True
+    assert is_usage_limit_error(SimpleNamespace(message="codex_error_info: usage_limit_exceeded")) is True
+    # Соседние ошибки не должны выдавать уведомление о лимите.
+    for message in ("429 Too Many Requests", "request timed out after 30s",
+                    "The 'gpt-6-luna' model is not supported", "Unauthorized 401"):
+        assert is_usage_limit_error(SimpleNamespace(message=message)) is False
+
+
+def test_limit_reset_time_handles_midnight_and_noon() -> None:
+    def hint(text: str) -> str:
+        return limit_reset_hint(SimpleNamespace(message=f"usage_limit_exceeded, {text}"))
+
+    # Время выходит без зонной подписи: Codex печатает его в зоне сессии.
+    assert hint("try again at 11:27 AM") == "11:27"
+    assert hint("try again at 3:07 PM") == "15:07"
+    assert hint("try again at 12:05 AM") == "00:05"
+    assert hint("try again at 12:30 PM") == "12:30"
+    # Неправильное время из текста ошибки не должно превращаться в вывод.
+    assert hint("try again at 13:99 AM") == ""
+    assert hint("try again at 0:30 AM") == ""
+
+
+def test_limit_notice_mentions_reset_time_and_omits_it_when_unknown() -> None:
+    assert "11:27 UTC" in codex_limit_notice("11:27 UTC")
+    assert "восстановление в" not in codex_limit_notice("")
+
+
+def test_usage_limit_notifies_once_and_recovery_once() -> None:
+    limit_error = SimpleNamespace(message="You've hit your usage limit. try again at 11:27 AM.")
+    provider = CodexProvider(on_usage_limit=lambda hint: None, on_usage_recovered=lambda: None)
+    provider._note_failure(limit_error)
+    provider._note_failure(limit_error)
+    provider._note_failure(limit_error)
+    provider._note_success()
+    provider._note_success()
+    provider._note_failure(limit_error)
+    provider._note_success()
+    assert provider._usage_exhausted is False
+
+
+def test_durable_limit_notice_pair_survives_restart(tmp_path: Path) -> None:
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    first = store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27 UTC"))
+    # Повторные отказы не плодят сообщения владельцу.
+    assert store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27 UTC")) == first
+    assert store.codex_usage_limit_active() is True
+    # Метка живёт в SQLite, поэтому новый процесс не пришлёт лимит повторно.
+    reopened = ChatThreadStore(tmp_path / "state.sqlite3")
+    assert reopened.codex_usage_limit_active() is True
+    reopened.clear_operational_state(_CODEX_LIMIT_KEY)
+    assert reopened.codex_usage_limit_active() is False
+    second = reopened.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27 UTC"))
+    assert second != first
+    recovered = reopened.queue_operational_notice("codex_usage_limit:recovered", CODEX_RECOVERED_NOTICE)
+    with sqlite3.connect(reopened.database_path) as conn:
+        texts = [row[0] for row in conn.execute(
+            "SELECT text FROM owner_query_deliveries WHERE id IN (?,?,?)", (first, second, recovered),
+        )]
+    assert sum("Лимит Codex исчерпан" in item for item in texts) == 2
+    assert sum("снова отвечает" in item for item in texts) == 1
+
+
+def test_other_failures_do_not_touch_the_limit_notice() -> None:
+    provider = CodexProvider(on_usage_limit=lambda hint: None, on_usage_recovered=lambda: None)
+    provider._note_failure(RuntimeError("connection reset by peer"))
+    assert provider._usage_exhausted is False
+
+
+def test_reset_time_is_translated_from_session_zone() -> None:
+    # Codex печатает время в зоне сессии. На этом VPS сессия идёт по Москве,
+    # поэтому 11:27 — это 15:27 по Новосибирску, а не 18:27: раньше здесь
+    # ошибочно считали, что это UTC, и время уезжало на три часа.
+    def local(zone: str, source: str = "Europe/Moscow") -> str:
+        return codex_limit_reset_local("11:27", zone, session_timezone_name=source)
+
+    assert local("Asia/Novosibirsk") == "15:27 Novosibirsk (UTC+07:00)"
+    assert local("Europe/Moscow") == "11:27 Moscow (UTC+03:00)"
+    assert local("Asia/Yekaterinburg") == "13:27 Yekaterinburg (UTC+05:00)"
+    # Если сессия Codex поедет в UTC, пересчёт последует за ней.
+    assert local("Asia/Novosibirsk", "UTC") == "18:27 Novosibirsk (UTC+07:00)"
+    # Переход через полночь: 23:59 по Москве — это уже 03:59 следующих суток.
+    assert codex_limit_reset_local("23:59", "Asia/Novosibirsk", session_timezone_name="Europe/Moscow") == "03:59 Novosibirsk (UTC+07:00)"
+    assert codex_limit_reset_local("00:30", "Asia/Novosibirsk", session_timezone_name="Europe/Moscow") == "04:30 Novosibirsk (UTC+07:00)"
+    # Негодные данные не ломают уведомление, а остаются как есть.
+    assert codex_limit_reset_local("", "Asia/Novosibirsk", session_timezone_name="Europe/Moscow") == ""
+    assert codex_limit_reset_local("мусор", "Asia/Novosibirsk", session_timezone_name="Europe/Moscow") == "мусор"
+    assert codex_limit_reset_local("11:27", "Not/AZone", session_timezone_name="Europe/Moscow") == "11:27"
+
+
+def test_saved_reset_hint_is_readable_and_cleared(tmp_path: Path) -> None:
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    store.note_codex_usage_limit("11:27 UTC")
+    assert store.codex_usage_limit_reason() == "11:27 UTC"
+    # Повторный отказ обновляет время, а не теряет его.
+    store.note_codex_usage_limit("14:27 UTC")
+    assert store.codex_usage_limit_reason() == "14:27 UTC"
+    store.clear_operational_state(_CODEX_LIMIT_REASON_KEY)
+    assert store.codex_usage_limit_reason() == ""
+
+
+@pytest.mark.asyncio
+async def test_limit_replaces_clarification_placeholder(tmp_path: Path, chat_registry) -> None:
+    store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
+    provider = QueryProvider()
+    service = AgentBridgeApplication(chat_registry, store, provider, owner_chat_id=7654321)
+    # Без лимита Рик уточняет охват и до Codex не доходит.
+    plain = await service.handle_owner_query("Ну что там?")
+    assert "Уточните" in plain.text
+    assert "Лимит Codex" not in plain.text
+    attempts_without_limit = provider.owner_threads_created
+
+    store.note_codex_usage_limit("11:27 UTC")
+    store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice("11:27 UTC"))
+    limited = await service.handle_owner_query("Ну что там?")
+    assert "Лимит Codex исчерпан" in limited.text
+    assert "11:27 UTC" in limited.text
+    assert "Ну что там?" in limited.text
+    assert "Уточните" not in limited.text
+    # Известный лимит не должен стоить ещё одной попытки обращения к Codex.
+    assert provider.owner_threads_created == attempts_without_limit

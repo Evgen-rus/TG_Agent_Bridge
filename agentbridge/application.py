@@ -13,7 +13,7 @@ from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new
 from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
 from .owner_query import OwnerQueryIntent, OwnerQueryScope, PortfolioChatSummary, parse_owner_time_phrase
-from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, ReminderRecord, RuleRecord, StoredMessage
+from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, ReminderRecord, RuleRecord, StoredMessage, codex_limit_notice
 
 logger = logging.getLogger(__name__)
 _GLOBAL_WORDING = re.compile(r"\b(для\s+всех|всем\s+клиент|глобальн)", re.IGNORECASE)
@@ -880,6 +880,15 @@ class AgentBridgeApplication:
     ) -> OwnerQueryResult | str | None:
         if update_id is not None and self.store.is_update_processed(update_id):
             return None
+        # Проверяем лимит первым: пока Codex не может думать, разбор адресата
+        # и любые уточняющие вопросы бессмысленны, и каждый такой вопрос
+        # стоил бы ещё одной заведомо отказной попытки.
+        limit_answer = self._codex_limit_answer(text)
+        if limit_answer is not None and reply_to_message_id is None:
+            prompt_id = self.store.create_owner_query_prompt(text)
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return OwnerQueryResult(limit_answer, prompt_id)
         if reply_to_message_id is not None:
             continued = await self.continue_owner_query(reply_to_message_id, text, update_id)
             if continued is not None:
@@ -938,6 +947,16 @@ class AgentBridgeApplication:
         if update_id is not None:
             self.store.mark_update_processed(update_id)
         return self._follow_up_query_result(chat, text, answer, scope=scope_for_chat)
+
+    def _codex_limit_answer(self, text: str) -> str | None:
+        """Внятный ответ вместо заглушки, пока активен лимит Codex.
+
+        Возвращает None, если лимита нет — тогда всё идёт по обычному пути.
+        Текст тот же, что уходит в уведомлении, чтобы владелец увидел одну
+        и ту же формулировку."""
+        if not self.store.codex_usage_limit_active():
+            return None
+        return codex_limit_notice(self.store.codex_usage_limit_reason()) + f"\n\nВаш вопрос: {text}"
 
     async def _resolve_owner_query_scope(self, text: str) -> OwnerQueryScope | None:
         chats = self.registry.all_chats()

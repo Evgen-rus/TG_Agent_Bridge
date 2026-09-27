@@ -9,8 +9,17 @@ from .application import AgentBridgeApplication
 from .chats.loader import ChatRegistry
 from .logging import OperationalEventHandler, configure_logging
 from .settings import Settings
-from .storage.sqlite import ChatThreadStore
+from .storage.sqlite import (
+    CODEX_RECOVERED_NOTICE,
+    _CODEX_LIMIT_KEY,
+    _CODEX_LIMIT_REASON_KEY,
+    ChatThreadStore,
+    codex_limit_notice,
+    codex_limit_reset_local,
+)
 from .telegram.bot import create_telegram_application
+
+_CODEX_RECOVERED_KEY = "codex_usage_limit:recovered"
 
 
 def main() -> None:
@@ -21,17 +30,41 @@ def main() -> None:
     registry = ChatRegistry.load(settings.chats_dir)
     store = ChatThreadStore(settings.database_path)
     logging.getLogger().addHandler(OperationalEventHandler(store.record_operational_event))
+
+    def notify_owner_codex_limit(reset_hint: str) -> None:
+        # Codex печатает время сброса в зоне сессии, а не в UTC: на этом VPS
+        # сессия идёт по Europe/Moscow. Переводим в зону владельца.
+        local_hint = codex_limit_reset_local(
+            reset_hint, settings.owner_timezone,
+            session_timezone_name=settings.codex_session_timezone,
+        )
+        # Метку восстановления снимаем заранее: без этого второй по счёту лимит
+        # не смог бы прислать своё уведомление о восстановлении.
+        store.clear_operational_state(_CODEX_RECOVERED_KEY)
+        store.note_codex_usage_limit(local_hint)
+        store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(local_hint))
+
+    def notify_owner_codex_recovered() -> None:
+        # Метку лимита снимаем, иначе следующий лимит не даст уведомления.
+        store.clear_operational_state(_CODEX_LIMIT_KEY)
+        store.clear_operational_state(_CODEX_LIMIT_REASON_KEY)
+        store.queue_operational_notice(_CODEX_RECOVERED_KEY, CODEX_RECOVERED_NOTICE)
+
     provider = CodexProvider(
         model=settings.codex_model,
         reasoning_effort=settings.codex_reasoning_effort,
         cwd=root,
         sepia_enabled=settings.sepia_enabled,
+        on_usage_limit=notify_owner_codex_limit,
+        on_usage_recovered=notify_owner_codex_recovered,
     )
     owner_provider = CodexProvider(
         model=settings.owner_codex_model,
         reasoning_effort=settings.owner_codex_reasoning_effort,
         cwd=root,
         sepia_enabled=False,
+        on_usage_limit=notify_owner_codex_limit,
+        on_usage_recovered=notify_owner_codex_recovered,
     )
     service = AgentBridgeApplication(
         registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size, settings.chats_dir,
@@ -70,6 +103,10 @@ def main() -> None:
         )
         logging.warning("event=previous_run_unclean component=application run_started_at=%s", previous_unclean)
         store.record_operational_event("previous_run_unclean", "WARNING")
+    # Лимит мог быть обнаружен до того, как время сброса начало сохраняться.
+    # Тогда ключ есть, а причины нет — и уведомление выходит без времени.
+    if store.codex_usage_limit_active() and not store.codex_usage_limit_reason():
+        logging.warning("event=codex_usage_limit_reset_unknown component=application")
     try:
         telegram_application.run_polling(
             allowed_updates=["message", "callback_query", "my_chat_member"],

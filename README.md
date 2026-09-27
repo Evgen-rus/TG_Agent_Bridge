@@ -1,271 +1,200 @@
-# AgentBridge
+# AgentBridge (Рик)
 
-Minimal suggest-only bridge from monitored Telegram chats to a persistent Codex
-thread. Suggestions go only to the configured owner chat; the bot never replies
-to monitored chats.
+Телеграм-мост, который читает рабочие чаты и подсказывает владельцу, что делать.
+Это **не автоответчик**: бот никогда не пишет в клиентские чаты, все сообщения
+уходят только в чат владельца.
 
-Incoming Telegram messages are saved to SQLite first, then analysed as a short
-episode of the current situation. After a restart the bot ingests the Telegram
-backlog instead of dropping it, rebuilds the picture from stored history, and
-notifies the owner only about the current outcome.
-
-## Configure
-
-1. Copy `.env.example` to `.env`.
-2. Set `TELEGRAM_BOT_TOKEN` and `OWNER_CHAT_ID`.
-3. For voice message transcription set `OPENAI_API_KEY`; `TRANSCRIPTION_MODEL`
-   defaults to `gpt-4o-mini-transcribe`.
-4. Copy `chats/example` to a meaningful directory, set the monitored numeric
-   `telegram_chat_id`, and replace `wiki.md` with that chat's stable context.
-   Loaded chats receive the compact `knowledge/leadgenbureau` pack by default.
-   Set `knowledge_pack: none` to opt out. Only `core.md` is injected each turn.
-5. Remove the example directory or change its placeholder chat ID.
-
-Client recommendations default to `gpt-6-luna` with reasoning effort `xhigh`.
-Their final wording is passed through the project-local Sepia `refactor` skill
-with the `client-chat` profile. Sepia receives only Rick's finished draft,
-communication state, and relevant facts/constraints, not the chat history.
-Set `SEPIA_ENABLED=false` to bypass this layer. Edit
-`.agents/skills/client-chat/SKILL.md` to change its client-chat style rules.
-The internal Owner contour has separate settings and defaults to `gpt-6-luna`
-with reasoning effort `xhigh`. Change them in `.env` without editing
-code, for example when you want to reduce usage:
-
-```dotenv
-OWNER_CODEX_MODEL=gpt-6-luna
-OWNER_CODEX_REASONING_EFFORT=none
-OWNER_TIMEZONE=Asia/Novosibirsk
-```
-
-The official Python SDK reuses existing Codex authentication. To start browser
-login from Python
-when no account is available:
-
-```powershell
-.\.venv\Scripts\python.exe -c "from openai_codex import Codex; c=Codex(); h=c.login_chatgpt(); print(h.auth_url); print(h.wait().success); c.close()"
-```
-
-Never commit `.env` or Codex authentication files.
-
-Owner reminders are created with `/remind YYYY-MM-DD HH:MM text` in the owner
-chat. The time is interpreted in `OWNER_TIMEZONE`; `/reminders` shows the
-unsent queue. Due reminders are stored in SQLite and delivered only to the
-owner chat by the existing retry loop.
-
-For an owner question with no explicit client, choose `Общая задача`. Rick first
-shows how it understood the task and waits for confirmation, clarification, or
-cancellation. This mode has one persistent Codex thread and no client context.
-Phrases such as `напомни через час проверить отчёт` use the same durable reminder
-store after confirmation; `/remind` remains available as the exact command form.
-On the VPS, an explicit request such as `Рик, перезагрузись` follows the
-same confirmation gate. The fixed `rick.service` restarts under systemd,
-and the new process reports its return to the owner chat.
-
-Владелец может спросить сразу про один, несколько или все подключённые чаты.
-Для неоднозначного запроса бот покажет выбор проектов. Периоды вроде «сегодня»,
-«вчера», «за неделю» и «последние 7 дней» считаются в `OWNER_TIMEZONE` и
-фильтруют историю по полуоткрытому UTC-интервалу. Без периода используются
-текущее состояние и ограниченная недавняя история.
-
-`MESSAGE_BATCH_SECONDS` controls the live per-chat collection window and
-defaults to 20 seconds. Human messages received in the same monitored chat
-during that window, including messages from different people, are analysed
-together as one episode. Separate chats always use separate batches.
-
-After downtime, polling starts with live analysis off. Incoming backlog is
-saved to SQLite first. `CATCHUP_IDLE_SECONDS` (2 by default) waits until that
-stream goes quiet, then catch-up processes the pending sequence. A large
-backlog is split into ordered episodes of `CATCHUP_EPISODE_SIZE` messages.
-Only the last episode may notify the owner. Live debounce begins after catch-up.
-
-The globally installed `codex` command is optional for this project: the
-`openai-codex` package includes its compatible runtime. Authentication is still
-required before a real suggestion can be generated.
-
-## Run
-
-```powershell
-.\.venv\Scripts\python.exe -m agentbridge.main
-```
-
-Ubuntu production uses `rick.service`; see [VPS deployment](Docs/VPS_DEPLOY.md)
-and [operations](Docs/OPERATIONS.md). Read-only health check:
-`python scripts/diagnose.py`. Daily owner report settings are
-`DAILY_REPORT_ENABLED`, `DAILY_REPORT_TIME` (07:30), and
-`DAILY_REPORT_TIMEZONE` (Europe/Moscow).
-
-The SQLite mapping is created at `runtime/agentbridge.sqlite3`. It stores
-Telegram history, one Codex thread ID per monitored chat, compact `chat_state`,
-recommendations, rules, and memory. Client photos and files are downloaded only
-for the current episode into `MEDIA_DIR` (default `runtime/media`), then deleted.
-`MEDIA_TTL_SECONDS` (3600) is the leftover-file safety net. Telegram `file_id`
-stays in SQLite so the bot can fetch the same file again if needed.
-
-Voice messages are supported. Each incoming voice note is stored first, then
-transcribed in the background with `TRANSCRIPTION_MODEL` (requires
-`OPENAI_API_KEY`) while the per-chat batch window runs; the transcript is saved
-to SQLite and sent to Codex as `[голосовое] текст` instead of an audio file.
-If transcription fails or hears no speech, a placeholder text is used so the
-batch is never blocked. Without `OPENAI_API_KEY` voice notes stay pending as
-plain attachments and everything else works as before.
-
-A voice note sent by the owner in the owner chat (typically as a reply to a bot
-recommendation) is transcribed on the fly and then handled exactly like typed
-text: feedback and question answers work over voice. A standalone owner voice
-note invokes the assistant when its transcript begins with `Рик` or `Агент`.
-The same leading names invoke it in an ordinary owner text message. Telegram
-media downloads use bounded retries; replying to a voice-download error keeps
-the original bot-message link for the repeated voice note.
-
-For predictable suggest-only operation, startup no longer drops Telegram
-updates. Successfully processed update IDs are stored in the same SQLite
-database, so Telegram retries are not sent to Codex twice. Messages authored by
-bot accounts are ignored.
-
-## Owner learning
-
-Use a separate service group as `OWNER_CHAT_ID`. The bot speaks there as a
-second pilot: it can propose a client reply, ask you one missing fact, or just
-point out a risk. It does not jump into ordinary conversation.
-
-The agent is invoked in the owner group when:
-
-- a person replies to a bot recommendation or question;
-- a person explicitly mentions/tags the bot, for example `@agent что сейчас
-  происходит с Татьяной?`;
-- a person replies to a “new group without wiki” card after the bot became
-  admin, or after the first message from a group where it was already admin.
-
-Telegram cannot list every group the bot is already in. A quiet group with no
-new messages stays undiscovered until someone writes or membership changes.
-
-Any human member can reply to a suggestion with a correction in ordinary
-language. Codex shows how it understood the correction; **Да, применить**
-confirms it and **Нет, уточнить** asks for clarification. Rules apply to that
-client by default. Global scope requires explicit wording such as "for all
-clients".
-
-Use `/rules` in the owner group to inspect active rules and `/undo` to deactivate
-the most recently confirmed active rule. After startup those two commands appear
-only in the owner chat Telegram command menu (the `/` list, or the Menu button
-in a private owner chat). Client chats do not get this menu. Corrected
-suggestions still go only to the owner group and are never sent to a client chat.
-
-If the bot asks a clarifying question, reply to that question. The answer is
-applied to the original client chat and may be offered as confirmable memory.
-
-### Context memory
-
-Reply to an owner recommendation with one of these prefixes to prepare a
-confirmable memory entry:
+## Как это работает
 
 ```text
-Контекст: факт, важный только для этого чата
-Контекст проекта: факт для связанных чатов одного проекта
-Общий контекст: факт, применимый во всех подключённых чатах
+Рабочий чат в Телеграме
+  → сообщения сохраняются в SQLite
+  → за последние 20 секунд накапливается эпизод
+  → Codex кратко оценивает ситуацию и предлагает ответ
+  → формулировка прогоняется через стиль «Сепы»
+  → предложение уходит в чат владельца
 ```
 
-The bot asks for confirmation before saving the entry. Chat memory stays within
-that chat; project memory is available only to chats with the same
-`memory_project` in `config.yaml`; common memory is available everywhere.
+Дальше владелец нажимает **«Да, применить»** или **«Нет, уточнить»**, либо
+пишет ответ своим словом. Всё решение остаётся за человеком.
 
-In the owner group you can add common memory without choosing a client. Write a
-new message (no reply and no @mention needed):
+Важные свойства:
 
-```text
-Общий контекст: фраза про отдел маркетинга утверждена для робота.
+- **История — в SQLite, а не в памяти агента.** База `runtime/agentbridge.sqlite3`
+  и есть источник истины. Треды Codex — только связность между обращениями.
+- **После перезапуска бэклог не теряется**, а обрабатывается пачками, без
+  «залпов» из десятков старых рекомендаций.
+- **У каждого чата свой тред Codex и свой контекст** — `config.yaml` и `wiki.md`
+  разных чатов никогда не смешиваются.
+- **Голосовые распознаются** через `gpt-4o-mini-transcribe` и передаются в
+  Codex как обычный текст.
+- **Утренний отчёт** владельцу в 07:30 по Москве.
+- **При исчерпании лимита Codex Рик сообщает об этом сам** — одним сообщением
+  в чат владельца, и ещё одним, когда лимит восстановится. Подробности в
+  [Docs/OPERATIONS.md](Docs/OPERATIONS.md#рик-сообщает-сам).
+
+## Как пользоваться ботом
+
+В чате владельца (`OWNER_CHAT_ID`) бот отвечает, если:
+
+- вы **ответили на сообщение бота**;
+- вы **упомянули его** через `@spare_eyes_bot` или слово «Рик,» / «Агент,»
+  в начале сообщения (в том числе в голосовом);
+- вы написали **`Общий контекст: …`** — это глобальная память для всех чатов.
+
+Для рабочих чатов бот молча накапливает эпизод. Для фразы без понятного адресата
+(например «Рик, что с Татьяной?») бот покажет список подключённых чатов и
+попросит уточнить.
+
+Команды: `/rules` — активные правила, `/undo` — отключить последнее,
+`/remind YYYY-MM-DD HH:MM текст` — напоминание, `/reminders` — очередь.
+
+## Команды на VPS
+
+Запускать **только из корня проекта** — там жёстко задан рабочий каталог.
+
+```bash
+cd /home/rick/TG_Agent_Bridge
 ```
 
-The bot asks for confirmation, then stores the fact for every connected chat.
-`Контекст:` and `Контекст проекта:` still need a reply to a bot recommendation.
-Messages from the configured internal LeadRecord participants are not answered,
-but their recent text is retained as local context for later client messages.
+### Старт, стоп, перезапуск
 
-Diagnostic logs are written to `runtime/logs/agentbridge.log`, rotate daily,
-and retain seven days by default. They contain event identifiers and processing
-stages, not Telegram message bodies. `LOG_DIR` and `LOG_RETENTION_DAYS` override
-the defaults.
-
-Startup `getMe` retries `TELEGRAM_BOOTSTRAP_RETRIES` times (5 by default) if
-Telegram times out through a proxy. `0` keeps the old fail-fast behaviour.
-
-Long polling has a separate liveness guard. Every `getUpdates` call updates a
-monotonic heartbeat, including empty responses from quiet chats.
-`TELEGRAM_POLL_HARD_TIMEOUT_SECONDS` (30 by default) cancels a single stuck
-request. The watchdog checks every `TELEGRAM_POLL_WATCHDOG_SECONDS` (15) and,
-after `TELEGRAM_POLL_STALL_SECONDS` (90) without polling progress, restarts the
-Telegram updater without dropping pending updates. A restart has
-`TELEGRAM_POLL_RESTART_TIMEOUT_SECONDS` (30) to finish. If recovery fails, the
-process exits with an error instead of remaining falsely healthy; run it under
-a supervisor configured to restart failed processes. Healthy polling is logged
-at most once every five minutes, while stalls and restarts are logged
-immediately.
-
-Recommendations are written to SQLite before Telegram delivery. If Telegram is
-temporarily unavailable, delivery is retried every `DELIVERY_RETRY_SECONDS`
-seconds and pending recommendations are retried again after application restart.
-Delivery is at-least-once: if Telegram accepts a message but the local database
-update fails, the same recommendation can be sent twice.
-
-## Test
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest
+```bash
+sudo systemctl start rick.service      # запустить
+sudo systemctl stop rick.service       # остановить
+sudo systemctl restart rick.service    # перезапустить
+sudo systemctl enable rick.service     # автозапуск при загрузке ОС
+systemctl status rick.service --no-pager
 ```
 
-## Обновление OpenAI Codex
+**Не запускайте второй процесс вручную**, пока сервис работает: Telegram
+допускает только один получатель `getUpdates` на токен, и второй процесс упадёт.
 
-Если AgentBridge внезапно перестал работать с новой моделью Codex и появляется ошибка вроде:
+```bash
+cd /home/rick/TG_Agent_Bridge
+.venv/bin/python -m agentbridge.main   # только при остановленном сервисе
+```
+
+### Логи
+
+```bash
+journalctl -u rick.service -f                      # смотреть вживую
+journalctl -u rick.service --since '1 hour ago'    # за последний час
+journalctl -u rick.service -p err --since today    # только ошибки
+tail -f runtime/logs/agentbridge.log               # лог самого приложения
+```
+
+Время в `journalctl` — **московское**, в `agentbridge.log` — **UTC**. Сверяйте
+по дате. В журнале systemd сообщения хранятся 14 дней, лог приложения — 7.
+
+### Диагностика
+
+```bash
+sudo -u rick -H .venv/bin/python scripts/diagnose.py
+```
+
+Запускать **от пользователя `rick`** — иначе `codex.auth_file_present` покажет
+`False` (у `root` свой домашний каталог). Скрипт ничего не меняет и не читает
+`.env`. Итоговая строка `OVERALL` — главный показатель:
+
+- `HEALTHY` — всё работает;
+- `DEGRADED <причина>` — есть проблема, причина названа прямо в строке.
+
+### Обновление кода
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+sudo systemctl stop rick.service
+git pull
+.venv/bin/python -m pip install -r requirements.txt   # если менялся requirements.txt
+.venv/bin/python -m pytest -q
+sudo systemctl start rick.service
+.venv/bin/python scripts/diagnose.py                  # от rick, см. выше
+```
+
+Перед `git pull` имеет смысл сделать копию базы: `cp runtime/agentbridge.sqlite3 runtime/agentbridge.sqlite3.bak`.
+Если что-то пошло не так — вернуть на место и запустить сервис заново.
+
+### Обновление Codex
+
+Актуальные версии сейчас: `openai-codex 0.157.1` и `openai-codex-cli-bin 0.157.1`.
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+sudo systemctl stop rick.service
+.venv/bin/python -m pip install -U openai-codex openai-codex-cli-bin
+.venv/bin/python -m pip list | grep -i codex     # проверить версии
+sudo systemctl start rick.service
+```
+
+Останавливать сервис **не обязательно** для самой установки пакетов, но
+**обязательно** перезапустите его после: процесс держит старый модуль в памяти.
+
+Частая причина проблем — не этот проект, а устаревшая версия пакета:
 
 ```text
 The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.
 ```
 
-сначала проверь версии Python SDK и встроенного Codex CLI:
+Тогда обновляйте оба пакета. Проверить доступные версии:
+`.venv/bin/python -m pip index versions openai-codex`.
 
-```powershell
-python -m pip list | findstr /I codex
+### Авторизация Codex
+
+Токен хранится в `~/.codex/auth.json` пользователя `rick`. Если файл пропал:
+
+```bash
+cd /home/rick/TG_Agent_Bridge
+.venv/bin/python -c "from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())"
 ```
 
-Пример:
+Путь из последней строки — готовый исполняемый файл. С ним:
 
-```text
-openai-codex          0.154.0
-openai-codex-cli-bin  0.154.0
+```bash
+<путь> login --device-auth
+<путь> login status
 ```
 
-AgentBridge использует Codex через Python-пакет `openai-codex`. Глобальная команда `codex` для работы проекта не обязательна.
+Если доступа нет, заводите сессию вручную. **Не вставляйте токены и коды
+авторизации в чат, логи или Git.**
 
-Обновить Codex внутри активного `.venv`:
+## Настройки
 
-```powershell
-python -m pip install -U openai-codex openai-codex-cli-bin
+Все настройки — в файле `.env` (права `600`, в Git не попадает). Полный список
+с комментариями: `.env.example`. Значения по умолчанию:
+
+| Переменная | По умолчанию | Зачем |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | — | Токен бота, обязателен |
+| `OWNER_CHAT_ID` | — | Чат владельца, куда идут все ответы |
+| `OPENAI_API_KEY` | — | Распознавание голосовых и дневной отчёт |
+| `CODEX_MODEL` | `gpt-6-luna` | Модель для рабочих чатов |
+| `CODEX_REASONING_EFFORT` | `xhigh` | Глубина рассуждения |
+| `OWNER_CODEX_MODEL` | `gpt-6-luna` | Модель для чата владельца |
+| `OWNER_CODEX_REASONING_EFFORT` | `xhigh` | Глубина для чата владельца |
+| `OWNER_TIMEZONE` | `Asia/Novosibirsk` | Часовой пояс фраз «сегодня», «за неделю» |
+| `MESSAGE_BATCH_SECONDS` | `20` | Окно накопления эпизода |
+| `DAILY_REPORT_TIME` | `07:30` | Время утреннего отчёта (Europe/Moscow) |
+| `LOG_RETENTION_DAYS` | `7` | Сколько дней хранить логи |
+| `TRANSCRIPTION_MODEL` | `gpt-4o-mini-transcribe` | Модель распознавания голоса |
+
+Снизить расход можно, не трогая код: `OWNER_CODEX_REASONING_EFFORT=none`
+в `.env`, затем `sudo systemctl restart rick.service`.
+
+## Для разработки
+
+```bash
+.venv/bin/python -m pytest -q                        # тесты (229 шт., ~30 с)
+.venv/bin/python -m compileall -q agentbridge tests   # проверка синтаксиса
+.venv/bin/python -m pip check                        # целостность зависимостей
+git diff --check                                     # пробелы в diff
 ```
 
-После обновления снова проверить версии:
+Архитектура и контракты — в `ARCHITECTURE.md`, правила работы для агента — в
+`AGENTS.md`. Сейчас в рабочей копии изменены `agentbridge/agents/codex.py` и
+`scripts/diagnose.py` (логирование причины сбоя Codex и вердикт `DEGRADED`).
 
-```powershell
-python -m pip list | findstr /I codex
-```
+## Дополнительно
 
-Посмотреть доступные версии пакета:
-
-```powershell
-python -m pip index versions openai-codex
-```
-
-После обновления полностью остановить AgentBridge и запустить заново:
-
-```powershell
-python -m agentbridge.main
-```
-
-Если виртуальное окружение ещё не активировано:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U openai-codex openai-codex-cli-bin
-python -m agentbridge.main
-```
-
-Важно: при появлении новых моделей OpenAI локальная версия `openai-codex` / `openai-codex-cli-bin` может оказаться старой, даже если код AgentBridge не менялся. Поэтому при неожиданных ошибках доступности модели сначала проверять и обновлять именно эти два пакета.
+- **[Установка с нуля](Docs/VPS_DEPLOY.md)** — если VPS пересоздали.
+- **[Что делать, когда сломалось](Docs/OPERATIONS.md)** — таблица симптомов.

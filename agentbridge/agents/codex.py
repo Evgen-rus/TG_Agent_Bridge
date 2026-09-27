@@ -325,11 +325,14 @@ AGENT_PROMPT_VERSION = 10
 class CodexProvider:
     prompt_version = AGENT_PROMPT_VERSION
 
-    def __init__(self, *, model: str = "gpt-6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False):
+    def __init__(self, *, model: str = "gpt-6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False, on_usage_limit=None, on_usage_recovered=None):
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.sepia_enabled = sepia_enabled
         self.cwd = str((cwd or Path.cwd()).resolve())
+        self.on_usage_limit = on_usage_limit
+        self.on_usage_recovered = on_usage_recovered
+        self._usage_exhausted = False
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
 
@@ -633,10 +636,12 @@ class CodexProvider:
         try:
             result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
         except Exception as exc:
-            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=%s duration_ms=%d", thread.id, type(exc).__name__, (time.monotonic() - started) * 1000)
+            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=%s reason=%s duration_ms=%d", thread.id, type(exc).__name__, _error_reason(exc), (time.monotonic() - started) * 1000)
+            self._note_failure(exc)
             raise RuntimeError(f"Codex turn failed ({type(exc).__name__})") from None
         if result.error is not None:
-            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=CodexResultError duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
+            logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=CodexResultError reason=%s duration_ms=%d", thread.id, _error_reason(result.error), (time.monotonic() - started) * 1000)
+            self._note_failure(result.error)
             raise RuntimeError("Codex turn failed (CodexResultError)")
         if not result.final_response:
             logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=EmptyResponse duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
@@ -646,8 +651,30 @@ class CodexProvider:
         except (json.JSONDecodeError, TypeError) as exc:
             logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=InvalidJson duration_ms=%d", thread.id, (time.monotonic() - started) * 1000)
             raise RuntimeError("Codex returned an invalid structured response") from exc
+        self._note_success()
         logger.info("event=codex_turn_finished component=codex thread_id=%s duration_ms=%d result=ok", thread.id, (time.monotonic() - started) * 1000)
         return payload
+
+    def _note_failure(self, error: object) -> None:
+        """Сообщить владельцу об исчерпанном лимите Codex ровно один раз.
+
+        Дальше повторные отказы молчат: при десяти подряд неудачных запросах
+        владельцу нужна одна причина, а не десять одинаковых сообщений."""
+        if not is_usage_limit_error(error):
+            return
+        self._usage_exhausted = True
+        logger.warning("event=codex_usage_limit_exhausted component=codex reset_hint=%s", limit_reset_hint(error) or "UNKNOWN")
+        if callable(self.on_usage_limit):
+            self.on_usage_limit(limit_reset_hint(error))
+
+    def _note_success(self) -> None:
+        """Первая удачная попытка после отказа означает, что лимит восстановлен."""
+        if not self._usage_exhausted:
+            return
+        self._usage_exhausted = False
+        logger.info("event=codex_usage_limit_recovered component=codex")
+        if callable(self.on_usage_recovered):
+            self.on_usage_recovered()
 
 
 def _turn_input(prompt: str, attachments: tuple[MediaAttachment, ...] = ()) -> RunInput:
@@ -691,3 +718,49 @@ def _critical_anchors(text: str) -> list[str]:
 def _thread_is_unavailable(exc: Exception) -> bool:
     message = str(exc).casefold()
     return "paginated_threads" in message or "no rollout found for thread id" in message
+
+
+def _error_reason(error: object) -> str:
+    """Короткая читаемая причина сбоя для лога: одного type не хватает,
+    иначе usage limit, 401 и таймаут выглядят одинаково. Редактирование
+    секретов делает SecretRedactionFilter на обработчиках логирования."""
+    if isinstance(error, BaseException):
+        label, text = type(error).__name__, str(error)
+    else:
+        label, text = "CodexError", str(getattr(error, "message", None) or error)
+    text = " ".join(text.split())
+    return f"{label}: {text[:300]}" if text else label
+
+
+_LIMIT_ERROR_MARKERS = ("usage_limit_exceeded", "you've hit your usage limit", "hit your usage limit")
+_RESET_TIME_RE = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AP]M)", re.IGNORECASE)
+
+
+def is_usage_limit_error(error: object) -> bool:
+    """Только явный usage limit, а не любое слово limit в тексте ошибки.
+
+    Иначе случайный таймаут или 429 привели бы к уведомлению о лимите,
+    которого на самом деле нет."""
+    text = _error_reason(error).casefold()
+    return any(marker in text for marker in _LIMIT_ERROR_MARKERS)
+
+
+def limit_reset_hint(error: object) -> str:
+    """Время сброса лимита из текста ошибки Codex, в виде «ЧЧ:ММ».
+
+    Codex печатает время в зоне своей сессии, а не в UTC: на этом VPS сессия
+    идёт в Europe/Moscow, и «11:27» означает 11:27 по Москве, то есть
+    15:27 по Новосибирску. Метка UTC здесь была бы ошибкой на три часа,
+    поэтому зону намеренно не подписываем — её подставляет вызывающий код."""
+    match = _RESET_TIME_RE.search(_error_reason(error))
+    if match is None:
+        return ""
+    hour, minute, meridiem = int(match.group(1)), match.group(2), match.group(3).upper()
+    if hour < 1 or hour > 12 or not minute.isdigit() or int(minute) > 59:
+        return ""
+    # 12 AM — полночь, 12 PM — полдень; иначе PM сдвигается на 12 часов.
+    if meridiem == "PM" and hour != 12:
+        hour += 12
+    elif meridiem == "AM" and hour == 12:
+        hour = 0
+    return f"{hour:02d}:{minute}"
