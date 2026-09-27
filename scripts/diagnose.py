@@ -52,9 +52,82 @@ def _after_success(failures: list[str], success: str | None) -> list[str]:
     return [item for item in failures if (_epoch(item) or 0) > mark]
 
 
+def _codex_limit_lines(conn: sqlite3.Connection) -> list[str]:
+    """Состояние лимита Codex из одного снимка SQLite.
+
+    Нужно, чтобы по diagnose было видно главное: «Codex реально сломан» или
+    «метка лимита устарела и пора делать контрольную попытку». Фонового опроса
+    модели здесь нет — читаются только уже сохранённые метки времени.
+    Логика решения продублирована намеренно: скрипт не импортирует
+    приложение, чтобы остаться независимым от её изменений."""
+    keys = {
+        row[0]: row[1]
+        for row in conn.execute(
+            "SELECT key, value FROM operational_state WHERE key LIKE 'codex_usage_limit%'"
+        )
+    }
+    active = "codex_usage_limit:notice" in keys
+    reset_hint = keys.get("codex_usage_limit:reset_hint") or "UNKNOWN"
+    reset_at = keys.get("codex_usage_limit:reset_at_utc") or "UNKNOWN"
+    seen_at = keys.get("codex_usage_limit:seen_at") or "UNKNOWN"
+    lines = [
+        f"codex.limit_active={str(active).lower()} codex.limit_reset_hint={reset_hint} "
+        f"codex.limit_reset_at_utc={reset_at} codex.limit_seen_at={seen_at}"
+    ]
+    if not active:
+        return lines, False
+    now = datetime.now(timezone.utc)
+    reset_dt = _parse_stamp(reset_at)
+    seen_dt = _parse_stamp(seen_at)
+    if reset_dt is not None:
+        if now >= reset_dt:
+            verdict = "READY (reset_time_reached) — следующий запрос владельца проверит Codex"
+        else:
+            verdict = f"WAIT (before_reset_time, {int((reset_dt - now).total_seconds())}s)"
+    elif seen_dt is not None:
+        # Интервал повторной попытки без известного сброса держим тем же, что
+        # и приложение: CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN.
+        left = int(seen_dt.timestamp() + 30 * 60 - now.timestamp())
+        verdict = (
+            "READY (cooldown_elapsed) — следующий запрос владельца проверит Codex"
+            if left <= 0
+            else f"WAIT (cooldown, {left}s)"
+        )
+    else:
+        verdict = "READY (no_probe_time_known) — время сброса неизвестно"
+    lines.append(f"codex.limit_recovery_probe={verdict}")
+    return lines, True
+
+
+def _parse_stamp(stamp: str) -> datetime | None:
+    if not stamp or stamp == "UNKNOWN":
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _codex_verdict(limit_active: bool, active_failures: list[str], codex_success: str | None) -> str:
+    """Одноразборный вывод: «Codex сломан» или «метка лимита устарела».
+
+    Отказ после последнего успеха — реальная поломка. Отказ при отсутствии
+    успехов после него и сохранённой метке лимита — скорее всего устаревшая
+    метка, и следующий запрос владельца её проверит."""
+    if active_failures:
+        if codex_success is None and limit_active:
+            return "likely_stale_limit_flag (no success after the limit; next owner request probes Codex)"
+        return f"real_failure ({len(active_failures)} failed turns after the last success)"
+    if limit_active:
+        return "stale_limit_flag (limit marked active but recent turns succeed) — clearing on next turn"
+    return "ok"
+
+
 def diagnose() -> str:
     lines = ["AGENTBRIDGE DIAGNOSE (read-only)"]
     reasons = []
+    limit_active = False
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
                                 capture_output=True, text=True, timeout=3, check=False).stdout.strip() or "UNKNOWN"
@@ -93,6 +166,8 @@ def diagnose() -> str:
                 }
                 last_report = conn.execute("SELECT max(report_date) FROM daily_reports").fetchone()[0] if "daily_reports" in tables else None
                 lines.append("queues " + " ".join(f"{key}={value}" for key, value in counts.items()))
+                limit_lines, limit_active = _codex_limit_lines(conn)
+                lines.extend(limit_lines)
                 lines.append(f"app.run_status={state.get('run_status', 'UNKNOWN')} app.started_at={state.get('run_started_at', 'UNKNOWN')}")
                 if state.get("run_status") != "running":
                     reasons.append("process_stopped" if state.get("run_status") == "stopped" else "process_status_unknown")
@@ -157,6 +232,9 @@ def diagnose() -> str:
         # даже когда сервис, Telegram и SQLite здоровы. Сбой до последнего успеха
         # считается историческим: агент уже отвечает нормально.
         reasons.append("codex_turn_failures")
+    # Главный вопрос по лимиту: Codex сломан или метка устарела. Ответ строится
+    # из двух независимых источников — сохранённой метки и живых логов.
+    lines.append(f"codex.verdict={_codex_verdict(limit_active, active_failures, codex_success)}")
     lines.append(f"runtime.bytes={_size(RUNTIME)} media.bytes={_size(RUNTIME / 'media')} logs.bytes={_size(LOGS)} disk.free_bytes={shutil.disk_usage(ROOT).free}")
     lines.extend(f"recent_failure {item}" for item in failures[-10:])
     lines.append("OVERALL: " + ("DEGRADED " + ",".join(reasons) if reasons else "HEALTHY (unverified fields marked UNKNOWN)"))

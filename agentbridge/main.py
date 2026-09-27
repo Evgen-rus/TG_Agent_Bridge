@@ -12,7 +12,6 @@ from .settings import Settings
 from .storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
     _CODEX_LIMIT_KEY,
-    _CODEX_LIMIT_REASON_KEY,
     ChatThreadStore,
     codex_limit_notice,
     codex_limit_reset_local,
@@ -30,10 +29,13 @@ def main() -> None:
     registry = ChatRegistry.load(settings.chats_dir)
     store = ChatThreadStore(settings.database_path)
     logging.getLogger().addHandler(OperationalEventHandler(store.record_operational_event))
+    # SQLite — источник истины о лимите, поэтому новый процесс начинает с того
+    # состояния, которое пережило рестарт, а не с «лимита никогда не было».
+    limit_active = store.codex_usage_limit_active()
 
-    def notify_owner_codex_limit(reset_hint: str) -> None:
-        # Codex печатает время сброса в зоне сессии, а не в UTC: на этом VPS
-        # сессия идёт по Europe/Moscow. Переводим в зону владельца.
+    def notify_owner_codex_limit(reset_hint: str, notify_owner: bool = True) -> None:
+        # Codex печатает время сброса без зоны, поэтому пересчёт опирается на
+        # CODEX_SESSION_TIMEZONE и подписывается как предположение.
         local_hint = codex_limit_reset_local(
             reset_hint, settings.owner_timezone,
             session_timezone_name=settings.codex_session_timezone,
@@ -41,13 +43,17 @@ def main() -> None:
         # Метку восстановления снимаем заранее: без этого второй по счёту лимит
         # не смог бы прислать своё уведомление о восстановлении.
         store.clear_operational_state(_CODEX_RECOVERED_KEY)
-        store.note_codex_usage_limit(local_hint)
-        store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(local_hint))
+        store.note_codex_usage_limit(
+            reset_hint, source_timezone_name=settings.codex_session_timezone, local_hint=local_hint,
+        )
+        # `notify_owner=False` — лимит владельцу уже заявлен: молча обновляем
+        # метки, чтобы время сброса не устарело, но не шлём второе уведомление.
+        if notify_owner:
+            store.queue_operational_notice(_CODEX_LIMIT_KEY, codex_limit_notice(local_hint))
 
     def notify_owner_codex_recovered() -> None:
         # Метку лимита снимаем, иначе следующий лимит не даст уведомления.
-        store.clear_operational_state(_CODEX_LIMIT_KEY)
-        store.clear_operational_state(_CODEX_LIMIT_REASON_KEY)
+        store.clear_codex_usage_limit()
         store.queue_operational_notice(_CODEX_RECOVERED_KEY, CODEX_RECOVERED_NOTICE)
 
     provider = CodexProvider(
@@ -57,6 +63,7 @@ def main() -> None:
         sepia_enabled=settings.sepia_enabled,
         on_usage_limit=notify_owner_codex_limit,
         on_usage_recovered=notify_owner_codex_recovered,
+        usage_limit_active=limit_active,
     )
     owner_provider = CodexProvider(
         model=settings.owner_codex_model,
@@ -65,6 +72,7 @@ def main() -> None:
         sepia_enabled=False,
         on_usage_limit=notify_owner_codex_limit,
         on_usage_recovered=notify_owner_codex_recovered,
+        usage_limit_active=limit_active,
     )
     service = AgentBridgeApplication(
         registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size, settings.chats_dir,
@@ -105,8 +113,18 @@ def main() -> None:
         store.record_operational_event("previous_run_unclean", "WARNING")
     # Лимит мог быть обнаружен до того, как время сброса начало сохраняться.
     # Тогда ключ есть, а причины нет — и уведомление выходит без времени.
-    if store.codex_usage_limit_active() and not store.codex_usage_limit_reason():
+    if limit_active and not store.codex_usage_limit_reason():
         logging.warning("event=codex_usage_limit_reset_unknown component=application")
+    # Метка лимита пережила рестарт: по ней видно, ждём ли ещё сброса или уже
+    # пора проверять модель на ближайшем запросе владельца.
+    if limit_active:
+        retry = store.codex_usage_limit_retry()
+        logging.info(
+            "event=codex_usage_limit_restored_state component=application "
+            "reset_hint=%s recovery_probe_allowed=%s reason=%s wait_seconds=%d",
+            store.codex_usage_limit_reason() or "UNKNOWN",
+            str(retry.allowed).lower(), retry.reason, retry.wait_seconds,
+        )
     try:
         telegram_application.run_polling(
             allowed_updates=["message", "callback_query", "my_chat_member"],

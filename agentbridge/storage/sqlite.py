@@ -49,6 +49,23 @@ def _now() -> str:
 # operational_state, владельцу не отправляются повторные сообщения о том же.
 _CODEX_LIMIT_KEY = "codex_usage_limit:notice"
 _CODEX_LIMIT_REASON_KEY = "codex_usage_limit:reset_hint"
+# Момент, когда владельцу показано время сброса лимита. По нему считается,
+# когда следующий запрос уже можно рискнуть отдать в Codex: до сброса
+# попытка заведомо отказная, после сброса — обычный рабочий запрос.
+_CODEX_LIMIT_RESET_AT_KEY = "codex_usage_limit:reset_at_utc"
+# Когда лимит заметили в последний раз. Служит запасным интервалом ожидания,
+# когда время сброса от Codex не пришло.
+_CODEX_LIMIT_SEEN_AT_KEY = "codex_usage_limit:seen_at"
+
+# Codex не печатает зону времени сброса: в тексте ошибки есть только «11:27 AM».
+# Поэтому часы нельзя выдавать за достоверные — зона приходит сверху, из
+# CODEX_SESSION_TIMEZONE, и подписывается как предположение.
+
+# Без известного времени сброса ждать нечего: ждём не меньше этого интервала
+# перед следующей попыткой, чтобы восстановление не превратилось в опрос.
+# Пауза отсчитывается от последнего отказа Codex, поэтому серия неудачных
+# попыток не может обнулить таймер и заставить долбить модель чаще.
+CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN = timedelta(minutes=30)
 
 CODEX_LIMIT_NOTICE = (
     "Лимит Codex исчерпан. Я продолжаю принимать сообщения и распознавать голос, "
@@ -70,36 +87,135 @@ def codex_limit_notice(reset_hint: str) -> str:
     если Codex не назвал время сброса."""
     if not reset_hint:
         return CODEX_LIMIT_NOTICE.format(reset="")
-    return CODEX_LIMIT_NOTICE.format(reset=f" По данным Codex восстановление в {reset_hint}.")
+    # «Около», а не «в»: зона времени в ошибке Codex не указана, поэтому
+    # показанный момент — пересчёт по CODEX_SESSION_TIMEZONE, а не факт.
+    return CODEX_LIMIT_NOTICE.format(reset=f" По данным Codex восстановление около {reset_hint}.")
 
 
 def codex_limit_reset_local(reset_hint: str, timezone_name: str, *, session_timezone_name: str) -> str:
-    """Перевести время сброса из зоны сессии Codex в зону владельца.
+    """Показать время сброса в зоне владельца, честно пометив источник.
 
-    Codex печатает время в зоне своей сессии — на этом VPS это Europe/Moscow,
-    потому что сервер и сессия живут в ней. Считать это время за UTC нельзя:
-    получилось бы на три часа позже. Подпись зоны берётся из OWNER_TIMEZONE,
-    а не пишется константой. Если перевести не удалось, исходная подсказка
-    остаётся в ответе, чтобы уведомление всё равно объяснило ситуацию."""
+    В тексте ошибки Codex зоны нет: только «try again at 11:27 AM». Значит,
+    перевод держится на предположении, что Codex печатает время в зоне своей
+    сессии, а сессия на этом VPS живёт по Europe/Moscow (`/etc/timezone`).
+    Поэтому результат подписан и исходными часами, и используемой зоной:
+    вручную владельцу спорить со временем не с чем, а автоматика опирается
+    на тот же CODEX_SESSION_TIMEZONE. Если зона неизвестна, исходная подсказка
+    возвращается как есть — выдумывать пересчёт нельзя."""
     if not reset_hint:
         return ""
+    source_label = _zone_label(session_timezone_name)
+    if source_label is None:
+        return f"{reset_hint} — Codex не указал зону, время сверяется по настройкам Codex"
     parts = reset_hint.replace("UTC", "").strip().split(":")
     if len(parts) < 2:
         return reset_hint
+    owner_label = _zone_label(timezone_name)
+    if owner_label is None:
+        return f"{reset_hint} — не удалось перевести в зону {timezone_name}, время сверяется по настройкам Codex"
     try:
-        source = ZoneInfo(session_timezone_name)
         hour, minute = int(parts[0]), int(parts[1])
-        today = datetime.now(timezone.utc).astimezone(source)
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            return reset_hint
+        today = datetime.now(timezone.utc).astimezone(ZoneInfo(session_timezone_name))
         moment = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        zone = ZoneInfo(timezone_name)
+        local = moment.astimezone(ZoneInfo(timezone_name))
     except (ValueError, ZoneInfoNotFoundError, TypeError):
         return reset_hint
-    local = moment.astimezone(zone)
-    offset = local.utcoffset() or timedelta(0)
-    total_minutes = int(offset.total_seconds() // 60)
+    # Здесь важно не выдать пересчёт за факт: часы пришли без зоны, поэтому
+    # подпись говорит и зону владельца, и исходное время с предположением.
+    return f"{local:%H:%M} {owner_label} ({_zone_offset_label(local)}, исходное «{reset_hint}» в зоне {session_timezone_name})"
+
+
+def _zone_label(timezone_name: str) -> str | None:
+    """Человекочитаемое имя зоны, либо None, если зона неизвестна системе."""
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return None
+    return timezone_name.split("/")[-1].replace("_", " ")
+
+
+def _zone_offset_label(moment: datetime) -> str:
+    total_minutes = int((moment.utcoffset() or timedelta(0)).total_seconds() // 60)
     sign = "+" if total_minutes >= 0 else "-"
-    zone_label = timezone_name.split("/")[-1].replace("_", " ")
-    return f"{local:%H:%M} {zone_label} (UTC{sign}{abs(total_minutes) // 60:02d}:{abs(total_minutes) % 60:02d})"
+    return f"UTC{sign}{abs(total_minutes) // 60:02d}:{abs(total_minutes) % 60:02d}"
+
+
+def codex_reset_moment_utc(reset_hint: str, source_timezone_name: str, *, now: datetime | None = None) -> datetime | None:
+    """Момент сброса в UTC из часов Codex, взятых в предполагаемой зоне сессии.
+
+    Возвращает None, если разобрать нельзя, зона неизвестна или момент уже
+    прошёл: в последнем случае ждать бессмысленно, и лимит проверяется сразу
+    по общей паузе, а не зависает до утра."""
+    if not reset_hint:
+        return None
+    if _zone_label(source_timezone_name) is None:
+        return None
+    parts = reset_hint.replace("UTC", "").strip().split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            return None
+        current = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(source_timezone_name))
+        moment = current.replace(hour=hour, minute=minute, second=0, microsecond=0).astimezone(timezone.utc)
+    except (ValueError, ZoneInfoNotFoundError, TypeError):
+        return None
+    return moment if moment > (now or datetime.now(timezone.utc)) else None
+
+
+def codex_limit_retry(reset_at: datetime | None, seen_at: datetime | None, *, now: datetime | None = None) -> CodexLimitRetry:
+    """Можно ли уже рискнуть обычной попыткой Codex.
+
+    Пока лимит активен, владельцу отвечают без обращения к модели. Но и навсегда
+    блокировать нельзя: если лимит восстановился, Рик обязан это заметить.
+    Поэтому решение принимается по сохранённым в SQLite меткам времени, а фонового
+    опроса модели нет — попытка делается только на реальном запросе владельца.
+
+    Известен момент сброса: ждём его, не тратя заведомо отказные запросы.
+    Момент неизвестен: ждём ограниченную паузу, чтобы восстановление не
+    превратилось в долбёжку модели."""
+    moment = now or datetime.now(timezone.utc)
+    if reset_at is not None:
+        if moment >= reset_at:
+            return CodexLimitRetry(True, "reset_time_reached", 0)
+        return CodexLimitRetry(False, "before_reset_time", int((reset_at - moment).total_seconds()))
+    if seen_at is None:
+        return CodexLimitRetry(True, "no_probe_time_known", 0)
+    wait_left = seen_at + CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN - moment
+    if wait_left <= timedelta(0):
+        return CodexLimitRetry(True, "cooldown_elapsed", 0)
+    return CodexLimitRetry(False, "cooldown", int(wait_left.total_seconds()))
+
+
+@dataclass(frozen=True)
+class CodexLimitRetry:
+    """Решение по контрольной попытке: ждать или рискнуть.
+
+    `reason` — короткая метка для лога и `scripts/diagnose.py`:
+    reset_time_reached | before_reset_time | cooldown_elapsed | cooldown |
+    no_probe_time_known."""
+
+    allowed: bool
+    reason: str
+    wait_seconds: int = 0
+
+
+@dataclass(frozen=True)
+class CodexLimitProbeState:
+    """Снимок сохранённого состояния лимита Codex из SQLite.
+
+    `active` — владельцу уже сообщали о лимите в этом процессе или раньше.
+    `reset_hint` — подпись времени для владельца. `reset_at_utc` — тот же
+    момент в UTC из предполагаемой зоны сессии Codex, либо None, если время
+    не названо или уже прошло. `seen_at` — когда лимит заметили в последний раз."""
+
+    active: bool
+    reset_hint: str = ""
+    reset_at_utc: datetime | None = None
+    seen_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -346,17 +462,31 @@ class ChatThreadStore:
             logger.info("event=delivery_queued component=storage delivery_id=%s operation=operational_notice", cursor.lastrowid)
             return cursor.lastrowid
 
-    def note_codex_usage_limit(self, reset_hint: str) -> None:
+    def note_codex_usage_limit(self, reset_hint: str, *, source_timezone_name: str, local_hint: str) -> None:
         """Запомнить активный лимит и время сброса, не отправляя сообщение.
 
         Вызывается на каждый отказ: сам текст уведомления уходит только
-        один раз, а время сброса нужно приложению, чтобы отвечать внятно
-        дальше, не тратя ещё одну попытку на заведомо отказный запрос."""
+        один раз, а момент сброса нужен приложению, чтобы отвечать внятно
+        дальше и не повторять заведомо отказный запрос раньше времени.
+
+        `reset_hint` — исходные часы из ошибки Codex, `source_timezone_name` —
+        зона, в которой эти часы предполагаются, `local_hint` — уже
+        пересчитанное время для владельца (может быть пустым, если Codex
+        времени не назвал)."""
+        now = _now()
+        reset_at = codex_reset_moment_utc(reset_hint, source_timezone_name)
         with self._connect() as connection:
-            connection.execute(
+            connection.executemany(
                 "INSERT INTO operational_state(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (_CODEX_LIMIT_REASON_KEY, reset_hint or ""),
+                [
+                    (_CODEX_LIMIT_REASON_KEY, local_hint or reset_hint or ""),
+                    (_CODEX_LIMIT_RESET_AT_KEY, reset_at.isoformat() if reset_at else ""),
+                    # Отсчёт паузы идёт от последнего отказа: сдвинутый вперёд
+                    # момент сброса всё равно заставит ждать до него, а если
+                    # время сброса неизвестно, пауза ограничит частоту попыток.
+                    (_CODEX_LIMIT_SEEN_AT_KEY, now),
+                ],
             )
 
     def clear_operational_state(self, key: str) -> None:
@@ -366,6 +496,15 @@ class ChatThreadStore:
         снят, чтобы следующий лимит снова привёл ровно одно сообщение."""
         with self._connect() as connection:
             connection.execute("DELETE FROM operational_state WHERE key=?", (key,))
+
+    def clear_codex_usage_limit(self) -> None:
+        """Снять всё состояние исчерпанного лимита разом.
+
+        Метка времени сброса и метка «когда заметили» относятся к тому же
+        случаю, поэтому при восстановлении их нельзя оставлять: иначе после
+        следующего перезапуска Рик решит, что лимит всё ещё действует."""
+        for key in (_CODEX_LIMIT_KEY, _CODEX_LIMIT_REASON_KEY, _CODEX_LIMIT_RESET_AT_KEY, _CODEX_LIMIT_SEEN_AT_KEY):
+            self.clear_operational_state(key)
 
     def codex_usage_limit_active(self) -> bool:
         with self._connect() as connection:
@@ -382,6 +521,40 @@ class ChatThreadStore:
         with self._connect() as connection:
             row = connection.execute("SELECT value FROM operational_state WHERE key=?", (_CODEX_LIMIT_REASON_KEY,)).fetchone()
         return row[0] if row else ""
+
+    def codex_usage_limit_probe_state(self) -> CodexLimitProbeState:
+        """Всё сохранённое состояние лимита: для решения о попытке и диагностики.
+
+        Возвращается целиком, чтобы решение о контрольной попытке принималось
+        по одному снимку SQLite, а не по нескольким рассинхронизированным
+        чтениям."""
+        with self._connect() as connection:
+            rows = dict(connection.execute(
+                "SELECT key, value FROM operational_state WHERE key IN (?, ?, ?)",
+                (_CODEX_LIMIT_KEY, _CODEX_LIMIT_RESET_AT_KEY, _CODEX_LIMIT_SEEN_AT_KEY),
+            ))
+
+        def moment(key: str) -> datetime | None:
+            value = rows.get(key) or ""
+            try:
+                return datetime.fromisoformat(value) if value else None
+            except ValueError:
+                return None
+
+        return CodexLimitProbeState(
+            active=_CODEX_LIMIT_KEY in rows,
+            reset_hint=self.codex_usage_limit_reason(),
+            reset_at_utc=moment(_CODEX_LIMIT_RESET_AT_KEY),
+            seen_at=moment(_CODEX_LIMIT_SEEN_AT_KEY),
+        )
+
+    def codex_usage_limit_retry(self, *, now: datetime | None = None) -> CodexLimitRetry:
+        """Можно ли уже рискнуть обычной попыткой Codex при активном лимите.
+
+        Таймеры сохранены в SQLite, поэтому перезапуск процесса не обнуляет
+        паузу и не превращает её в поток заведомо отказных запросов."""
+        state = self.codex_usage_limit_probe_state()
+        return codex_limit_retry(state.reset_at_utc, state.seen_at, now=now)
 
     def record_operational_event(self, event: str, level: str) -> None:
         with self._connect() as connection:
@@ -401,7 +574,13 @@ class ChatThreadStore:
                 return existing[0]
             def count(sql: str) -> int:
                 return connection.execute(sql, (start_utc, end_utc)).fetchone()[0]
-            facts = count("SELECT count(*) FROM memory_entries WHERE status='active' AND kind='fact' AND created_at>=? AND created_at<?")
+            # Считаем всю подтверждённую память, а не только kind='fact':
+            # факт — лишь один из видов (decision, commitment, preference,
+            # open_question, rule, assumption, experience), и подтверждённое
+            # решение или договорённость для владельца так же ценны, как факт.
+            # Черновики отсеиваются статусом: в memory_entries попадает только
+            # подтверждённая запись, отклонённые остаются в memory_drafts.
+            memory = count("SELECT count(*) FROM memory_entries WHERE status='active' AND created_at>=? AND created_at<?")
             rules = count("SELECT count(*) FROM learning_rules WHERE status='active' AND created_at>=? AND created_at<?")
             experience = count("SELECT count(*) FROM experience_entries WHERE status='active' AND created_at>=? AND created_at<?")
             errors = count("SELECT count(*) FROM operational_events WHERE level IN ('ERROR','CRITICAL') AND created_at>=? AND created_at<?")
@@ -409,9 +588,9 @@ class ChatThreadStore:
             pending = connection.execute("SELECT count(*) FROM telegram_messages WHERE processing_status IN ('pending','processing')").fetchone()[0]
             pending += connection.execute("SELECT count(*) FROM owner_query_deliveries WHERE owner_message_id IS NULL").fetchone()[0]
             text = (f"Рик на связи. Отчёт за {report_date}.\n"
-                    f"Новых фактов: {facts}; правил: {rules}; опыта: {experience}.\n"
+                    f"Новых записей памяти: {memory}; правил: {rules}; опыта: {experience}.\n"
                     f"Техника: ошибок {errors}; восстановлений после сбоя {restarts}; сейчас pending {pending}." +
-                    ("\nЗа вчера нового ничего не узнал." if not any((facts, rules, experience)) else ""))
+                    ("\nЗа вчера нового ничего не узнал." if not any((memory, rules, experience)) else ""))
             cursor = connection.execute("INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (text, _now()))
             connection.execute("INSERT INTO daily_reports(report_date, delivery_id, created_at) VALUES(?, ?, ?)",
                                (report_date, cursor.lastrowid, _now()))

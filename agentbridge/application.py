@@ -953,9 +953,25 @@ class AgentBridgeApplication:
 
         Возвращает None, если лимита нет — тогда всё идёт по обычному пути.
         Текст тот же, что уходит в уведомлении, чтобы владелец увидел одну
-        и ту же формулировку."""
+        и ту же формулировку.
+
+        Возврат None при активном лимите означает «попробовать Codex»: иначе
+        Рик принял бы метку за вечную и перестал бы проверять восстановление
+        даже после сброса. Попытка делается только на реальном запросе
+        владельца, по сохранённым в SQLite меткам времени."""
         if not self.store.codex_usage_limit_active():
             return None
+        retry = self.store.codex_usage_limit_retry()
+        if retry.allowed:
+            logger.info(
+                "event=codex_limit_recovery_probe_allowed component=application reason=%s",
+                retry.reason,
+            )
+            return None
+        logger.info(
+            "event=codex_limit_recovery_probe_blocked component=application reason=%s wait_seconds=%d",
+            retry.reason, retry.wait_seconds,
+        )
         return codex_limit_notice(self.store.codex_usage_limit_reason()) + f"\n\nВаш вопрос: {text}"
 
     async def _resolve_owner_query_scope(self, text: str) -> OwnerQueryScope | None:

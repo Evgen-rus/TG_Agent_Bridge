@@ -31,6 +31,19 @@ The existing owner delivery retry loop sends due reminders only to
 restart therefore delivers overdue pending reminders without requiring a
 separate scheduler.
 
+An explicit Codex `usage_limit_exceeded` is a durable, owner-visible condition,
+not an in-memory flag. `operational_state` holds the notice key, the display
+reset hint, the reset moment in UTC derived from the assumed Codex session
+zone, and the last time the limit was seen. On startup `main` reads that state
+and injects it into both `CodexProvider` instances, so a restart neither loses
+the condition nor re-sends the notice. Recovery is the first successful turn
+after the limit, which clears all limit state and queues one recovery notice.
+While the limit is active the owner query path answers from SQLite instead of
+calling the model, but only until the reset moment; after it, or after a
+bounded cooldown when Codex named no reset time, the next real owner request is
+allowed through as the recovery probe. There is no background polling and no
+extra model turn.
+
 OWNER_CHAT_ID
   -> reply to a bot recommendation: correction / learning / memory
      A substantive owner correction may also create a pending memory draft;
@@ -75,7 +88,12 @@ so the new process queues one owner notice in `owner_query_deliveries`. The
 exact cause may remain unknown until systemd logs are inspected. The same
 delivery queue stores the deterministic 07:30 Europe/Moscow daily report.
 `daily_reports.report_date` prevents duplicate creation and advances missed
-reports after downtime. Operational error counts are stored without messages.
+reports after downtime. The report is built entirely from SQLite and never
+calls the model; it counts every active durable memory kind (fact, decision,
+commitment, preference, open question, rule, assumption, experience) as one
+«запись памяти», and keeps rules and experience as separate counters. Draft,
+rejected and superseded records are not counted. Operational error counts are
+stored without messages.
 ```
 
 Each monitored chat has isolated persistent Codex threads: the client thread

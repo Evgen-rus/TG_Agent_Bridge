@@ -325,16 +325,25 @@ AGENT_PROMPT_VERSION = 10
 class CodexProvider:
     prompt_version = AGENT_PROMPT_VERSION
 
-    def __init__(self, *, model: str = "gpt-6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False, on_usage_limit=None, on_usage_recovered=None):
+    def __init__(self, *, model: str = "gpt-6-luna", reasoning_effort: str = "xhigh", cwd: Path | None = None, sepia_enabled: bool = False, on_usage_limit=None, on_usage_recovered=None, usage_limit_active: bool = False):
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.sepia_enabled = sepia_enabled
         self.cwd = str((cwd or Path.cwd()).resolve())
         self.on_usage_limit = on_usage_limit
         self.on_usage_recovered = on_usage_recovered
-        self._usage_exhausted = False
+        # Состояние лимита живёт в SQLite, а не в памяти процесса: перезапуск
+        # не должен стирать факт исчерпания и заставлять прислать второе
+        # уведомление. Провайдер сам SQLite не знает — начальное значение
+        # приходит снаружи, из composition root.
+        self._usage_exhausted = bool(usage_limit_active)
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
+
+    @property
+    def usage_limit_active(self) -> bool:
+        """Активен ли лимит по мнению этого процесса."""
+        return self._usage_exhausted
 
     async def suggest(self, *, message: str, sender_name: str, chat_name: str, wiki: str, rules: list[str], thread_id: str | None, context_pack: str = "", attachments: tuple[MediaAttachment, ...] | list[MediaAttachment] = ()) -> AgentReply:
         return await asyncio.to_thread(self._suggest_sync, message, sender_name, chat_name, wiki, rules, thread_id, None, context_pack, tuple(attachments))
@@ -659,13 +668,21 @@ class CodexProvider:
         """Сообщить владельцу об исчерпанном лимите Codex ровно один раз.
 
         Дальше повторные отказы молчат: при десяти подряд неудачных запросах
-        владельцу нужна одна причина, а не десять одинаковых сообщений."""
+        владельцу нужна одна причина, а не десять одинаковых сообщений. Если
+        лимит был известен ещё до старта процесса, уведомление не повторяется,
+        но время сброса обновляется — владельцу полезно видеть свежий сброс."""
         if not is_usage_limit_error(error):
             return
+        reset_hint = limit_reset_hint(error)
+        if self._usage_exhausted:
+            logger.warning("event=codex_usage_limit_still_active component=codex reset_hint=%s", reset_hint or "UNKNOWN")
+            if callable(self.on_usage_limit):
+                self.on_usage_limit(reset_hint, False)
+            return
         self._usage_exhausted = True
-        logger.warning("event=codex_usage_limit_exhausted component=codex reset_hint=%s", limit_reset_hint(error) or "UNKNOWN")
+        logger.warning("event=codex_usage_limit_exhausted component=codex reset_hint=%s", reset_hint or "UNKNOWN")
         if callable(self.on_usage_limit):
-            self.on_usage_limit(limit_reset_hint(error))
+            self.on_usage_limit(reset_hint, True)
 
     def _note_success(self) -> None:
         """Первая удачная попытка после отказа означает, что лимит восстановлен."""

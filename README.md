@@ -84,8 +84,10 @@ journalctl -u rick.service -p err --since today    # только ошибки
 tail -f runtime/logs/agentbridge.log               # лог самого приложения
 ```
 
-Время в `journalctl` — **московское**, в `agentbridge.log` — **UTC**. Сверяйте
-по дате. В журнале systemd сообщения хранятся 14 дней, лог приложения — 7.
+Лог приложения пишется в **UTC**. Время в `journalctl` — по настройке самой
+ОС и `journald` (на этом VPS `Europe/Moscow`), а не по приложению: там та же
+строка события видна с местным часовым поясом. Сверяйте по дате. В журнале
+systemd сообщения хранятся 14 дней, лог приложения — 7.
 
 ### Диагностика
 
@@ -167,12 +169,13 @@ cd /home/rick/TG_Agent_Bridge
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | — | Токен бота, обязателен |
 | `OWNER_CHAT_ID` | — | Чат владельца, куда идут все ответы |
-| `OPENAI_API_KEY` | — | Распознавание голосовых и дневной отчёт |
+| `OPENAI_API_KEY` | — | Только распознавание голосовых. Утренний отчёт собирается из SQLite, Codex работает по подписке ChatGPT |
 | `CODEX_MODEL` | `gpt-6-luna` | Модель для рабочих чатов |
 | `CODEX_REASONING_EFFORT` | `xhigh` | Глубина рассуждения |
 | `OWNER_CODEX_MODEL` | `gpt-6-luna` | Модель для чата владельца |
 | `OWNER_CODEX_REASONING_EFFORT` | `xhigh` | Глубина для чата владельца |
 | `OWNER_TIMEZONE` | `Asia/Novosibirsk` | Часовой пояс фраз «сегодня», «за неделю» |
+| `CODEX_SESSION_TIMEZONE` | `Europe/Moscow` | Предполагаемая зона времени сброса лимита Codex |
 | `MESSAGE_BATCH_SECONDS` | `20` | Окно накопления эпизода |
 | `DAILY_REPORT_TIME` | `07:30` | Время утреннего отчёта (Europe/Moscow) |
 | `LOG_RETENTION_DAYS` | `7` | Сколько дней хранить логи |
@@ -184,15 +187,14 @@ cd /home/rick/TG_Agent_Bridge
 ## Для разработки
 
 ```bash
-.venv/bin/python -m pytest -q                        # тесты (229 шт., ~30 с)
+.venv/bin/python -m pytest -q                        # тесты
 .venv/bin/python -m compileall -q agentbridge tests   # проверка синтаксиса
 .venv/bin/python -m pip check                        # целостность зависимостей
 git diff --check                                     # пробелы в diff
 ```
 
 Архитектура и контракты — в `ARCHITECTURE.md`, правила работы для агента — в
-`AGENTS.md`. Сейчас в рабочей копии изменены `agentbridge/agents/codex.py` и
-`scripts/diagnose.py` (логирование причины сбоя Codex и вердикт `DEGRADED`).
+`AGENTS.md`.
 
 ## Дополнительно
 
