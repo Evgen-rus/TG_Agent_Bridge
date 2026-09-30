@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram.error import TimedOut
+from telegram.error import NetworkError, TimedOut
 
 from agentbridge.agents.base import AgentReply, FeedbackAnalysis, OwnerQueryAnswer
 from agentbridge.application import AgentBridgeApplication, MemoryProposal, OwnerQueryResult, QuestionReplyResult, Suggestion
@@ -170,6 +170,47 @@ async def test_owner_mention_asks_the_assistant() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generated_photo_is_sent_only_to_owner_and_removed_after_delivery(tmp_path) -> None:
+    generated_dir = tmp_path / "runtime" / "media" / "owner_generated"
+    generated_dir.mkdir(parents=True)
+    image_path = generated_dir / "owner-task-1.jpg"
+    image_bytes = b"\xff\xd8mock-jpeg\xff\xd9"
+    image_path.write_bytes(image_bytes)
+
+    class PhotoService(OwnerAssistantService):
+        async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
+            return OwnerQueryResult("Тестовое изображение Рика", media_path=str(image_path))
+
+    class PhotoBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.photos: list[dict] = []
+
+        async def send_photo(self, **kwargs):
+            self.photos.append({**kwargs, "photo_bytes": kwargs["photo"].read()})
+            return FakeSentMessage(2020)
+
+    service = PhotoService()
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=service,
+        batch_seconds=0, media_dir=tmp_path / "runtime" / "media",
+    )
+    bot = PhotoBot()
+
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent Нарисуй Рика"), FakeChat(7654321), FakeUser()), FakeContext(bot),
+    )
+
+    assert len(bot.photos) == 1
+    assert bot.photos[0]["chat_id"] == 7654321
+    assert bot.photos[0]["caption"] == "Тестовое изображение Рика"
+    assert bot.photos[0]["photo_bytes"] == image_bytes
+    assert bot.sent == []
+    assert service.client_calls == []
+    assert not image_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_codex_file_citation_and_local_path_never_reach_telegram() -> None:
     class CitationService(OwnerAssistantService):
         async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
@@ -310,6 +351,45 @@ async def _deliver_pending(application, bot):
         await asyncio.sleep(0.04)
     finally:
         await application.post_stop(application)
+
+
+@pytest.mark.asyncio
+async def test_pending_generated_photo_is_retained_while_telegram_delivery_fails(tmp_path) -> None:
+    import os
+    import time
+
+    media_dir = tmp_path / "runtime" / "media"
+    generated_dir = media_dir / "owner_generated"
+    generated_dir.mkdir(parents=True)
+    image_path = generated_dir / "owner-task-9.jpg"
+    image_path.write_bytes(b"\xff\xd8mock-jpeg\xff\xd9")
+    os.utime(image_path, (time.time() - 3600, time.time() - 3600))
+
+    class Store:
+        def retained_document_paths(self):
+            return set()
+
+    class Service:
+        store = Store()
+
+        def pending_owner_query_deliveries(self):
+            return [OwnerQueryResult("Изображение Рика", delivery_id=9, media_path=str(image_path))]
+
+        def record_owner_query_delivery(self, delivery_id, owner_message_id):
+            raise AssertionError("A failed photo must remain pending")
+
+    class OfflinePhotoBot(FakeBot):
+        async def send_photo(self, **kwargs):
+            raise NetworkError("offline")
+
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=Service(),
+        media_dir=media_dir, media_ttl_seconds=10, delivery_retry_seconds=30,
+    )
+
+    await _deliver_pending(application, OfflinePhotoBot())
+
+    assert image_path.exists()
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from agentbridge.agents.codex import (
     _CANDIDATE_STATE_PROPERTIES,
     _CRITIQUE_INSTRUCTIONS,
     _FEEDBACK_SCHEMA,
+    _GENERAL_TASK_PLAN_SCHEMA,
     _INSTRUCTIONS,
     _ONBOARDING_SCHEMA,
     _OWNER_QUERY_INSTRUCTIONS,
@@ -432,7 +433,7 @@ async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_co
 
 
 def test_codex_output_schemas_match_structured_outputs_subset() -> None:
-    for schema in (_SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _ONBOARDING_SCHEMA, _SEPIA_SCHEMA):
+    for schema in (_SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _GENERAL_TASK_PLAN_SCHEMA, _ONBOARDING_SCHEMA, _SEPIA_SCHEMA):
         validate_structured_output_schema(schema)
     field = _SUGGEST_SCHEMA["properties"]["candidate_state"]
     assert field["additionalProperties"] is False
@@ -440,6 +441,7 @@ def test_codex_output_schemas_match_structured_outputs_subset() -> None:
     assert field["properties"]["summary"]["type"] == ["string", "null"]
     assert field["properties"]["facts"]["type"] == ["array", "null"]
     assert set(_SUGGEST_SCHEMA["required"]) == set(_SUGGEST_SCHEMA["properties"])
+    assert _GENERAL_TASK_PLAN_SCHEMA["properties"]["kind"]["enum"][-1] == "image"
 
 
 def test_structured_output_schema_rejects_the_errors_we_already_hit() -> None:

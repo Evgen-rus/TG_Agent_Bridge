@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
+from decimal import Decimal
 import json
 import re
 import logging
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
+from .image_generation import ImageGenerationError, ImageGenerator
 from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
 from .owner_query import OwnerQueryIntent, OwnerQueryScope, PortfolioChatSummary, parse_owner_time_phrase
+from .speech import MAX_SPEECH_BYTES, SpeechProviderError, SpeechProviderRegistry
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, ReminderRecord, RuleRecord, StoredMessage, codex_limit_notice
 
 logger = logging.getLogger(__name__)
@@ -137,6 +141,9 @@ class OwnerQueryResult:
     selection_id: int | None = None
     general_task_id: int | None = None
     restart_marker_id: int | None = None
+    media_path: str = ""
+    media_kind: str = ""
+    speak: bool = False
 
 
 class AgentBridgeApplication:
@@ -151,6 +158,11 @@ class AgentBridgeApplication:
         knowledge_dir: Path | None = None,
         owner_provider: AgentProvider | None = None,
         owner_timezone: str = "Asia/Novosibirsk",
+        image_generator: ImageGenerator | None = None,
+        generated_media_dir: Path | None = None,
+        speech_provider_registry: SpeechProviderRegistry | None = None,
+        owner_voice_provider_order: tuple[str, ...] = ("openrouter",),
+        owner_voice_max_cost_usd: Decimal = Decimal("0"),
     ):
         self.registry = registry
         self.store = store
@@ -159,6 +171,11 @@ class AgentBridgeApplication:
         self.owner_chat_id = owner_chat_id
         self.attachment_fetcher = None
         self.owner_timezone = owner_timezone
+        self.image_generator = image_generator
+        self.generated_media_dir = generated_media_dir or Path("runtime/media/owner_generated")
+        self.speech_provider_registry = speech_provider_registry
+        self.owner_voice_provider_order = owner_voice_provider_order
+        self.owner_voice_max_cost_usd = owner_voice_max_cost_usd
         self.episode_size = max(1, episode_size)
         self.chats_dir = chats_dir
         if knowledge_dir is not None:
@@ -1154,7 +1171,14 @@ class AgentBridgeApplication:
             return None if reminder_only else OwnerQueryResult("Не удалось подготовить понимание задачи.")
         self.store.save_owner_query_thread(0, "Общие задачи", plan.thread_id,
             prompt_version=getattr(self.owner_provider, "prompt_version", None))
-        payload = {"remind_at_utc": plan.remind_at_utc, "local_label": plan.local_label, "reminder_text": plan.reminder_text}
+        if plan.kind == "image" and not plan.image_prompt.strip():
+            return OwnerQueryResult("Не удалось подготовить описание изображения.")
+        payload = {
+            "remind_at_utc": plan.remind_at_utc,
+            "local_label": plan.local_label,
+            "reminder_text": plan.reminder_text,
+            "image_prompt": plan.image_prompt.strip(),
+        }
         if related_chat is not None:
             payload["related_chat_id"] = related_chat.telegram_chat_id
             payload["related_chat_name"] = related_chat.name
@@ -1164,7 +1188,10 @@ class AgentBridgeApplication:
             task_id = self.store.create_general_task(self.owner_chat_id or 0, request, plan.understanding, plan.kind, payload)
         elif not self.store.revise_general_task(task_id, request, plan.understanding, plan.kind, payload):
             return OwnerQueryResult("Эта задача уже обработана или отменена.")
-        return OwnerQueryResult(f"Я понял задачу так:\n\n{plan.understanding}", general_task_id=task_id)
+        understanding = plan.understanding
+        if plan.kind == "image":
+            understanding += "\n\nПосле подтверждения создам одно изображение и отправлю его сюда. Генерация оплачивается отдельно по тарифу OpenAI API."
+        return OwnerQueryResult(f"Я понял задачу так:\n\n{understanding}", general_task_id=task_id)
 
     def attach_general_task(self, task_id: int, owner_message_id: int) -> None:
         self.store.attach_general_task_message(task_id, owner_message_id)
@@ -1248,6 +1275,25 @@ class AgentBridgeApplication:
                     "Перезапускаюсь. Сейчас проверим, переживу ли я собственную операцию на мозге.",
                     restart_marker_id=marker_id,
                 )
+            if task.kind == "image":
+                image_prompt = str(task.payload.get("image_prompt") or "").strip()
+                if self.image_generator is None or not image_prompt:
+                    raise ImageGenerationError("Image generation is not configured")
+                image = await self.image_generator.generate(image_prompt)
+                if not isinstance(image, bytes) or not image:
+                    raise RuntimeError("image generator returned no image")
+                self.generated_media_dir.mkdir(parents=True, exist_ok=True)
+                media_path = self.generated_media_dir / f"owner-task-{task_id}.jpg"
+                try:
+                    media_path.write_bytes(image)
+                except Exception:
+                    media_path.unlink(missing_ok=True)
+                    raise
+                self.store.set_general_task_status(task_id, "executing", "done")
+                return OwnerQueryResult(
+                    "Готово, отправляю изображение.", general_task_id=task_id,
+                    media_path=str(media_path),
+                )
             runner = getattr(self.owner_provider, "run_general_task", None)
             thread_id = self._owner_query_thread_id_for_provider(0)
             if runner is None or not thread_id:
@@ -1260,7 +1306,14 @@ class AgentBridgeApplication:
             else:
                 answer = str(result)
             self.store.set_general_task_status(task_id, "executing", "done")
-            return OwnerQueryResult(answer, general_task_id=task_id)
+            return OwnerQueryResult(answer, general_task_id=task_id, speak=True)
+        except ImageGenerationError:
+            logger.warning("event=image_generation_failed task_id=%s", task_id)
+            self.store.set_general_task_status(task_id, "executing", "failed")
+            return OwnerQueryResult(
+                "Не получилось создать изображение. Возможно, для API ещё не включена генерация изображений.",
+                general_task_id=task_id,
+            )
         except Exception:
             logger.exception("event=general_task_failed task_id=%s", task_id)
             self.store.set_general_task_status(task_id, "executing", "failed")
@@ -1269,14 +1322,50 @@ class AgentBridgeApplication:
     def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_query_prompt(prompt_id, owner_message_id)
 
-    def save_pending_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None, general_task_id: int | None = None) -> int:
-        return self.store.create_owner_query_delivery(text, prompt_id, selection_id, general_task_id)
+    def save_pending_owner_query_delivery(
+        self, text: str, prompt_id: int | None, selection_id: int | None = None,
+        general_task_id: int | None = None, media_path: str = "", media_kind: str = "",
+    ) -> int:
+        return self.store.create_owner_query_delivery(
+            text, prompt_id, selection_id, general_task_id, media_path, media_kind,
+        )
 
     def pending_owner_query_deliveries(self) -> list[OwnerQueryResult]:
         return [
-            OwnerQueryResult(text=text, prompt_id=prompt_id, delivery_id=delivery_id, selection_id=selection_id, general_task_id=general_task_id)
-            for delivery_id, text, prompt_id, selection_id, general_task_id in self.store.pending_owner_query_deliveries()
+            OwnerQueryResult(
+                text=text, prompt_id=prompt_id, delivery_id=delivery_id, selection_id=selection_id,
+                general_task_id=general_task_id, media_path=media_path, media_kind=media_kind,
+            )
+            for delivery_id, text, prompt_id, selection_id, general_task_id, media_path, media_kind
+            in self.store.pending_owner_query_deliveries()
         ]
+
+    async def prepare_owner_query_voice(self, result: OwnerQueryResult) -> OwnerQueryResult:
+        """Attach synthesized speech to a model answer before Telegram delivery."""
+        registry = self.speech_provider_registry
+        if not result.speak or result.media_path or registry is None:
+            return result
+        try:
+            audio = await registry.synthesize(
+                result.text,
+                provider_order=self.owner_voice_provider_order,
+                max_cost_usd=self.owner_voice_max_cost_usd,
+            )
+            if (
+                audio.media_type != "audio/mpeg" or audio.extension != ".mp3"
+                or not audio.data or len(audio.data) > MAX_SPEECH_BYTES
+            ):
+                raise SpeechProviderError("unsupported_audio_response")
+            self.generated_media_dir.mkdir(parents=True, exist_ok=True)
+            media_path = self.generated_media_dir / f"owner-voice-{uuid4().hex}.mp3"
+            media_path.write_bytes(audio.data)
+        except SpeechProviderError as exc:
+            logger.warning("event=owner_voice_generation_failed reason=%s", exc.reason)
+            return replace(result, speak=False)
+        except Exception as exc:
+            logger.warning("event=owner_voice_generation_failed error_type=%s", type(exc).__name__)
+            return replace(result, speak=False)
+        return replace(result, media_path=str(media_path), media_kind="audio", speak=False)
 
     def record_owner_query_delivery(self, delivery_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_query_delivery(delivery_id, owner_message_id)
@@ -1382,7 +1471,7 @@ class AgentBridgeApplication:
             time_label=scope.time_label if scope else "",
             detail_level=scope.detail_level if scope else "short",
         )
-        return OwnerQueryResult(answer, prompt_id)
+        return OwnerQueryResult(answer, prompt_id, speak=True)
 
     async def _answer_owner_portfolio(
         self, scope: OwnerQueryScope, *, update_id: int | None = None, selection_id: int | None = None,
@@ -1449,7 +1538,7 @@ class AgentBridgeApplication:
             self.store.mark_update_processed(update_id)
         if selection_id is not None:
             self.store.finish_owner_query_selection(selection_id)
-        return OwnerQueryResult(str(answer), prompt_id)
+        return OwnerQueryResult(str(answer), prompt_id, speak=True)
 
     def _portfolio_context(self, chat: ChatConfig, scope: OwnerQueryScope) -> tuple[str, int, int, bool]:
         messages, total, truncated = self.store.portfolio_messages(

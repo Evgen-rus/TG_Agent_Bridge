@@ -88,6 +88,57 @@ async def test_general_reminder_uses_existing_store_only_after_confirmation(tmp_
 
 
 @pytest.mark.asyncio
+async def test_image_task_waits_for_confirmation_then_generates_one_owner_image(tmp_path, chat_registry) -> None:
+    class ImageProvider(GeneralProvider):
+        async def plan_general_task(self, *, request, timezone_name, now_local, thread_id):
+            return GeneralTaskPlan(
+                "general-thread", "Нарисовать Рика в виде доброжелательного робота.", "image",
+                image_prompt="A friendly fictional robot named Rick, colorful digital illustration",
+            )
+
+    class FakeImageGenerator:
+        def __init__(self):
+            self.prompts = []
+
+        async def generate(self, prompt):
+            self.prompts.append(prompt)
+            return b"\xff\xd8mock-jpeg\xff\xd9"
+
+    provider = ImageProvider()
+    generator = FakeImageGenerator()
+    store = ChatThreadStore(tmp_path / "image-task.sqlite3")
+    image_dir = tmp_path / "media" / "owner_generated"
+    service = AgentBridgeApplication(
+        chat_registry, store, provider, owner_chat_id=77, owner_provider=provider,
+        image_generator=generator, generated_media_dir=image_dir,
+    )
+
+    prepared = await service._prepare_general_task("Нарисуй Рика")
+    assert prepared.general_task_id is not None
+    assert generator.prompts == []
+    assert "оплачивается отдельно" in prepared.text
+
+    result = await service.handle_general_task_action(prepared.general_task_id, "confirm", 77)
+
+    assert result.media_path == str(image_dir / f"owner-task-{prepared.general_task_id}.jpg")
+    assert (image_dir / f"owner-task-{prepared.general_task_id}.jpg").read_bytes() == b"\xff\xd8mock-jpeg\xff\xd9"
+    assert generator.prompts == ["A friendly fictional robot named Rick, colorful digital illustration"]
+    assert store.get_general_task(prepared.general_task_id).status == "done"
+    assert provider.runs == []
+
+    delivery_id = service.save_pending_owner_query_delivery(
+        result.text, None, general_task_id=prepared.general_task_id, media_path=result.media_path,
+    )
+    pending = service.pending_owner_query_deliveries()
+    assert len(pending) == 1
+    assert pending[0].delivery_id == delivery_id
+    assert pending[0].media_path == result.media_path
+
+    service.record_owner_query_delivery(delivery_id, owner_message_id=8123)
+    assert service.pending_owner_query_deliveries() == []
+
+
+@pytest.mark.asyncio
 async def test_general_task_clarification_replans_and_cancel_is_terminal(tmp_path, chat_registry) -> None:
     provider = GeneralProvider()
     store = ChatThreadStore(tmp_path / "clarify.sqlite3")

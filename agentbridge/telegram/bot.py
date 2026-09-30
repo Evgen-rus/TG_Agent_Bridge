@@ -389,6 +389,7 @@ def create_telegram_application(
     pending_batches: dict[int, _PendingBatch] = {}
     delivery_lock = asyncio.Lock()
     send_lock = asyncio.Lock()
+    owner_generated_media_dir = ((media_dir or Path("runtime/media")) / "owner_generated").resolve()
     voice_tasks: dict[int, set[asyncio.Task[None]]] = {}
     owner_voice_retry_targets: dict[int, int] = {}
     retry_task: asyncio.Task[None] | None = None
@@ -441,6 +442,36 @@ def create_telegram_application(
                     logger.info("event=owner_delivery_part_sent part=%s/%s owner_message_id=%s", index + 1, len(parts), message_id)
             return sent
 
+    async def _send_owner_photo(bot, *, chat_id: int, media_path: str, caption: str):
+        if chat_id != owner_chat_id:
+            raise ValueError("Outbound media must target the owner chat")
+        path = Path(media_path).resolve()
+        try:
+            path.relative_to(owner_generated_media_dir)
+        except ValueError as exc:
+            raise ValueError("Owner media path is outside the generated-media directory") from exc
+        if not path.is_file():
+            raise FileNotFoundError("Owner image is no longer available")
+        async with send_lock:
+            with path.open("rb") as photo:
+                return await bot.send_photo(
+                    chat_id=chat_id, photo=photo, caption=_telegram_safe_text(caption)[:1024],
+                )
+
+    async def _send_owner_audio(bot, *, chat_id: int, media_path: str):
+        if chat_id != owner_chat_id:
+            raise ValueError("Outbound media must target the owner chat")
+        path = Path(media_path).resolve()
+        try:
+            path.relative_to(owner_generated_media_dir)
+        except ValueError as exc:
+            raise ValueError("Owner media path is outside the generated-media directory") from exc
+        if not path.is_file() or path.suffix.lower() != ".mp3":
+            raise FileNotFoundError("Owner audio is no longer available")
+        async with send_lock:
+            with path.open("rb") as audio:
+                return await bot.send_voice(chat_id=chat_id, voice=audio)
+
     async def _send_typing(bot, chat_id: int) -> None:
         send_action = getattr(bot, "send_chat_action", None)
         if send_action is None:
@@ -469,19 +500,46 @@ def create_telegram_application(
     async def _deliver_owner_query(bot, result) -> None:
         if result is None:
             return
+        if isinstance(result, OwnerQueryResult) and result.speak and not result.media_path:
+            prepare_voice = getattr(message_service, "prepare_owner_query_voice", None)
+            if prepare_voice is not None:
+                try:
+                    result = await prepare_voice(result)
+                except Exception as exc:
+                    logger.warning("event=owner_voice_generation_failed error_type=%s", type(exc).__name__)
         text = result.text if isinstance(result, OwnerQueryResult) else str(result)
         text = _telegram_safe_text(text)
+        media_path = result.media_path if isinstance(result, OwnerQueryResult) else ""
+        media_kind = result.media_kind if isinstance(result, OwnerQueryResult) else ""
+        if media_path and not media_kind:
+            media_kind = "photo"
         prompt_id = result.prompt_id if isinstance(result, OwnerQueryResult) else None
         delivery_id = result.delivery_id if isinstance(result, OwnerQueryResult) else None
         selection_id = result.selection_id if isinstance(result, OwnerQueryResult) else None
         general_task_id = result.general_task_id if isinstance(result, OwnerQueryResult) else None
-        if not text:
+        if not text and not media_path:
             return
+        if media_path:
+            try:
+                candidate = Path(media_path).resolve()
+                candidate.relative_to(owner_generated_media_dir)
+                if not candidate.is_file():
+                    raise FileNotFoundError
+            except (OSError, ValueError):
+                logger.warning("event=owner_media_delivery_unavailable media_kind=%s reason=missing_or_invalid_file", media_kind or "unknown")
+                text = "Не удалось отправить аудио: файл больше недоступен." if media_kind == "audio" else "Не удалось отправить изображение: файл больше недоступен."
+                media_path = ""
+                media_kind = ""
         save = getattr(message_service, "save_pending_owner_query_delivery", None)
         if delivery_id is None and save is not None:
             try:
-                delivery_id = save(text, prompt_id, selection_id, general_task_id)
+                delivery_id = save(
+                    text, prompt_id, selection_id, general_task_id,
+                    media_path=media_path, media_kind=media_kind,
+                )
             except TypeError:
+                if media_path and media_kind == "audio":
+                    raise
                 delivery_id = save(text, prompt_id)
         try:
             selection_options = None
@@ -492,14 +550,27 @@ def create_telegram_application(
             needs_confirmation = general_task_id is not None and (
                 confirmation_getter is None or confirmation_getter(general_task_id)
             )
-            sent = await _send(
-                bot, chat_id=owner_chat_id, text=text,
-                reply_markup=(
-                    _owner_query_selection_keyboard(selection_id, selection_options) if selection_id is not None
-                    else _general_task_keyboard(general_task_id) if needs_confirmation else None
-                ),
-                delivery_key=f"owner-query:{delivery_id}" if delivery_id is not None else None,
+            reply_markup = (
+                _owner_query_selection_keyboard(selection_id, selection_options) if selection_id is not None
+                else _general_task_keyboard(general_task_id) if needs_confirmation else None
             )
+            text_sent = None
+            if media_path and media_kind == "photo":
+                sent = await _send_owner_photo(
+                    bot, chat_id=owner_chat_id, media_path=media_path, caption=text,
+                )
+            elif media_path and media_kind == "audio":
+                if text:
+                    text_sent = await _send(
+                        bot, chat_id=owner_chat_id, text=text, reply_markup=reply_markup,
+                        delivery_key=f"owner-query:{delivery_id}:text" if delivery_id is not None else None,
+                    )
+                sent = await _send_owner_audio(bot, chat_id=owner_chat_id, media_path=media_path)
+            else:
+                sent = await _send(
+                    bot, chat_id=owner_chat_id, text=text, reply_markup=reply_markup,
+                    delivery_key=f"owner-query:{delivery_id}" if delivery_id is not None else None,
+                )
         except BadRequest:
             logger.warning("event=owner_query_delivery_pending reason=telegram_bad_request")
             return
@@ -513,15 +584,21 @@ def create_telegram_application(
         record = getattr(message_service, "record_owner_query_delivery", None)
         if delivery_id is not None and record is not None and message_id is not None:
             record(delivery_id, message_id)
+        if media_path and message_id is not None:
+            Path(media_path).unlink(missing_ok=True)
         attach = getattr(message_service, "attach_owner_query_prompt", None)
-        if prompt_id is not None and attach is not None and message_id is not None:
-            attach(prompt_id, message_id)
+        linked_message_id = (
+            message_id if media_path and media_kind == "audio"
+            else getattr(text_sent, "message_id", None) or message_id
+        )
+        if prompt_id is not None and attach is not None and linked_message_id is not None:
+            attach(prompt_id, linked_message_id)
         attach_selection = getattr(message_service, "attach_owner_query_selection", None)
-        if selection_id is not None and attach_selection is not None and message_id is not None:
-            attach_selection(selection_id, message_id)
+        if selection_id is not None and attach_selection is not None and linked_message_id is not None:
+            attach_selection(selection_id, linked_message_id)
         attach_general = getattr(message_service, "attach_general_task", None)
-        if general_task_id is not None and attach_general is not None and message_id is not None:
-            attach_general(general_task_id, message_id)
+        if general_task_id is not None and attach_general is not None and linked_message_id is not None:
+            attach_general(general_task_id, linked_message_id)
 
     async def _deliver_reminder(bot, reminder) -> None:
         try:
@@ -602,10 +679,26 @@ def create_telegram_application(
                         store.queue_daily_report(report_date, start, end)
                 except Exception:
                     logger.exception("event=daily_report_queue_failed component=telegram")
+        pending_queries = getattr(message_service, "pending_owner_query_deliveries", None)
+        query_results = []
+        query_scan_succeeded = pending_queries is None
+        if pending_queries is not None:
+            try:
+                query_results = pending_queries()
+                query_scan_succeeded = True
+            except Exception:
+                logger.exception("event=owner_query_delivery_scan_failed")
         if media_dir is not None:
             store = getattr(message_service, "store", None)
             retained = store.retained_document_paths() if store is not None else set()
-            purge_expired_media(media_dir, media_ttl_seconds, retained_paths=retained)
+            retained.update(
+                result.media_path for result in query_results
+                if isinstance(result, OwnerQueryResult) and result.media_path
+            )
+            if query_scan_succeeded:
+                purge_expired_media(media_dir, media_ttl_seconds, retained_paths=retained)
+            else:
+                logger.warning("event=media_purge_skipped reason=owner_query_delivery_scan_failed")
         pending = getattr(message_service, "pending_suggestions", None)
         if pending is not None:
             try:
@@ -615,13 +708,7 @@ def create_telegram_application(
                 suggestions = []
             for suggestion in suggestions:
                 await _deliver_suggestion(bot, suggestion)
-        pending_queries = getattr(message_service, "pending_owner_query_deliveries", None)
         if pending_queries is not None:
-            try:
-                query_results = pending_queries()
-            except Exception:
-                logger.exception("event=owner_query_delivery_scan_failed")
-                query_results = []
             for query_result in query_results:
                 await _deliver_owner_query(bot, query_result)
         notices = getattr(message_service, "pending_onboarding_notices", None)

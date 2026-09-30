@@ -83,6 +83,11 @@ OWNER_CHAT_ID
      durable owner-only selection buttons, then isolated per-chat summaries and
      owner aggregation. Periods are converted from OWNER_TIMEZONE to [from,to)
      UTC before SQLite history filtering.
+  -> substantive owner-assistant answers may pass through the speech-provider
+     selector, then deliver full text and an MP3 voice note to OWNER_CHAT_ID;
+     the selector checks current model pricing and defaults to a zero-dollar
+     ceiling, so unknown-price and paid routes are skipped. Audio remains in the
+     existing durable owner-query delivery queue until Telegram accepts it.
   -> reply to a new-group card: client brief, then confirm wiki draft
   -> /rules and /undo from the owner-chat command menu only
   -> ordinary human conversation is ignored
@@ -187,6 +192,8 @@ a series of outdated recommendations.
   document copies, and labels for history.
 - `agentbridge/transcribe.py`: OpenAI speech-to-text call used for client voice
   notes; the configured `TRANSCRIPTION_MODEL` is the only transcription model.
+- `agentbridge/speech.py`: reusable speech-provider interface, ordered provider
+  selector with a per-response cost ceiling, and the OpenRouter TTS adapter.
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
   state, processed updates, pending/delivered recommendation links, learning
   drafts, versioned rules, memory, owner questions, reminders, experience, and
@@ -250,6 +257,14 @@ Before a new candidate is offered, active memory, active rules, and the
 relevant knowledge-pack markdown are checked with normalized exact or
 containment matching; this check does not change prompt packing.
 
+Owner voice replies are generated only for final assistant answers. Plans,
+selection prompts, routine notices, and generated images stay text-only. The
+full answer is still delivered as text; a separate MP3 voice note follows it.
+Both stay owner-only. The text parts use the existing acknowledged delivery
+parts, while `owner_query_deliveries.media_kind` keeps pending audio paths for
+retry. A model can be selected only when its live quote is known and below
+`OWNER_VOICE_MAX_COST_USD`; the default is zero, with no paid fallback.
+
 `ASK_OWNER` is used when a needed fact is missing. The question is sent only to
 `OWNER_CHAT_ID` and linked back to the client chat. The owner's reply can update
 the current situation and propose confirmed memory; it is never sent to the
@@ -276,6 +291,13 @@ selected IDs and time metadata so a follow-up reruns the same portfolio.
 - General owner tasks never execute before their durable Telegram confirmation;
   duplicate callbacks cannot run a task twice. Arbitrary failed tasks are not
   retried automatically, while reminder delivery keeps its existing retry path.
+- Creating a new image is an owner-only general task. It makes no OpenAI Images
+  request before confirmation; after confirmation it generates one JPEG, stores
+  it under `MEDIA_DIR/owner_generated`, and persists the path in the owner
+  delivery queue. Telegram sends it only to `OWNER_CHAT_ID`; a successful send
+  records its message ID and deletes the temporary file, while failed delivery
+  retains the file for the retry loop. Generation uses `OPENAI_API_KEY` and is
+  billed separately by OpenAI. Editing existing images is not supported.
 - Self-restart never gives Codex process-control arguments: it can classify the
   intent only. The Telegram adapter starts the fixed local helper after owner
   confirmation, and only the replacement PID can close the restart marker.

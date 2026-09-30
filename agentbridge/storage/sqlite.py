@@ -934,6 +934,8 @@ class ChatThreadStore:
                     prompt_id INTEGER,
                     selection_id INTEGER,
                     owner_message_id INTEGER,
+                    media_path TEXT NOT NULL DEFAULT '',
+                    media_kind TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_owner_query_deliveries_pending
@@ -1097,7 +1099,11 @@ class ChatThreadStore:
                 ("time_label", "TEXT NOT NULL DEFAULT ''"),
                 ("detail_level", "TEXT NOT NULL DEFAULT 'short'"),
             ),
-            "owner_query_deliveries": (("selection_id", "INTEGER"), ("general_task_id", "INTEGER")),
+            "owner_query_deliveries": (
+                ("selection_id", "INTEGER"), ("general_task_id", "INTEGER"),
+                ("media_path", "TEXT NOT NULL DEFAULT ''"),
+                ("media_kind", "TEXT NOT NULL DEFAULT ''"),
+            ),
             "reminders": (
                 ("related_chat_id", "INTEGER"),
                 ("related_chat_name", "TEXT"),
@@ -2188,22 +2194,32 @@ class ChatThreadStore:
             )
         return result.rowcount == 1
 
-    def create_owner_query_delivery(self, text: str, prompt_id: int | None, selection_id: int | None = None, general_task_id: int | None = None) -> int:
+    def create_owner_query_delivery(
+        self, text: str, prompt_id: int | None, selection_id: int | None = None,
+        general_task_id: int | None = None, media_path: str = "", media_kind: str = "",
+    ) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                """INSERT INTO owner_query_deliveries (text, prompt_id, selection_id, general_task_id, created_at)
-                VALUES (?, ?, ?, ?, ?)""",
-                (text, prompt_id, selection_id, general_task_id, _now()),
+                """INSERT INTO owner_query_deliveries
+                (text, prompt_id, selection_id, general_task_id, media_path, media_kind, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (text, prompt_id, selection_id, general_task_id, media_path, media_kind, _now()),
             )
             return int(cursor.lastrowid)
 
-    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None, int | None, int | None]]:
+    def pending_owner_query_deliveries(self) -> list[tuple[int, str, int | None, int | None, int | None, str, str]]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT id, text, prompt_id, selection_id, general_task_id FROM owner_query_deliveries
+                """SELECT id, text, prompt_id, selection_id, general_task_id, media_path, media_kind FROM owner_query_deliveries
                 WHERE owner_message_id IS NULL ORDER BY id""",
             ).fetchall()
-        return [(int(row["id"]), row["text"], row["prompt_id"], row["selection_id"], row["general_task_id"]) for row in rows]
+        return [
+            (
+                int(row["id"]), row["text"], row["prompt_id"], row["selection_id"],
+                row["general_task_id"], row["media_path"], row["media_kind"],
+            )
+            for row in rows
+        ]
 
     def create_reminder(
         self, owner_chat_id: int, remind_at_utc: str, text: str, *,

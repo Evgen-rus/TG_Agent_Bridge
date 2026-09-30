@@ -147,12 +147,13 @@ _GENERAL_TASK_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
         "understanding": {"type": "string"},
-        "kind": {"type": "string", "enum": ["general", "reminder", "restart"]},
+        "kind": {"type": "string", "enum": ["general", "reminder", "restart", "image"]},
         "remind_at_utc": {"type": "string"},
         "local_label": {"type": "string"},
         "reminder_text": {"type": "string"},
+        "image_prompt": {"type": "string"},
     },
-    "required": ["understanding", "kind", "remind_at_utc", "local_label", "reminder_text"],
+    "required": ["understanding", "kind", "remind_at_utc", "local_label", "reminder_text", "image_prompt"],
     "additionalProperties": False,
 }
 _OWNER_SCOPE_SCHEMA = {
@@ -265,8 +266,12 @@ _GENERAL_TASK_PLAN_INSTRUCTIONS = """Ты личный Codex-помощник в
 Если время неоднозначно, прямо попроси уточнить его в understanding, а remind_at_utc оставь пустым.
 Если владелец явно просит перезапустить Рика, AgentBridge или тебя самого, kind=restart. Не выбирай
 restart для повторного анализа/запроса, обновления данных, перезагрузки страницы или неоднозначной фразы.
+Если владелец явно просит создать новое изображение, kind=image: image_prompt должен
+содержать короткое описание одного изображения. understanding говорит, что после подтверждения владельца
+будет сделана одна генерация и изображение отправится только в чат владельца. Пока планируешь, изображение
+не создавай. Запрос редактировать существующее изображение не классифицируй как image. Поля напоминания оставь пустыми.
 Для остальных задач kind=general. understanding кратко перечисляет цель и существенные действия,
-особенно запись файлов, сеть, SSH, отправку сообщений, deploy или удаление. Остальные поля пустые.
+особенно запись файлов, сеть, SSH, отправку сообщений, deploy или удаление. Поля напоминания и image_prompt пустые.
 Не добавляй действий, которых владелец не просил. Пиши по-русски.
 Если запрос прямо сообщает, что владелец подтвердил выполнение, это режим выполнения: выполни только
 подтверждённую задачу штатными инструментами и верни короткий фактический итог."""
@@ -320,7 +325,7 @@ _SEPIA_INSTRUCTIONS = """Ты выполняешь только финальну
 После редактуры сравни результат с draft. facts_preserved и commitments_preserved=true только если ничего критического не добавлено, не удалено и не изменено.
 Верни только JSON по схеме."""
 
-AGENT_PROMPT_VERSION = 10
+AGENT_PROMPT_VERSION = 11
 
 
 class CodexProvider:
@@ -521,7 +526,8 @@ class CodexProvider:
                     config={"model_reasoning_effort": self.reasoning_effort})
             payload = self._run_json(thread, prompt, _GENERAL_TASK_PLAN_SCHEMA)
         return GeneralTaskPlan(thread.id, str(payload["understanding"]).strip(), str(payload["kind"]),
-            str(payload["remind_at_utc"]).strip(), str(payload["local_label"]).strip(), str(payload["reminder_text"]).strip())
+            str(payload["remind_at_utc"]).strip(), str(payload["local_label"]).strip(),
+            str(payload["reminder_text"]).strip(), str(payload["image_prompt"]).strip())
 
     async def run_general_task(self, *, request: str, thread_id: str) -> OwnerQueryAnswer:
         return await asyncio.to_thread(self._run_general_task_sync, request, thread_id)

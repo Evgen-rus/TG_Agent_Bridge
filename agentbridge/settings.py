@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import os
 
@@ -38,6 +39,16 @@ class Settings:
     media_ttl_seconds: int = 3600
     openai_api_key: str = ""
     transcription_model: str = "gpt-4o-mini-transcribe"
+    image_generation_model: str = "gpt-image-2.5-flare"
+    image_generation_size: str = "1024x1024"
+    image_generation_quality: str = "low"
+    openrouter_api_key: str = ""
+    owner_voice_enabled: bool = True
+    owner_voice_provider_order: tuple[str, ...] = ("openrouter",)
+    owner_voice_max_cost_usd: Decimal = Decimal("0")
+    openrouter_tts_model: str = "fish-audio/s2.1-pro-free:free"
+    openrouter_tts_voice: str = "933563129e564b19a115bedd57b7406a"
+    openrouter_tts_timeout_seconds: float = 120.0
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -54,6 +65,16 @@ class Settings:
             owner_chat_id = int(owner)
         except ValueError as exc:
             raise ValueError("OWNER_CHAT_ID must be an integer") from exc
+        try:
+            owner_voice_max_cost_usd = Decimal(os.getenv("OWNER_VOICE_MAX_COST_USD", "0").strip())
+        except InvalidOperation as exc:
+            raise ValueError("OWNER_VOICE_MAX_COST_USD must be a non-negative number") from exc
+        if not owner_voice_max_cost_usd.is_finite() or owner_voice_max_cost_usd < 0:
+            raise ValueError("OWNER_VOICE_MAX_COST_USD must be a non-negative number")
+        owner_voice_provider_order = tuple(
+            item.strip() for item in os.getenv("OWNER_VOICE_PROVIDER_ORDER", "openrouter").split(",")
+            if item.strip()
+        )
 
         return cls(
             telegram_bot_token=token,
@@ -85,4 +106,16 @@ class Settings:
             media_ttl_seconds=int(os.getenv("MEDIA_TTL_SECONDS", "3600")),
             openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
             transcription_model=os.getenv("TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip(),
+            image_generation_model=os.getenv("IMAGE_GENERATION_MODEL", "gpt-image-2.5-flare").strip(),
+            image_generation_size=os.getenv("IMAGE_GENERATION_SIZE", "1024x1024").strip(),
+            image_generation_quality=os.getenv("IMAGE_GENERATION_QUALITY", "low").strip(),
+            openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+            owner_voice_enabled=os.getenv("OWNER_VOICE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+            owner_voice_provider_order=owner_voice_provider_order,
+            owner_voice_max_cost_usd=owner_voice_max_cost_usd,
+            openrouter_tts_model=os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro-free:free").strip(),
+            openrouter_tts_voice=os.getenv(
+                "OPENROUTER_TTS_VOICE", "933563129e564b19a115bedd57b7406a",
+            ).strip(),
+            openrouter_tts_timeout_seconds=float(os.getenv("OPENROUTER_TTS_TIMEOUT_SECONDS", "120")),
         )

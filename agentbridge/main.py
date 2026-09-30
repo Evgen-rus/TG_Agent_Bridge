@@ -8,8 +8,10 @@ import sys
 from .agents.codex import CodexProvider
 from .application import AgentBridgeApplication
 from .chats.loader import ChatRegistry
+from .image_generation import OpenAIImageGenerator
 from .logging import OperationalEventHandler, configure_logging
 from .settings import Settings
+from .speech import OpenRouterSpeechProvider, SpeechProviderRegistry
 from .storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
     ChatThreadStore,
@@ -93,10 +95,30 @@ def main() -> None:
         on_usage_recovered=note_owner_codex_recovered,
         usage_limit_active=limit_active,
     )
+    image_generator = OpenAIImageGenerator(
+        settings.openai_api_key,
+        model=settings.image_generation_model,
+        size=settings.image_generation_size,
+        quality=settings.image_generation_quality,
+    )
+    speech_provider_registry = None
+    if settings.owner_voice_enabled and settings.openrouter_api_key:
+        speech_provider_registry = SpeechProviderRegistry((
+            OpenRouterSpeechProvider(
+                settings.openrouter_api_key,
+                model=settings.openrouter_tts_model,
+                voice=settings.openrouter_tts_voice,
+                timeout_seconds=settings.openrouter_tts_timeout_seconds,
+            ),
+        ))
     service = AgentBridgeApplication(
         registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size, settings.chats_dir,
         knowledge_dir=root / "knowledge", owner_provider=owner_provider,
-        owner_timezone=settings.owner_timezone,
+        owner_timezone=settings.owner_timezone, image_generator=image_generator,
+        generated_media_dir=settings.media_dir / "owner_generated",
+        speech_provider_registry=speech_provider_registry,
+        owner_voice_provider_order=settings.owner_voice_provider_order,
+        owner_voice_max_cost_usd=settings.owner_voice_max_cost_usd,
     )
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,

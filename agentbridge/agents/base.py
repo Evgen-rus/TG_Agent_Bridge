@@ -78,6 +78,7 @@ class GeneralTaskPlan:
     remind_at_utc: str = ""
     local_label: str = ""
     reminder_text: str = ""
+    image_prompt: str = ""
 
 
 @dataclass(frozen=True)
