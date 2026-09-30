@@ -715,27 +715,6 @@ class ChatThreadStore:
             connection.execute("DELETE FROM operational_events WHERE created_at<?",
                                ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),))
 
-    def recent_failures(self, limit: int = 5) -> list[tuple[str, str]]:
-        """Последние сбои как пары (событие, время UTC) для разбора Риком.
-
-        Рик отвечает владельцу на «что за ошибка была» не из памяти: он
-        получает сухие имена событий из журнала. Текст ошибки сюда не
-        попадает намеренно — в нём бывают пути и секреты, а владельцу для
-        разбора хватает того, что произошло и когда.
-
-        Уровень сверяется в верхнем регистре, потому что пишет его
-        OperationalEventHandler, а он кладёт `record.levelname` — то есть
-        `ERROR`/`CRITICAL` заглавными. Сравнение со строчным `level='error'`
-        молча не нашло бы на VPS ничего.
-        """
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT event, created_at FROM operational_events "
-                "WHERE UPPER(level) IN ('ERROR', 'CRITICAL') "
-                "ORDER BY created_at DESC, id DESC LIMIT ?", (limit,),
-            ).fetchall()
-        return [(str(row[0]), str(row[1])) for row in rows]
-
     def queue_daily_report(self, report_date: str, start_utc: str, end_utc: str) -> int:
         with self._connect() as connection:
             existing = connection.execute(

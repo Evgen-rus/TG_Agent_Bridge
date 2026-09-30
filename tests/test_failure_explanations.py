@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import logging
 
 import pytest
 from openai_codex.errors import TransportClosedError
@@ -13,7 +12,6 @@ from agentbridge.agents.codex import (
     codex_failure_hint,
 )
 from agentbridge.application import AgentBridgeApplication, OwnerQueryResult
-from agentbridge.logging import OperationalEventHandler
 from agentbridge.storage.sqlite import ChatThreadStore
 
 
@@ -118,56 +116,6 @@ def test_owner_failure_text_never_raises_on_explaining_provider(tmp_path) -> Non
     application = _application(tmp_path, BrokenProvider())
     text = application._owner_failure_text(TimeoutError("boom"))
     assert "Не удалось выполнить задачу." in text
-
-
-def test_recent_failures_returns_newest_first(tmp_path) -> None:
-    store = ChatThreadStore(tmp_path / "state.sqlite3")
-    store.record_operational_event("first_failure", "ERROR")
-    store.record_operational_event("second_failure", "ERROR")
-    store.record_operational_event("not_an_error", "INFO")
-    failures = store.recent_failures(limit=2)
-    assert [event for event, _ in failures] == ["second_failure", "first_failure"]
-
-
-def test_recent_failures_respects_limit(tmp_path) -> None:
-    store = ChatThreadStore(tmp_path / "state.sqlite3")
-    for index in range(5):
-        store.record_operational_event(f"failure_{index}", "ERROR")
-    assert len(store.recent_failures(limit=3)) == 3
-
-
-def test_recent_failures_ignores_non_error_levels(tmp_path) -> None:
-    store = ChatThreadStore(tmp_path / "state.sqlite3")
-    store.record_operational_event("polling_started", "INFO")
-    assert store.recent_failures() == []
-
-
-def test_recent_failures_includes_critical(tmp_path) -> None:
-    store = ChatThreadStore(tmp_path / "state.sqlite3")
-    store.record_operational_event("process_crashed", "CRITICAL")
-    assert [event for event, _ in store.recent_failures()] == ["process_crashed"]
-
-
-def test_recent_failures_matches_levels_case_insensitively(tmp_path) -> None:
-    """Реальный логгер пишет `record.levelname` — это заглавные `ERROR`."""
-    store = ChatThreadStore(tmp_path / "state.sqlite3")
-    store.record_operational_event("uppercase", "ERROR")
-    store.record_operational_event("lowercase", "error")
-    assert {event for event, _ in store.recent_failures()} == {"uppercase", "lowercase"}
-
-
-def test_recent_failures_survives_real_operational_handler(tmp_path) -> None:
-    """Сквозная проверка регистра: событие, записанное логгером, видно в выборке."""
-    store = ChatThreadStore(tmp_path / "state.sqlite3")
-    handler = OperationalEventHandler(store.record_operational_event)
-    logger = logging.getLogger("test.operational.level")
-    logger.addHandler(handler)
-    logger.setLevel(logging.ERROR)
-    try:
-        logger.error("event=codex_turn_failed component=codex")
-    finally:
-        logger.removeHandler(handler)
-    assert [event for event, _ in store.recent_failures()] == ["codex_turn_failed"]
 
 
 def test_owner_query_result_carries_failure_text(tmp_path) -> None:
