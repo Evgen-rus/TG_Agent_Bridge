@@ -561,7 +561,7 @@ def test_known_future_reset_time_blocks_until_reset_then_allows(tmp_path: Path) 
     assert still_blocked.allowed is False
     assert still_blocked.reason == "before_reset_time"
     # Сам момент сброса открывает обычную попытку.
-    after = store.codex_usage_limit_retry(now=datetime.fromisoformat(state.reset_at_utc))
+    after = store.codex_usage_limit_retry(now=state.reset_at_utc)
     assert after.allowed is True
     assert after.reason == "reset_time_reached"
 
