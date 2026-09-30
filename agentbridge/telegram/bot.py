@@ -185,6 +185,29 @@ def _general_task_keyboard(task_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+# Действия выбора, которые не перерисовывают список, а сразу запускают работу.
+# Для них нажатие подтверждается заранее: клавиатура исчезает, показывает
+# «принято», и во время долгого turn идёт typing. Обычное переключение
+# пунктов (item_add/item_remove/reset/multi/single) сюда не входит — там
+# результат приходит быстро и список должен остаться на месте.
+_LONG_SELECTION_ACTIONS = frozenset({"done", "all", "general", "choose"})
+_SELECTION_ACCEPTED_TEXT = "Принято, работаю над этим. Ответ придёт в чат."
+
+
+async def _accept_selection_callback(query) -> None:
+    """Подтвердить финальное нажатие до долгой работы.
+
+    Порядок важен: сначала гасим кнопки, потом пишем, что запрос принят. Так
+    повторное нажатие уже не может запустить вторую обработку, даже если Codex
+    ещё думает, а владелец решит повторить тап.
+    """
+    await _telegram_try("clear_selection_keyboard", query.edit_message_reply_markup(reply_markup=None))
+    edit_text = getattr(query, "edit_message_text", None)
+    if edit_text is None:
+        return
+    await _telegram_try("confirm_selection", edit_text(_SELECTION_ACCEPTED_TEXT, reply_markup=None))
+
+
 async def _telegram_try(operation: str, coro: Awaitable[object]) -> None:
     """UX-only Telegram calls: a timeout must not abort local work like saving a rule."""
     try:
@@ -1522,7 +1545,23 @@ def create_telegram_application(
             handler = getattr(message_service, "handle_owner_query_selection", None)
             if handler is None:
                 return
-            result = await handler(selection_id, parts[1], index, owner_chat_id)
+            action = parts[1]
+            # Действия, которые сразу уходят в Codex/портфельный разбор, подтверждаем
+            # нажатием до долгой работы: иначе клавиатура висит на месте минуту и
+            # владелец считает, что бот завис. Переключение списка этим не трогаем.
+            if action in _LONG_SELECTION_ACTIONS:
+                await _accept_selection_callback(query)
+                try:
+                    async with _typing(context.bot, owner_chat_id):
+                        result = await handler(selection_id, action, index, owner_chat_id)
+                except Exception:
+                    # Кнопок уже нет, поэтому тихий отказ оставил бы владельца
+                    # без внятного объяснения: сообщаем явно.
+                    logger.exception("event=owner_query_selection_failed selection_id=%s action=%s", selection_id, action)
+                    await _send(context.bot, chat_id=owner_chat_id, text="Не получилось обработать выбор. Попробуйте ещё раз или напишите вопрос обычным текстом.")
+                    return
+            else:
+                result = await handler(selection_id, action, index, owner_chat_id)
             if result is None:
                 return
             if result.selection_id is not None:

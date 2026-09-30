@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
-from openai_codex.errors import InvalidRequestError, MethodNotFoundError
+from openai_codex.errors import InvalidRequestError, MethodNotFoundError, TransportClosedError
 
 from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
 from ..media import is_visual_media
@@ -503,7 +503,29 @@ class CodexProvider:
         self, *, question: str, chat_name: str, context_pack: str, thread_id: str | None,
         attachments: tuple[MediaAttachment, ...] | list[MediaAttachment] = (),
     ) -> OwnerQueryAnswer:
-        return await asyncio.to_thread(self._answer_owner_query_sync, question, chat_name, context_pack, thread_id, tuple(attachments))
+        return await self._owner_turn_with_retry(
+            self._answer_owner_query_sync, question, chat_name, context_pack, thread_id, tuple(attachments),
+        )
+
+    async def _owner_turn_with_retry(self, call, *args):
+        """Ровно один безопасный повтор read-only owner turn на новом transport.
+
+        Повторяется только оборванный транспорт: тот read-only вопрос, который
+        не был доставлен модели целиком. Всё остальное — и второй обрыв
+        transport — уходит в обычный failed path, как раньше, поэтому лишних
+        платных запросов не появляется.
+        """
+        try:
+            return await asyncio.to_thread(call, *args)
+        except CodexTransportClosed as exc:
+            logger.warning("event=codex_transport_closed_retry component=codex error_type=%s", type(exc).__name__)
+        try:
+            return await asyncio.to_thread(call, *args)
+        except CodexTransportClosed as exc:
+            logger.error(
+                "event=codex_transport_closed_retry_failed component=codex error_type=%s", type(exc).__name__,
+            )
+            raise RuntimeError("Codex transport closed twice") from None
 
     async def plan_general_task(
         self, *, request: str, timezone_name: str, now_local: str, thread_id: str | None,
@@ -530,7 +552,7 @@ class CodexProvider:
             str(payload["reminder_text"]).strip(), str(payload["image_prompt"]).strip())
 
     async def run_general_task(self, *, request: str, thread_id: str) -> OwnerQueryAnswer:
-        return await asyncio.to_thread(self._run_general_task_sync, request, thread_id)
+        return await self._owner_turn_with_retry(self._run_general_task_sync, request, thread_id)
 
     def _run_general_task_sync(self, request: str, thread_id: str) -> OwnerQueryAnswer:
         prompt = f"Владелец подтвердил выполнение этой задачи:\n\n{request}"
@@ -659,7 +681,7 @@ class CodexProvider:
         except Exception as exc:
             logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=%s reason=%s duration_ms=%d", thread.id, type(exc).__name__, _error_reason(exc), (time.monotonic() - started) * 1000)
             self._note_failure(exc)
-            raise RuntimeError(f"Codex turn failed ({type(exc).__name__})") from None
+            _raise_turn_failure(exc)
         if result.error is not None:
             logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=CodexResultError reason=%s duration_ms=%d", thread.id, _error_reason(result.error), (time.monotonic() - started) * 1000)
             self._note_failure(result.error)
@@ -758,6 +780,38 @@ def _critical_anchors(text: str) -> list[str]:
 def _thread_is_unavailable(exc: Exception) -> bool:
     message = str(exc).casefold()
     return "paginated_threads" in message or "no rollout found for thread id" in message
+
+
+class CodexTransportClosed(RuntimeError):
+    """Транспорт Codex закрылся прямо во время read-only turn.
+
+    Отдельный тип нужен ровно для одного: такой обрыв безопасно повторить на
+    свежем `Codex()` transport. Повтор делает владелец, а не turn сам, поэтому
+    ограничение «одна попытка» держится в одном месте, а не в каждом вызове.
+    """
+
+
+def _is_transport_closed(error: object) -> bool:
+    """Оборванный транспорт — и только он, а не любая ошибка подряд.
+
+    Повторять вообще всё нельзя: повтор платного или уже выполненного turn
+    означал бы двойную работу и двойные расходы. Оборванное соединение
+    отличается тем, что запрос не был доставлен модели целиком, и новый
+    read-only transport начинает тот же вопрос с нуля.
+    """
+    return isinstance(error, TransportClosedError)
+
+
+def _raise_turn_failure(exc: Exception) -> None:
+    """Превратить ошибку turn в стабильный, несекретный RuntimeError.
+
+    `_run_json` поднимает именно этот тип для всех отказов Codex, чтобы
+    прикладной слой видел один контракт. Здесь мы возвращаем наружу
+    `CodexTransportClosed` там, где обрыв транспорта допускает один повтор.
+    """
+    if _is_transport_closed(exc):
+        raise CodexTransportClosed("Codex transport closed during turn") from None
+    raise RuntimeError(f"Codex turn failed ({type(exc).__name__})") from None
 
 
 def _error_reason(error: object) -> str:

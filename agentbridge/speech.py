@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import json
+import time
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
