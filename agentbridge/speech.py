@@ -13,6 +13,10 @@ OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 MAX_SPEECH_BYTES = 10 * 1024 * 1024
 MAX_MODEL_CATALOG_BYTES = 8 * 1024 * 1024
 MAX_SPEECH_TEXT_CHARS = 12_000
+# Каталог цен OpenRouter меняется редко, а владелец спрашивает голосом часто.
+# Короткий TTL держит проверку цены свежей, не превращая каждый ответ
+# владельца в дополнительный запрос к каталогу.
+MODEL_CATALOG_TTL_SECONDS = 900.0
 
 
 class SpeechProviderError(RuntimeError):
@@ -99,11 +103,40 @@ class OpenRouterSpeechProvider:
         self.model = model.strip()
         self.voice = voice.strip()
         self.timeout_seconds = timeout_seconds
+        self._catalog: bytes | None = None
+        self._catalog_expires_at = 0.0
+        self._catalog_lock = asyncio.Lock()
+
+    async def _model_catalog(self) -> bytes:
+        """Каталог моделей из памяти, обновляется не чаще одного раза за TTL.
+
+        Кэш только ускоряет проверку: цена берётся из того же ответа `/models`,
+        а после истечения TTL каталог запрашивается заново. Неудачное обновление
+        кэш не продлевает и оставляет предыдущие данные просроченными, поэтому
+        цена проверяется заново, а не по устаревшему остатку TTL.
+        """
+        now = time.monotonic()
+        cached = self._catalog
+        if cached is not None and now < self._catalog_expires_at:
+            return cached
+        async with self._catalog_lock:
+            now = time.monotonic()
+            if self._catalog is not None and now < self._catalog_expires_at:
+                return self._catalog
+            try:
+                payload = await asyncio.to_thread(
+                    self._request, "/models?output_modalities=speech", None, MAX_MODEL_CATALOG_BYTES,
+                )
+            except SpeechProviderError:
+                raise
+            self._catalog = payload
+            self._catalog_expires_at = now + MODEL_CATALOG_TTL_SECONDS
+            return payload
 
     async def quote_usd(self, text: str) -> Decimal | None:
         if not self._api_key:
             return None
-        payload = await asyncio.to_thread(self._request, "/models?output_modalities=speech", None, MAX_MODEL_CATALOG_BYTES)
+        payload = await self._model_catalog()
         try:
             catalog = json.loads(payload)
             model = next(item for item in catalog["data"] if item.get("id") == self.model)

@@ -497,26 +497,78 @@ def create_telegram_application(
             except asyncio.CancelledError:
                 pass
 
+    async def _deliver_owner_voice(bot, result) -> None:
+        """Синтезирует голос уже доставленного текстового ответа.
+
+        Вызывается только после подтверждённой доставки текста: если OpenRouter
+        или Telegram отказали, владелец уже получил ответ, а незакрытая доставка
+        (`owner_delivery_parts` + `owner_query_deliveries.media_path`) переживает
+        рестарт.
+        """
+        prepare_voice = getattr(message_service, "prepare_owner_query_voice", None)
+        if prepare_voice is None:
+            return
+        try:
+            voiced = await prepare_voice(result)
+        except Exception as exc:
+            logger.warning("event=owner_voice_generation_failed error_type=%s", type(exc).__name__)
+            return
+        audio_path = getattr(voiced, "media_path", "") if isinstance(voiced, OwnerQueryResult) else ""
+        if not audio_path:
+            return
+        # Отдельная доставка: её собственный ключ не трогает уже закрытую
+        # текстовую часть, поэтому ретрай аудио не отправляет текст заново.
+        audio_delivery_id = None
+        save = getattr(message_service, "save_pending_owner_query_delivery", None)
+        if save is not None:
+            try:
+                audio_delivery_id = save(
+                    "", getattr(result, "prompt_id", None),
+                    getattr(result, "selection_id", None), getattr(result, "general_task_id", None),
+                    media_path=audio_path, media_kind="audio",
+                )
+            except TypeError:
+                logger.warning("event=owner_voice_pending_failed reason=delivery_not_supported")
+                return
+        try:
+            sent = await _send_owner_audio(bot, chat_id=owner_chat_id, media_path=audio_path)
+        except (BadRequest, NetworkError) as exc:
+            logger.warning(
+                "event=owner_voice_delivery_pending reason=%s error_type=%s",
+                "telegram_bad_request" if isinstance(exc, BadRequest) else "telegram_network_error",
+                type(exc).__name__,
+            )
+            return
+        except Exception:
+            logger.exception("event=owner_voice_delivery_pending reason=delivery_error")
+            return
+        message_id = getattr(sent, "message_id", None)
+        record = getattr(message_service, "record_owner_query_delivery", None)
+        if audio_delivery_id is not None and record is not None and message_id is not None:
+            record(audio_delivery_id, message_id)
+        if message_id is not None:
+            Path(audio_path).unlink(missing_ok=True)
+            logger.info("event=owner_voice_sent component=telegram chat_id=%s delivery_id=%s owner_message_id=%s", owner_chat_id, audio_delivery_id, message_id)
+
     async def _deliver_owner_query(bot, result) -> None:
         if result is None:
             return
-        if isinstance(result, OwnerQueryResult) and result.speak and not result.media_path:
-            prepare_voice = getattr(message_service, "prepare_owner_query_voice", None)
-            if prepare_voice is not None:
-                try:
-                    result = await prepare_voice(result)
-                except Exception as exc:
-                    logger.warning("event=owner_voice_generation_failed error_type=%s", type(exc).__name__)
-        text = result.text if isinstance(result, OwnerQueryResult) else str(result)
-        text = _telegram_safe_text(text)
-        media_path = result.media_path if isinstance(result, OwnerQueryResult) else ""
-        media_kind = result.media_kind if isinstance(result, OwnerQueryResult) else ""
+        is_query = isinstance(result, OwnerQueryResult)
+        # Чистим текст ровно один раз и здесь: очищенная строка уходит и в
+        # Telegram, и в синтез речи, поэтому разметка Codex и локальные пути
+        # физически не могут попасть в OpenRouter.
+        text = _telegram_safe_text(result.text if is_query else str(result))
+        # Голос запрашивается только у текстового ответа без вложения, и только
+        # после того, как текст подтверждён Telegram.
+        voice_requested = bool(is_query and result.speak and not result.media_path)
+        media_path = result.media_path if is_query else ""
+        media_kind = result.media_kind if is_query else ""
         if media_path and not media_kind:
             media_kind = "photo"
-        prompt_id = result.prompt_id if isinstance(result, OwnerQueryResult) else None
-        delivery_id = result.delivery_id if isinstance(result, OwnerQueryResult) else None
-        selection_id = result.selection_id if isinstance(result, OwnerQueryResult) else None
-        general_task_id = result.general_task_id if isinstance(result, OwnerQueryResult) else None
+        prompt_id = result.prompt_id if is_query else None
+        delivery_id = result.delivery_id if is_query else None
+        selection_id = result.selection_id if is_query else None
+        general_task_id = result.general_task_id if is_query else None
         if not text and not media_path:
             return
         if media_path:
@@ -554,17 +606,13 @@ def create_telegram_application(
                 _owner_query_selection_keyboard(selection_id, selection_options) if selection_id is not None
                 else _general_task_keyboard(general_task_id) if needs_confirmation else None
             )
-            text_sent = None
             if media_path and media_kind == "photo":
                 sent = await _send_owner_photo(
                     bot, chat_id=owner_chat_id, media_path=media_path, caption=text,
                 )
             elif media_path and media_kind == "audio":
-                if text:
-                    text_sent = await _send(
-                        bot, chat_id=owner_chat_id, text=text, reply_markup=reply_markup,
-                        delivery_key=f"owner-query:{delivery_id}:text" if delivery_id is not None else None,
-                    )
+                # Отложенное аудио из прошлой попытки: текст этой доставки уже
+                # закрыт её же текстовым ключом, поэтому заново не отправляется.
                 sent = await _send_owner_audio(bot, chat_id=owner_chat_id, media_path=media_path)
             else:
                 sent = await _send(
@@ -587,10 +635,9 @@ def create_telegram_application(
         if media_path and message_id is not None:
             Path(media_path).unlink(missing_ok=True)
         attach = getattr(message_service, "attach_owner_query_prompt", None)
-        linked_message_id = (
-            message_id if media_path and media_kind == "audio"
-            else getattr(text_sent, "message_id", None) or message_id
-        )
+        # Текст и фото дают ровно одно подтверждённое сообщение; отдельное
+        # аудио — самостоятельная доставка со своим ключом.
+        linked_message_id = message_id
         if prompt_id is not None and attach is not None and linked_message_id is not None:
             attach(prompt_id, linked_message_id)
         attach_selection = getattr(message_service, "attach_owner_query_selection", None)
@@ -599,6 +646,9 @@ def create_telegram_application(
         attach_general = getattr(message_service, "attach_general_task", None)
         if general_task_id is not None and attach_general is not None and linked_message_id is not None:
             attach_general(general_task_id, linked_message_id)
+        if voice_requested and media_kind != "audio":
+            # Текст подтверждён Telegram — синтез идёт после, а не вместо него.
+            await _deliver_owner_voice(bot, result)
 
     async def _deliver_reminder(bot, reminder) -> None:
         try:
