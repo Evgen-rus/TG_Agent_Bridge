@@ -29,6 +29,9 @@ from scripts import diagnose as health
 from tests.test_application import QueryProvider
 
 LIMIT_ERROR = SimpleNamespace(message="You've hit your usage limit. try again at 11:27 AM.")
+# Тот же отказ по лимиту, но без разбираемого момента сброса: storage не может
+# посчитать reset_at и держит только общую паузу CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN.
+UNKNOWN_RESET_LIMIT_ERROR = SimpleNamespace(message="You've hit your usage limit. try again later.")
 
 
 def _note_limit(store: ChatThreadStore, reset_hint: str = "11:27", *, local: str | None = None) -> None:
@@ -508,23 +511,59 @@ def test_failed_recovery_probe_rearms_cooldown_without_new_notice(tmp_path: Path
     """Контрольная попытка может снова упереться в лимит — и это не тишина.
 
     Отказ заново ставит паузу (иначе Рик долбил бы модель на каждый запрос),
-    но владельцу второе уведомление о том же лимите не уходит."""
+    но владельцу второе уведомление о том же лимите не уходит.
+
+    Здесь намеренно отказ БЕЗ разбираемого времени сброса: только тогда решение
+    принимает ветка CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN. Со временем сброса в
+    тексте ошибки тест зависел бы от часов на машине — утром «11:27» ещё в
+    будущем, storage честно выбирает before_reset_time, и проверялась бы
+    совсем другая ветка."""
     store = ChatThreadStore(tmp_path / "state.sqlite3")
     bridge = LimitBridge(store)
     provider = bridge.provider()
-    provider._note_failure(LIMIT_ERROR)
-    # Пауза после первого отказа.
+    provider._note_failure(UNKNOWN_RESET_LIMIT_ERROR)
+    # Время сброса неизвестно: ждём только ограниченную паузу после отказа.
+    assert store.codex_usage_limit_probe_state().reset_at_utc is None
     first_seen = store.codex_usage_limit_probe_state().seen_at
     assert store.codex_usage_limit_retry(now=first_seen + timedelta(minutes=5)).allowed is False
     # Контрольная попытка разрешена, но лимит ещё не восстановился.
     assert store.codex_usage_limit_retry(now=first_seen + CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN).allowed is True
-    provider._note_failure(LIMIT_ERROR)
+    provider._note_failure(UNKNOWN_RESET_LIMIT_ERROR)
     # Пауза снова на месте от нового отказа, а уведомление не продублировано.
     second_seen = store.codex_usage_limit_probe_state().seen_at
     assert second_seen > first_seen
     assert store.codex_usage_limit_retry(now=second_seen + timedelta(minutes=5)).allowed is False
     limit_texts, _ = bridge.notices()
     assert len(limit_texts) == 1
+
+
+def test_known_future_reset_time_blocks_until_reset_then_allows(tmp_path: Path) -> None:
+    """Ветка известного времени сброса: до него ждём, после — пробуем.
+
+    Отдельный тест от паузы: известный момент сброса ограничивает попытки
+    строже, чем CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN, и освобождает сам собой."""
+    store = ChatThreadStore(tmp_path / "state.sqlite3")
+    bridge = LimitBridge(store)
+    provider = bridge.provider()
+    reset_hint = _future_reset_hint(hours=2)
+    provider._note_failure(
+        SimpleNamespace(message=f"You've hit your usage limit. try again at {reset_hint} AM.")
+    )
+
+    state = store.codex_usage_limit_probe_state()
+    # Момент сброса распознан и лежит в будущем, поэтому общая пауза не нужна.
+    assert state.reset_at_utc is not None
+    before = store.codex_usage_limit_retry()
+    assert before.allowed is False
+    assert before.reason == "before_reset_time"
+    # Пауза держит и после кулдауна: до сброса модель не трогаем.
+    still_blocked = store.codex_usage_limit_retry(now=state.seen_at + CODEX_LIMIT_UNKNOWN_RESET_COOLDOWN)
+    assert still_blocked.allowed is False
+    assert still_blocked.reason == "before_reset_time"
+    # Сам момент сброса открывает обычную попытку.
+    after = store.codex_usage_limit_retry(now=datetime.fromisoformat(state.reset_at_utc))
+    assert after.allowed is True
+    assert after.reason == "reset_time_reached"
 
 
 def test_repeated_failures_after_restart_do_not_duplicate_notice(tmp_path: Path) -> None:
