@@ -359,6 +359,14 @@ failure leaves the inbox row pending.
   simply stay pending. Owner-chat voice notes are transcribed on the fly and
   then processed as ordinary owner text (feedback, answers, mention queries).
 - Tokens and credentials never appear unredacted in logs or tracked files.
+- Owner-visible failures carry a fixed reason label plus a what-to-do hint
+  (`codex_sandbox_missing`, `codex_transport_closed`, `codex_usage_limit`,
+  `codex_auth`, `codex_turn_failed`). The raw error text stays in the
+  redacted log; only the label and the hint reach the owner chat. The
+  application layer asks the provider through `AgentProvider.explain_failure`
+  and never imports Codex. The owner's context pack also carries the last few
+  `operational_events` error rows, so the agent can answer "what broke?"
+  without guessing.
 - Owner-group conversation invokes the agent on reply-to-bot, an explicit
   mention/tag, a voice transcript beginning with `Рик` or `Агент`, or a global
   memory prefix (`Общий контекст:`). Ordinary owner-group talk is ignored.

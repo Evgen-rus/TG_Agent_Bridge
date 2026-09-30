@@ -707,6 +707,15 @@ class CodexProvider:
         logger.info("event=codex_turn_finished component=codex thread_id=%s duration_ms=%d result=ok", thread.id, (time.monotonic() - started) * 1000)
         return payload
 
+    def explain_failure(self, error: object) -> tuple[str, str]:
+        """Разложить отказ на метку причины и подсказку для владельца.
+
+        Метод прикладного слоя ходит только сюда: он не знает про Codex и не
+        импортирует его. Наружу уходит фиксированная метка и что делать, а не
+        текст ошибки, где встречаются пути и иногда секреты.
+        """
+        return codex_failure_hint(error)
+
     def _note_failure(self, error: object) -> None:
         """Сообщить наружу факт исчерпания лимита Codex.
 
@@ -819,8 +828,41 @@ def _raise_turn_failure(exc: Exception) -> None:
     `CodexTransportClosed` там, где обрыв транспорта допускает один повтор.
     """
     if _is_transport_closed(exc):
-        raise CodexTransportClosed("Codex transport closed during turn") from None
+        raise CodexTransportClosed(_error_reason(exc)) from None
     raise RuntimeError(f"Codex turn failed ({type(exc).__name__})") from None
+
+
+# Причины, которые владельцу полезно видеть буквально, иначе он ночью не
+# понимает, что чинить. Значения фиксированы: в чат уходит только метка и
+# подсказка из этого словаря, а не текст ошибки.
+_CODEX_FAILURE_HINTS = {
+    "codex_transport_closed": "оборвалась связь с процессом Codex; проверить bubblewrap и версию openai-codex на VPS",
+    "codex_sandbox_missing": "на VPS нет bubblewrap — установить: sudo apt-get install -y bubblewrap",
+    "codex_auth": "проблема с авторизацией Codex; проверить ~/.codex/auth.json и логин",
+    "codex_usage_limit": "исчерпан лимит Codex; ждёт автоматического восстановления",
+    "codex_turn_failed": "Codex не отработал запрос; детали в runtime/logs/agentbridge.log",
+}
+
+
+def codex_failure_hint(error: object) -> tuple[str, str]:
+    """Метка причины и подсказка для владельца.
+
+    Текст ошибки наружу не отдаётся: в нём встречаются пути, URL и иногда
+    секреты. Поэтому наружу уходит только фиксированная метка, а разбор
+    остаётся в логе, где редикция уже работает.
+    """
+    if isinstance(error, CodexTransportClosed):
+        # Самая частая и самая неочевидная: процесс Codex умирает на старте,
+        # и без bubblewrap в сообщении владельца это выглядит как зависание.
+        if "bubblewrap" in str(error).casefold() or _MISSING_SANDBOX_MARKERS.search(_error_reason(error)):
+            return "codex_sandbox_missing", _CODEX_FAILURE_HINTS["codex_sandbox_missing"]
+        return "codex_transport_closed", _CODEX_FAILURE_HINTS["codex_transport_closed"]
+    if is_usage_limit_error(error):
+        return "codex_usage_limit", _CODEX_FAILURE_HINTS["codex_usage_limit"]
+    text = _error_reason(error).casefold()
+    if _AUTH_ERROR_MARKERS.search(text):
+        return "codex_auth", _CODEX_FAILURE_HINTS["codex_auth"]
+    return "codex_turn_failed", _CODEX_FAILURE_HINTS["codex_turn_failed"]
 
 
 def _error_reason(error: object) -> str:
@@ -837,6 +879,10 @@ def _error_reason(error: object) -> str:
 
 _LIMIT_ERROR_MARKERS = ("usage_limit_exceeded", "you've hit your usage limit", "hit your usage limit")
 _RESET_TIME_RE = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AP]M)", re.IGNORECASE)
+# Текст ошибки Codex про оборванный процесс часто несёт причину в stderr.
+# Он нужен только для выбора метки: наружу уходит фиксированная подсказка.
+_MISSING_SANDBOX_MARKERS = re.compile(r"bubblewrap|sandbox prerequisites", re.IGNORECASE)
+_AUTH_ERROR_MARKERS = re.compile(r"unauthorized|401|invalid_api_key|not logged in|login", re.IGNORECASE)
 
 
 def is_usage_limit_error(error: object) -> bool:

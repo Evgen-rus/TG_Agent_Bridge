@@ -1,4 +1,4 @@
-openai-codex
+openai-codex==0.159.2
 python-telegram-bot==22.8
 python-dotenv==1.2.2
 PyYAML==6.0.3

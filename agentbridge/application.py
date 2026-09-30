@@ -965,6 +965,41 @@ class AgentBridgeApplication:
             self.store.mark_update_processed(update_id)
         return self._follow_up_query_result(chat, text, answer, scope=scope_for_chat)
 
+    def _owner_failures_block(self) -> str:
+        """Свежие сбои — чтобы Рик мог объяснить владельцу, что сломалось.
+
+        Блок маленький и всегда один и тот же: Рик отвечает на «что за ошибка
+        была» из этого, а не из памяти. Сюда попадают только имена событий и
+        время — текст ошибки с путями и секретами в чат не идёт.
+        """
+        try:
+            failures = self.store.recent_failures(limit=5)
+        except Exception:
+            logger.exception("event=owner_failures_read_failed")
+            return ""
+        if not failures:
+            return ""
+        lines = "\n".join(f"- {event} в {when} UTC" for event, when in failures)
+        return "\n\nПоследние сбои системы (используй, если владелец спрашивает, что сломалось):\n" + lines
+
+    def _owner_failure_text(self, error: object, *, what: str = "задачу") -> str:
+        """Внятный отказ с меткой причины вместо безликой заглушки.
+
+        Причина и подсказка приходят от `AgentProvider.explain_failure`, чтобы
+        прикладной слой не знал про Codex. Текст ошибки наружу не уходит:
+        там пути и иногда секреты, а владельцу достаточно метки, по которой
+        он сразу понимает, что чинить.
+        """
+        explain = getattr(self.owner_provider, "explain_failure", None)
+        if not callable(explain):
+            return f"Не удалось выполнить {what}."
+        try:
+            label, hint = explain(error)
+        except Exception:
+            logger.exception("event=owner_failure_explain_failed")
+            return f"Не удалось выполнить {what}."
+        return f"Не получилось выполнить {what}. Причина: {label}. Что делать: {hint}."
+
     def _codex_limit_answer(self, text: str) -> str | None:
         """Внятный ответ вместо заглушки, пока активен лимит Codex.
 
@@ -1128,18 +1163,18 @@ class AgentBridgeApplication:
                 try:
                     answer = await self._answer_owner_query_for_chat(chat, scope.question, scope=scope)
                     result = self._follow_up_query_result(chat, scope.question, answer, scope=scope)
-                except Exception:
+                except Exception as exc:
                     logger.exception("event=owner_query_selection_single_failed selection_id=%s", selection_id)
                     self.store.fail_owner_query_selection(selection_id)
-                    return OwnerQueryResult("Не удалось обработать выбранный проект.")
+                    return OwnerQueryResult(self._owner_failure_text(exc, what="выбранный проект"))
                 self.store.finish_owner_query_selection(selection_id)
                 return result
             try:
                 return await self._answer_owner_portfolio(scope, selection_id=selection_id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("event=owner_query_selection_portfolio_failed selection_id=%s", selection_id)
                 self.store.fail_owner_query_selection(selection_id)
-                return OwnerQueryResult("Не удалось обработать выбранные проекты.")
+                return OwnerQueryResult(self._owner_failure_text(exc, what="выбранные проекты"))
         return OwnerQueryResult("Выберите действие.", selection_id=selection_id)
 
     async def _prepare_general_task(
@@ -1164,9 +1199,11 @@ class AgentBridgeApplication:
                 request=planner_request, timezone_name=self.owner_timezone,
                 now_local=datetime.now(zone).isoformat(timespec="minutes"), thread_id=thread_id,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("event=general_task_plan_failed")
-            return None if reminder_only else OwnerQueryResult("Не удалось подготовить понимание задачи.")
+            if reminder_only:
+                return None
+            return OwnerQueryResult(self._owner_failure_text(exc, what="понимание задачи"))
         if not isinstance(plan, GeneralTaskPlan) or (reminder_only and plan.kind != "reminder"):
             return None if reminder_only else OwnerQueryResult("Не удалось подготовить понимание задачи.")
         self.store.save_owner_query_thread(0, "Общие задачи", plan.thread_id,
@@ -1314,10 +1351,13 @@ class AgentBridgeApplication:
                 "Не получилось создать изображение. Возможно, для API ещё не включена генерация изображений.",
                 general_task_id=task_id,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("event=general_task_failed task_id=%s", task_id)
             self.store.set_general_task_status(task_id, "executing", "failed")
-            return OwnerQueryResult("Не удалось выполнить общую задачу. Изменения автоматически не повторяю.")
+            return OwnerQueryResult(
+                self._owner_failure_text(exc, what="общую задачу") + " Изменения автоматически не повторяю.",
+                general_task_id=task_id,
+            )
 
     def attach_owner_query_prompt(self, prompt_id: int, owner_message_id: int) -> None:
         self.store.attach_owner_query_prompt(prompt_id, owner_message_id)
@@ -1521,9 +1561,9 @@ class AgentBridgeApplication:
                 answer = await aggregate(
                     question=scope.question, period=scope.time_label, detail_level=scope.detail_level, summaries=compact,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("event=owner_portfolio_aggregate_failed")
-                answer = "Не удалось собрать общий итог; отдельные сводки временно недоступны."
+                answer = self._owner_failure_text(exc, what="общий итог") + " Отдельные сводки временно недоступны."
         else:
             answer = "\n\n".join(
                 f"{item['chat_name']}: {item.get('failure') or (item.get('summary') or {}).get('current_status', '')}"
@@ -1585,6 +1625,7 @@ class AgentBridgeApplication:
                     f"status={status}; error={item.download_error}; path={item.media_path if available else ''}"
                 )
             pack += "\n\nВложения чата (открывай только файлы со status=available по указанному path; имя файла не доказывает содержимое):\n" + "\n".join(catalog)
+        pack += self._owner_failures_block()
         if answerer is not None:
             thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
             requested_numbers = set(re.findall(r"(?<!\d)\d{3,}(?!\d)", question))

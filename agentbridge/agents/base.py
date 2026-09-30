@@ -157,3 +157,12 @@ class AgentProvider(Protocol):
         self, *, question: str, period: str, detail_level: str,
         summaries: Sequence[dict[str, object]],
     ) -> str: ...
+
+    def explain_failure(self, error: object) -> tuple[str, str]:
+        """Разобрать отказ в метку причины и подсказку для владельца.
+
+        Прикладной слой не знает Codex и не должен его импортировать: он видит
+        только `AgentProvider`. Наружу уходит фиксированная метка плюс что
+        делать, а не текст ошибки, где бывают пути и секреты.
+        """
+        ...
