@@ -10,6 +10,7 @@ from agentbridge.agents.base import AgentAction, AgentReply
 from agentbridge.agents.codex import (
     AGENT_PROMPT_VERSION,
     CodexProvider,
+    CodexTransportClosed,
     _CANDIDATE_STATE_PROPERTIES,
     _CRITIQUE_INSTRUCTIONS,
     _FEEDBACK_SCHEMA,
@@ -330,7 +331,8 @@ async def test_closed_transport_is_retried_once_on_a_new_codex(fake_codex, monke
 
 @pytest.mark.asyncio
 async def test_second_closed_transport_fails_without_a_third_attempt(fake_codex, monkeypatch) -> None:
-    """Второй обрыв — обычный failed path: работа дальше не продолжается."""
+    """Второй обрыв — отказ без третьей попытки, но тип `CodexTransportClosed`
+    сохраняется: иначе метка причины для владельца стала бы общей."""
     attempts = 0
 
     def always_closed(self, prompt, **kwargs):
@@ -341,7 +343,7 @@ async def test_second_closed_transport_fails_without_a_third_attempt(fake_codex,
     monkeypatch.setattr(_FakeThread, "run", always_closed)
     provider = CodexProvider()
 
-    with pytest.raises(RuntimeError, match="transport closed twice"):
+    with pytest.raises(CodexTransportClosed):
         await provider.answer_owner_query(
             question="What now?", chat_name="Acme", context_pack="pack", thread_id="thread-owner",
         )

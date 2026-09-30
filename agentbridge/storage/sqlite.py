@@ -722,10 +722,16 @@ class ChatThreadStore:
         получает сухие имена событий из журнала. Текст ошибки сюда не
         попадает намеренно — в нём бывают пути и секреты, а владельцу для
         разбора хватает того, что произошло и когда.
+
+        Уровень сверяется в верхнем регистре, потому что пишет его
+        OperationalEventHandler, а он кладёт `record.levelname` — то есть
+        `ERROR`/`CRITICAL` заглавными. Сравнение со строчным `level='error'`
+        молча не нашло бы на VPS ничего.
         """
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT event, created_at FROM operational_events WHERE level='error' "
+                "SELECT event, created_at FROM operational_events "
+                "WHERE UPPER(level) IN ('ERROR', 'CRITICAL') "
                 "ORDER BY created_at DESC, id DESC LIMIT ?", (limit,),
             ).fetchall()
         return [(str(row[0]), str(row[1])) for row in rows]

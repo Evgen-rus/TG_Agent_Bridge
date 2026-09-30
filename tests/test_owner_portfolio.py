@@ -281,8 +281,15 @@ def _selection_callback(telegram_app):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["done", "all", "general", "choose:0"])
-async def test_long_selection_callback_confirms_immediately_and_blocks_second_run(tmp_path, action) -> None:
+@pytest.mark.parametrize("template", [
+    "portfolio:done:{sid}",
+    "portfolio:all:{sid}",
+    "portfolio:general:{sid}",
+    # Порядок именно такой: id выбора идёт перед индексом пункта, как в
+    # боевой клавиатуре `portfolio:choose:{selection_id}:{index}`.
+    "portfolio:choose:{sid}:0",
+])
+async def test_long_selection_callback_confirms_immediately_and_blocks_second_run(tmp_path, template) -> None:
     """Нажатие подтверждается до долгой работы, повтор не запускает её снова.
 
     Старая клавиатура гасится сразу и во время работы идёт typing: иначе
@@ -314,7 +321,7 @@ async def test_long_selection_callback_confirms_immediately_and_blocks_second_ru
     callback = _selection_callback(telegram_app)
     bot = _SlowBot()
     context = SimpleNamespace(bot=bot)
-    data = f"portfolio:{action}:{selection_id}"
+    data = template.format(sid=selection_id)
 
     query = _SelectionQuery(data)
     task = asyncio.create_task(callback(SimpleNamespace(callback_query=query, update_id=910), context))

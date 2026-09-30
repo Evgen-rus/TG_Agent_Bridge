@@ -312,10 +312,13 @@ selected IDs and time metadata so a follow-up reruns the same portfolio.
   duplicate callbacks cannot run a task twice. Arbitrary failed tasks are not
   retried automatically, while reminder delivery keeps its existing retry path.
   The single exception is a read-only owner/general turn interrupted by a closed
-  Codex transport: it is retried exactly once on a fresh transport, because the
-  question never reached the model. A second failure takes the ordinary failed
-  path. Every other turn error — including usage limit — is never replayed; a
-  failed `thread_resume` starts a new thread but a failed turn does not.
+  Codex transport: it is retried exactly once on a fresh transport. A closed
+  transport does NOT guarantee the question never reached the model, so that one
+  retry may repeat model usage; it is accepted because the turn is read-only and
+  has no application side effects. A second failure keeps the
+  `CodexTransportClosed` type and takes the ordinary failed path. Every other turn
+  error — including usage limit — is never replayed; a failed `thread_resume`
+  starts a new thread but a failed turn does not.
 - Creating a new image is an owner-only general task. It makes no OpenAI Images
   request before confirmation; after confirmation it generates one JPEG, stores
   it under `MEDIA_DIR/owner_generated`, and persists the path in the owner
@@ -364,9 +367,7 @@ failure leaves the inbox row pending.
   `codex_auth`, `codex_turn_failed`). The raw error text stays in the
   redacted log; only the label and the hint reach the owner chat. The
   application layer asks the provider through `AgentProvider.explain_failure`
-  and never imports Codex. The owner's context pack also carries the last few
-  `operational_events` error rows, so the agent can answer "what broke?"
-  without guessing.
+  and never imports Codex.
 - Owner-group conversation invokes the agent on reply-to-bot, an explicit
   mention/tag, a voice transcript beginning with `Рик` or `Агент`, or a global
   memory prefix (`Общий контекст:`). Ordinary owner-group talk is ignored.

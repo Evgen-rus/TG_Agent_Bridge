@@ -965,23 +965,6 @@ class AgentBridgeApplication:
             self.store.mark_update_processed(update_id)
         return self._follow_up_query_result(chat, text, answer, scope=scope_for_chat)
 
-    def _owner_failures_block(self) -> str:
-        """Свежие сбои — чтобы Рик мог объяснить владельцу, что сломалось.
-
-        Блок маленький и всегда один и тот же: Рик отвечает на «что за ошибка
-        была» из этого, а не из памяти. Сюда попадают только имена событий и
-        время — текст ошибки с путями и секретами в чат не идёт.
-        """
-        try:
-            failures = self.store.recent_failures(limit=5)
-        except Exception:
-            logger.exception("event=owner_failures_read_failed")
-            return ""
-        if not failures:
-            return ""
-        lines = "\n".join(f"- {event} в {when} UTC" for event, when in failures)
-        return "\n\nПоследние сбои системы (используй, если владелец спрашивает, что сломалось):\n" + lines
-
     def _owner_failure_text(self, error: object, *, what: str = "задачу") -> str:
         """Внятный отказ с меткой причины вместо безликой заглушки.
 
@@ -1625,7 +1608,6 @@ class AgentBridgeApplication:
                     f"status={status}; error={item.download_error}; path={item.media_path if available else ''}"
                 )
             pack += "\n\nВложения чата (открывай только файлы со status=available по указанному path; имя файла не доказывает содержимое):\n" + "\n".join(catalog)
-        pack += self._owner_failures_block()
         if answerer is not None:
             thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
             requested_numbers = set(re.findall(r"(?<!\d)\d{3,}(?!\d)", question))

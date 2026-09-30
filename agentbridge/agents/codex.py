@@ -508,12 +508,18 @@ class CodexProvider:
         )
 
     async def _owner_turn_with_retry(self, call, *args):
-        """Ровно один безопасный повтор read-only owner turn на новом transport.
+        """Ровно один повтор read-only owner turn на новом transport.
 
-        Повторяется только оборванный транспорт: тот read-only вопрос, который
-        не был доставлен модели целиком. Всё остальное — и второй обрыв
-        transport — уходит в обычный failed path, как раньше, поэтому лишних
-        платных запросов не появляется.
+        Повторяется только оборванный транспорт. Он НЕ гарантирует, что
+        запрос не дошёл до модели: у Codex «Transport closed» встречается и
+        после начавшейся работы, поэтому повтор теоретически может
+        повторить model usage. Повтор всё равно оставлен, потому что turn
+        read-only и прикладных side effects не имеет — терять из-за обрыва
+        транспорта целый ответ владельцу дороже, чем лишний запрос модели.
+
+        Второй обрыв уже не повторяется, но тип сохраняется: иначе
+        объяснение отказа для владельца скатилось бы в общую метку
+        `codex_turn_failed` и потеряло бы сам факт обрыва транспорта.
         """
         try:
             return await asyncio.to_thread(call, *args)
@@ -525,7 +531,7 @@ class CodexProvider:
             logger.error(
                 "event=codex_transport_closed_retry_failed component=codex error_type=%s", type(exc).__name__,
             )
-            raise RuntimeError("Codex transport closed twice") from None
+            raise CodexTransportClosed(str(exc) or "Codex transport closed twice") from None
 
     async def plan_general_task(
         self, *, request: str, timezone_name: str, now_local: str, thread_id: str | None,
@@ -803,9 +809,14 @@ def _thread_is_unavailable(exc: Exception) -> bool:
 class CodexTransportClosed(RuntimeError):
     """Транспорт Codex закрылся прямо во время read-only turn.
 
-    Отдельный тип нужен ровно для одного: такой обрыв безопасно повторить на
-    свежем `Codex()` transport. Повтор делает владелец, а не turn сам, поэтому
-    ограничение «одна попытка» держится в одном месте, а не в каждом вызове.
+    Отдельный тип нужен ровно для одного: такой обрыв повторить можно, причём
+    ровно один раз, на свежем `Codex()` transport. Повтор делает владелец
+    повтора, а не turn сам, поэтому ограничение «одна попытка» держится в
+    одном месте, а не в каждом вызове.
+
+    Обрыв НЕ означает, что запрос не дошёл до модели: такое состояние
+    бывает и после начавшейся работы. Прикладных side effects у read-only
+    turn нет, поэтому повтор допустим, но он может повторить model usage.
     """
 
 
@@ -814,8 +825,8 @@ def _is_transport_closed(error: object) -> bool:
 
     Повторять вообще всё нельзя: повтор платного или уже выполненного turn
     означал бы двойную работу и двойные расходы. Оборванное соединение
-    отличается тем, что запрос не был доставлен модели целиком, и новый
-    read-only transport начинает тот же вопрос с нуля.
+    отличается тем, что turn заведомо read-only и без прикладных
+    последствий, поэтому его можно повторить один раз.
     """
     return isinstance(error, TransportClosedError)
 
