@@ -83,11 +83,12 @@ OWNER_CHAT_ID
      durable owner-only selection buttons, then isolated per-chat summaries and
      owner aggregation. Periods are converted from OWNER_TIMEZONE to [from,to)
      UTC before SQLite history filtering.
-  -> substantive owner-assistant answers may pass through the speech-provider
-     selector, then deliver full text and an MP3 voice note to OWNER_CHAT_ID;
-     the selector checks current model pricing and defaults to a zero-dollar
-     ceiling, so unknown-price and paid routes are skipped. Audio remains in the
-     existing durable owner-query delivery queue until Telegram accepts it.
+  -> substantive owner-assistant answers are delivered as full text to
+     OWNER_CHAT_ID first; only then may a speech provider synthesize an MP3
+     that is sent as a separate message. The selector checks current model
+     pricing against a zero-dollar default ceiling, so unknown-price and paid
+     routes are skipped. Audio remains in the existing durable owner-query
+     delivery queue until Telegram accepts it.
   -> reply to a new-group card: client brief, then confirm wiki draft
   -> /rules and /undo from the owner-chat command menu only
   -> ordinary human conversation is ignored
@@ -96,6 +97,16 @@ Ambiguous owner queries include an explicit «Общая задача» choice. 
 one persistent owner-only Codex thread under reserved key `0` and receives no
 client wiki, history, state, or scoped memory. It first stores a durable task
 plan and waits for «Да, чувак, погнали!», clarification, or cancellation.
+
+Selection callbacks are confirmed before the long work, not after it. A final
+action (`done`, `all`, `general`, `choose`) immediately clears the keyboard,
+edits the card to an acknowledgement, and shows typing while Codex runs, so a
+press is never mistaken for a hang. List toggling (`item_add`, `item_remove`,
+`reset`, `multi`, `single`) keeps the keyboard in place because it answers
+fast. Re-entrant presses are safe by construction: `claim_owner_query_selection`
+moves the selection out of `selecting` atomically, so a repeat runs no second
+analysis, and a failed turn reports an explicit message instead of leaving
+disappeared buttons.
 Natural-language reminders are planned by Codex but, after confirmation, use
 the existing SQLite reminder API and delivery loop instead of an ad-hoc command.
 A confidently resolved single client is planned the same way before any chat
@@ -193,7 +204,8 @@ a series of outdated recommendations.
 - `agentbridge/transcribe.py`: OpenAI speech-to-text call used for client voice
   notes; the configured `TRANSCRIPTION_MODEL` is the only transcription model.
 - `agentbridge/speech.py`: reusable speech-provider interface, ordered provider
-  selector with a per-response cost ceiling, and the OpenRouter TTS adapter.
+  selector with a per-response cost ceiling, and the OpenRouter TTS adapter with
+  a short-lived in-memory pricing catalog cache.
 - `agentbridge/storage/sqlite.py`: durable Telegram history, threads, chat
   state, processed updates, pending/delivered recommendation links, learning
   drafts, versioned rules, memory, owner questions, reminders, experience, and
@@ -259,11 +271,19 @@ containment matching; this check does not change prompt packing.
 
 Owner voice replies are generated only for final assistant answers. Plans,
 selection prompts, routine notices, and generated images stay text-only. The
-full answer is still delivered as text; a separate MP3 voice note follows it.
-Both stay owner-only. The text parts use the existing acknowledged delivery
-parts, while `owner_query_deliveries.media_kind` keeps pending audio paths for
-retry. A model can be selected only when its live quote is known and below
-`OWNER_VOICE_MAX_COST_USD`; the default is zero, with no paid fallback.
+full answer is delivered as text first, and only after Telegram accepts it is a
+separate MP3 voice note synthesized and sent. A TTS or audio failure therefore
+cannot lose the answer. Both stay owner-only. The text parts use the existing
+acknowledged delivery parts, while `owner_query_deliveries.media_kind` keeps
+pending audio paths for retry; an audio-only row carries no text, so retrying it
+never re-sends the text and never re-runs a paid synthesis.
+
+Synthesis receives the same sanitized text as Telegram, so Codex file-citation
+markup and local paths cannot reach the provider. A model is selected only when
+its price is known and not above `OWNER_VOICE_MAX_COST_USD`; the default is
+zero, with no paid fallback. The OpenRouter pricing catalog is cached in memory
+for a short TTL instead of being fetched per answer; a failed refresh never
+extends the cache, so price is re-checked rather than served stale.
 
 `ASK_OWNER` is used when a needed fact is missing. The question is sent only to
 `OWNER_CHAT_ID` and linked back to the client chat. The owner's reply can update
@@ -291,6 +311,11 @@ selected IDs and time metadata so a follow-up reruns the same portfolio.
 - General owner tasks never execute before their durable Telegram confirmation;
   duplicate callbacks cannot run a task twice. Arbitrary failed tasks are not
   retried automatically, while reminder delivery keeps its existing retry path.
+  The single exception is a read-only owner/general turn interrupted by a closed
+  Codex transport: it is retried exactly once on a fresh transport, because the
+  question never reached the model. A second failure takes the ordinary failed
+  path. Every other turn error — including usage limit — is never replayed; a
+  failed `thread_resume` starts a new thread but a failed turn does not.
 - Creating a new image is an owner-only general task. It makes no OpenAI Images
   request before confirmation; after confirmation it generates one JPEG, stores
   it under `MEDIA_DIR/owner_generated`, and persists the path in the owner

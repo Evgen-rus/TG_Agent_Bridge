@@ -573,18 +573,27 @@ class CodexProvider:
         prompt = f"Чат: {chat_name}\n\n{context_pack}\n\nВопрос команды:\n{question}"
         with Codex() as codex:
             if thread_id:
+                # Отказ ловится ТОЛЬКО на resume: раньше сюда попадал и сам
+                # turn, и тогда любая ошибка молча поднимала новый тред и
+                # повторяла вопрос — то есть повторялось всё подряд.
                 try:
                     thread = codex.thread_resume(
                         thread_id, model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, include_turns=False,
                     )
-                    payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
                 except Exception:
-                    thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
-                    payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
+                    thread = self._start_owner_query_thread(codex)
+                payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
             else:
-                thread = codex.thread_start(model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only, developer_instructions=_OWNER_QUERY_INSTRUCTIONS, config={"model_reasoning_effort": self.reasoning_effort})
+                thread = self._start_owner_query_thread(codex)
                 payload = self._run_json(thread, _turn_input(prompt, attachments), _OWNER_QUERY_SCHEMA)
         return OwnerQueryAnswer(thread.id, str(payload["answer"]).strip())
+
+    def _start_owner_query_thread(self, codex):
+        return codex.thread_start(
+            model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+            developer_instructions=_OWNER_QUERY_INSTRUCTIONS,
+            config={"model_reasoning_effort": self.reasoning_effort},
+        )
 
     async def resolve_owner_query_scope(self, *, question: str, known_chats: list[dict[str, str]]) -> OwnerQueryIntent:
         return await asyncio.to_thread(self._resolve_owner_query_scope_sync, question, known_chats)

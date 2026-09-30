@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -477,3 +478,184 @@ async def test_reply_to_first_recommendation_part_preserves_feedback_and_questio
     await _callback(application)(update, FakeContext(bot))
     assert len(bot.sent) == before_duplicate
     assert all(item["chat_id"] == 7654321 for item in bot.sent)
+
+
+class VoiceBot(FakeBot):
+    """Бот, который умеет отправлять голос и умеет его ронять."""
+
+    def __init__(self, *, fail_voice: bool = False) -> None:
+        super().__init__()
+        self.fail_voice = fail_voice
+        self.voices: list[dict] = []
+
+    async def send_voice(self, **kwargs):
+        if self.fail_voice:
+            raise NetworkError("voice upload failed")
+        self.voices.append({**kwargs, "voice_bytes": kwargs["voice"].read()})
+        return FakeSentMessage(3000 + len(self.voices))
+
+
+class _BaseVoiceService(OwnerAssistantService):
+    """Owner-сервис, который доставляет текст и умеет синтезировать голос.
+
+    Голос пишется в заранее заданный файл: так тест проверяет доставку и
+    удаление MP3, а не работу HTTP-слоя OpenRouter.
+    """
+
+    def __init__(self, *, error: Exception | None = None, result=None, audio_name: str = "owner-voice-test.mp3") -> None:
+        super().__init__()
+        self.spoken_texts: list[str] = []
+        self.pending: list[OwnerQueryResult] = []
+        self.recorded: list[tuple[int, int]] = []
+        self.audio_path: Path | None = None
+        self._error = error
+        self._result = result or OwnerQueryResult("Ответ владельцу", 11, speak=True)
+        self._audio_name = audio_name
+
+    def bind_audio(self, path: Path) -> None:
+        self.audio_path = path
+
+    async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
+        return self._result
+
+    async def prepare_owner_query_voice(self, result):
+        self.spoken_texts.append(result.text)
+        if self._error is not None:
+            raise self._error
+        if self.audio_path is None:
+            raise AssertionError("bind_audio() was not called")
+        self.audio_path.write_bytes(b"ID3-audio")
+        return replace(result, media_path=str(self.audio_path), media_kind="audio")
+
+    def save_pending_owner_query_delivery(
+        self, text, prompt_id, selection_id=None, general_task_id=None, media_path="", media_kind="",
+    ):
+        self.pending.append(OwnerQueryResult(
+            text, prompt_id, delivery_id=len(self.pending) + 1,
+            media_path=media_path, media_kind=media_kind,
+        ))
+        return len(self.pending)
+
+    def record_owner_query_delivery(self, delivery_id, owner_message_id):
+        self.recorded.append((delivery_id, owner_message_id))
+        # Доставка закрыта — повторно её брать нельзя.
+        self.pending = [item for item in self.pending if item.delivery_id != delivery_id]
+
+    def pending_owner_query_deliveries(self):
+        return list(self.pending)
+
+
+class VoiceService(_BaseVoiceService):
+    pass
+
+
+def _voice_application(service, bot, tmp_path, audio_name: str = "owner-voice-test.mp3"):
+    media_dir = tmp_path / "runtime" / "media"
+    generated_dir = media_dir / "owner_generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    service.bind_audio(generated_dir / audio_name)
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=service,
+        batch_seconds=0, media_dir=media_dir, delivery_retry_seconds=30,
+    )
+    application.bot = bot
+    return application, generated_dir
+
+
+_SENSITIVE_OWNER_RESULT = OwnerQueryResult(
+    'Счёт проверен :codex-file-citation{path="D:\\Project\\runtime\\invoice.pdf" purpose="source"}. '
+    'Копия: "D:\\My Project\\runtime\\invoice.pdf"',
+    11, speak=True,
+)
+
+
+@pytest.mark.asyncio
+async def test_voice_is_synthesized_from_sanitized_text_after_text_delivery(tmp_path) -> None:
+    """TTS получает ровно тот же очищенный текст, что ушёл в Telegram."""
+    service = VoiceService(result=_SENSITIVE_OWNER_RESULT)
+    application, _ = _voice_application(service, VoiceBot(), tmp_path)
+
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent проверь счёт"), FakeChat(7654321), FakeUser()),
+        FakeContext(application.bot),
+    )
+
+    assert len(service.spoken_texts) == 1
+    spoken = service.spoken_texts[0]
+    assert ":codex-file-citation" not in spoken
+    assert "D:\\" not in spoken and "My Project" not in spoken
+    # Синтез идёт после текста: текст уже отправлен, голос — вторым сообщением.
+    assert len(application.bot.sent) == 1
+    assert spoken == application.bot.sent[0]["text"]
+    assert len(application.bot.voices) == 1
+    assert application.bot.voices[0]["chat_id"] == 7654321
+
+
+@pytest.mark.asyncio
+async def test_tts_failure_does_not_block_or_fail_text_delivery(tmp_path) -> None:
+    """Упавший OpenRouter не превращает текстовый ответ в pending/failed."""
+    service = VoiceService(error=RuntimeError("openrouter is down"))
+    application, _ = _voice_application(service, VoiceBot(), tmp_path)
+
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent вопрос"), FakeChat(7654321), FakeUser()),
+        FakeContext(application.bot),
+    )
+
+    # Текст доставлен и подтверждён: сбой TTS не оставляет незакрытой доставки.
+    assert [item["text"] for item in application.bot.sent] == ["Ответ владельцу"]
+    assert application.bot.voices == []
+    assert service.spoken_texts == ["Ответ владельцу"]
+    assert service.pending == []
+    assert service.recorded == [(1, 1001)]
+
+
+@pytest.mark.asyncio
+async def test_telegram_audio_failure_keeps_mp3_and_retry_resends_only_audio(tmp_path) -> None:
+    """Аудио не доставилось — MP3 сохранён, повтор не дублирует уже отправленный текст."""
+    service = VoiceService()
+    bot = VoiceBot(fail_voice=True)
+    application, _ = _voice_application(service, bot, tmp_path)
+    audio_path = service.audio_path
+
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent вопрос"), FakeChat(7654321), FakeUser(), 811),
+        FakeContext(bot),
+    )
+
+    assert [item["text"] for item in bot.sent] == ["Ответ владельцу"]
+    assert bot.voices == []
+    # MP3 переживает неудачу Telegram — иначе голос пришлось бы платно синтезировать заново.
+    assert audio_path.exists()
+    # Незакрытая доставка содержит только аудио: текст у неё пустой.
+    assert [(item.text, item.media_kind) for item in service.pending] == [("", "audio")]
+    assert service.recorded[0][0] == 1
+
+    # Повтор: Telegram ожил, текст уходить не должен.
+    retry_bot = VoiceBot()
+    application.bot = retry_bot
+    await _deliver_pending(application, retry_bot)
+
+    assert retry_bot.sent == []
+    assert len(retry_bot.voices) == 1
+    assert retry_bot.voices[0]["voice_bytes"] == b"ID3-audio"
+    assert not audio_path.exists()
+    assert service.pending == []
+
+
+@pytest.mark.asyncio
+async def test_successful_audio_delivery_removes_mp3(tmp_path) -> None:
+    """После принятого Telegram голоса временный MP3 удаляется."""
+    service = VoiceService()
+    bot = VoiceBot()
+    application, _ = _voice_application(service, bot, tmp_path, audio_name="owner-voice-ok.mp3")
+    audio_path = service.audio_path
+
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent вопрос"), FakeChat(7654321), FakeUser()),
+        FakeContext(bot),
+    )
+
+    assert len(bot.voices) == 1
+    assert not audio_path.exists()
+    assert service.pending == []

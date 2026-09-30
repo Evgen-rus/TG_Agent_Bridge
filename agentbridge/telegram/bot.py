@@ -7,7 +7,7 @@ import html
 import inspect
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import logging
 import os
@@ -671,7 +671,9 @@ def create_telegram_application(
             attach_general(general_task_id, linked_message_id)
         if voice_requested and media_kind != "audio":
             # Текст подтверждён Telegram — синтез идёт после, а не вместо него.
-            await _deliver_owner_voice(bot, result)
+            # В синтез уходит ровно та же очищенная строка, что и в Telegram:
+            # разметка Codex и локальные пути не должны попасть в OpenRouter.
+            await _deliver_owner_voice(bot, replace(result, text=text))
 
     async def _deliver_reminder(bot, reminder) -> None:
         try:

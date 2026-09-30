@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -234,6 +235,160 @@ async def test_registered_portfolio_callback_deduplicates_update_and_keeps_item_
     query.data = f"portfolio:item_add:{initial.selection_id}:0"
     await callback(SimpleNamespace(callback_query=query, update_id=902), context)
     await callback(SimpleNamespace(callback_query=query, update_id=902), context)
+    assert service.owner_query_selection(initial.selection_id).selected_chat_ids == (-1,)
+
+
+class _SelectionQuery:
+    """Callback_query, который помнит и текст правки, и состояние клавиатуры."""
+
+    def __init__(self, data: str) -> None:
+        self.data = data
+        self.message = SimpleNamespace(chat=SimpleNamespace(id=77))
+        self.edits: list[str] = []
+        self.markups: list[object] = []
+
+    async def answer(self):
+        return None
+
+    async def edit_message_text(self, text, reply_markup=None):
+        self.edits.append(text)
+        self.markups.append(reply_markup)
+
+    async def edit_message_reply_markup(self, reply_markup=None):
+        self.markups.append(reply_markup)
+
+
+class _SlowBot:
+    """Бот, который пишет typing и отвечает только после явного разрешения."""
+
+    def __init__(self) -> None:
+        self.actions: list[str] = []
+        self.sent: list[dict] = []
+
+    async def send_chat_action(self, *, chat_id, action):
+        self.actions.append(action)
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=9100 + len(self.sent))
+
+
+def _selection_callback(telegram_app):
+    return next(
+        handler.callback for group in telegram_app.handlers.values() for handler in group
+        if hasattr(handler, "callback") and handler.callback.__name__ == "learning_callback"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["done", "all", "general", "choose:0"])
+async def test_long_selection_callback_confirms_immediately_and_blocks_second_run(tmp_path, action) -> None:
+    """Нажатие подтверждается до долгой работы, повтор не запускает её снова.
+
+    Старая клавиатура гасится сразу и во время работы идёт typing: иначе
+    владелец минуту смотрит на неподвижные кнопки и считает, что бот завис.
+    Повторный callback при ещё не завершённой обработке работу не удваивает —
+    защитой остаётся атомарный claim в storage.
+    """
+    provider = AggregateProvider()
+    service = AgentBridgeApplication(_registry(), ChatThreadStore(tmp_path / "db.sqlite3"), provider, owner_chat_id=77)
+    initial = await service.handle_owner_query("Нужен выбор")
+    assert initial.selection_id is not None
+    selection_id = initial.selection_id
+
+    running = asyncio.Event()
+    calls: list[str] = []
+    original = service.handle_owner_query_selection
+
+    async def slow_handler(sel_id, act, index=None, chat_id=None):
+        calls.append(act)
+        # Ждём, пока тест убедится, что UI уже обновлён.
+        running.set()
+        await asyncio.sleep(0.05)
+        return await original(sel_id, act, index, chat_id)
+
+    service.handle_owner_query_selection = slow_handler
+    telegram_app = create_telegram_application(
+        token="test-token", owner_chat_id=77, message_service=service, batch_seconds=0,
+    )
+    callback = _selection_callback(telegram_app)
+    bot = _SlowBot()
+    context = SimpleNamespace(bot=bot)
+    data = f"portfolio:{action}:{selection_id}"
+
+    query = _SelectionQuery(data)
+    task = asyncio.create_task(callback(SimpleNamespace(callback_query=query, update_id=910), context))
+    await asyncio.wait_for(running.wait(), timeout=1)
+
+    # Долгий вызов ещё идёт, но нажатие уже подтверждено.
+    assert query.markups[0] is None
+    assert any("Принято" in text for text in query.edits)
+    assert bot.actions and bot.actions[0] == "typing"
+
+    await task
+    work_after_first = len(provider.owner_calls) + len(provider.aggregate_inputs) + len(provider.contexts)
+    delivered = len(bot.sent)
+
+    # Повторное нажатие по уже погасшей клавиатуре не запускает работу заново:
+    # обработчик может войти, но storage отвечает отказом по статусу выбора,
+    # поэтому Codex/портфельный разбор не повторяется.
+    second = _SelectionQuery(data)
+    await callback(SimpleNamespace(callback_query=second, update_id=911), context)
+
+    assert len(provider.owner_calls) + len(provider.aggregate_inputs) + len(provider.contexts) == work_after_first
+    # Повтор не порождает нового ответа: либо тишина, либо один отказ по статусу.
+    assert len(bot.sent) - delivered <= 1
+    assert all(
+        "уже обработан" in item["text"] or "больше недоступен" in item["text"]
+        for item in bot.sent[delivered:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_selection_callback_failure_reports_explicitly_after_buttons_are_gone(tmp_path) -> None:
+    """Ошибка после гашения кнопок не оставляет владельца без объяснения."""
+    provider = AggregateProvider()
+    service = AgentBridgeApplication(_registry(), ChatThreadStore(tmp_path / "db.sqlite3"), provider, owner_chat_id=77)
+    initial = await service.handle_owner_query("Нужен выбор")
+    assert initial.selection_id is not None
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("codex exploded")
+
+    service.handle_owner_query_selection = failing
+    telegram_app = create_telegram_application(
+        token="test-token", owner_chat_id=77, message_service=service, batch_seconds=0,
+    )
+    callback = _selection_callback(telegram_app)
+    bot = _SlowBot()
+    query = _SelectionQuery(f"portfolio:done:{initial.selection_id}")
+
+    await callback(SimpleNamespace(callback_query=query, update_id=912), SimpleNamespace(bot=bot))
+
+    assert any("Не получилось обработать выбор" in item["text"] for item in bot.sent)
+    assert all(item["chat_id"] == 77 for item in bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_selection_list_toggle_keeps_keyboard_and_no_typing(tmp_path) -> None:
+    """Переключение пунктов списка не должно гасить клавиатуру."""
+    provider = AggregateProvider()
+    service = AgentBridgeApplication(_registry(), ChatThreadStore(tmp_path / "db.sqlite3"), provider, owner_chat_id=77)
+    initial = await service.handle_owner_query("Нужен выбор")
+    assert initial.selection_id is not None
+
+    telegram_app = create_telegram_application(
+        token="test-token", owner_chat_id=77, message_service=service, batch_seconds=0,
+    )
+    callback = _selection_callback(telegram_app)
+    bot = _SlowBot()
+    query = _SelectionQuery(f"portfolio:item_add:{initial.selection_id}:0")
+
+    await callback(SimpleNamespace(callback_query=query, update_id=913), SimpleNamespace(bot=bot))
+
+    assert query.edits and "Выберите проекты" in query.edits[0]
+    assert query.markups[-1] is not None
+    assert bot.actions == []
     assert service.owner_query_selection(initial.selection_id).selected_chat_ids == (-1,)
 
 

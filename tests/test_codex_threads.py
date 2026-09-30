@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import json
 
 import pytest
-from openai_codex.errors import InvalidRequestError
+from openai_codex.errors import InvalidRequestError, TransportClosedError
 
 from agentbridge.agents.base import AgentAction, AgentReply
 from agentbridge.agents.codex import (
@@ -304,6 +304,91 @@ async def test_codex_owner_query_restarts_when_saved_thread_is_unavailable(fake_
     assert result.thread_id == "thread-owner"
     assert result.answer == "Owner answer"
     assert fake_codex.starts[-1]["developer_instructions"] == _OWNER_QUERY_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_closed_transport_is_retried_once_on_a_new_codex(fake_codex, monkeypatch) -> None:
+    """Оборванный транспорт повторяется ровно один раз и даёт ответ."""
+    opened: list[int] = []
+
+    def flaky_run(self, prompt, **kwargs):
+        opened.append(1)
+        if len(opened) == 1:
+            raise TransportClosedError("transport closed")
+        return _FakeResult({"answer": "Owner answer"})
+
+    monkeypatch.setattr(_FakeThread, "run", flaky_run)
+    provider = CodexProvider()
+
+    result = await provider.answer_owner_query(
+        question="What now?", chat_name="Acme", context_pack="pack", thread_id="thread-owner",
+    )
+
+    assert result.answer == "Owner answer"
+    assert len(opened) == 2
+
+
+@pytest.mark.asyncio
+async def test_second_closed_transport_fails_without_a_third_attempt(fake_codex, monkeypatch) -> None:
+    """Второй обрыв — обычный failed path: работа дальше не продолжается."""
+    attempts = 0
+
+    def always_closed(self, prompt, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise TransportClosedError("transport closed")
+
+    monkeypatch.setattr(_FakeThread, "run", always_closed)
+    provider = CodexProvider()
+
+    with pytest.raises(RuntimeError, match="transport closed twice"):
+        await provider.answer_owner_query(
+            question="What now?", chat_name="Acme", context_pack="pack", thread_id="thread-owner",
+        )
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_other_errors_are_never_retried(fake_codex, monkeypatch) -> None:
+    """Повторяется только оборванный транспорт, а не любая ошибка подряд."""
+    attempts = 0
+
+    def failing(self, prompt, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("some other failure")
+
+    monkeypatch.setattr(_FakeThread, "run", failing)
+    provider = CodexProvider()
+
+    with pytest.raises(RuntimeError, match="Codex turn failed"):
+        await provider.answer_owner_query(
+            question="What now?", chat_name="Acme", context_pack="pack", thread_id="thread-owner",
+        )
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_general_task_transport_is_retried_once(fake_codex, monkeypatch) -> None:
+    """Тот же единственный повтор действует для general turn."""
+    attempts = 0
+
+    def flaky_run(self, prompt, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TransportClosedError("transport closed")
+        return _FakeResult({"answer": "Готово"})
+
+    monkeypatch.setattr(_FakeThread, "run", flaky_run)
+    provider = CodexProvider()
+
+    result = await provider.run_general_task(request="Сделай отчёт", thread_id="thread-owner")
+
+    assert result.answer == "Готово"
+    assert attempts == 2
 
 
 @pytest.mark.asyncio
