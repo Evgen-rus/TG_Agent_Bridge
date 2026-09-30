@@ -394,6 +394,46 @@ async def test_general_task_transport_is_retried_once(fake_codex, monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_startup_probe_makes_a_real_ephemeral_codex_turn(fake_codex, monkeypatch) -> None:
+    from openai_codex import ApprovalMode, Sandbox
+
+    calls = []
+
+    def probe_run(self, prompt, **kwargs):
+        calls.append(kwargs)
+        return _FakeResult({"answer": "Codex отвечает"})
+
+    monkeypatch.setattr(_FakeThread, "run", probe_run)
+    await CodexProvider().probe()
+    assert fake_codex.starts[-1]["ephemeral"] is True
+    assert fake_codex.starts[-1]["approval_mode"] == ApprovalMode.deny_all
+    assert calls[-1]["sandbox"] == Sandbox.read_only
+    assert calls[-1]["effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_developer_turn_is_workspace_write_and_checks_are_fixed(fake_codex, monkeypatch) -> None:
+    from openai_codex import ApprovalMode, Sandbox
+    from types import SimpleNamespace
+
+    calls = []
+    checks = []
+
+    def developer_run(self, prompt, **kwargs):
+        calls.append(kwargs)
+        return _FakeResult({"answer": "Код изменён"})
+
+    monkeypatch.setattr(_FakeThread, "run", developer_run)
+    monkeypatch.setattr("agentbridge.agents.codex.subprocess.run",
+        lambda command, **kwargs: checks.append(command) or SimpleNamespace(returncode=0, stdout=" M agentbridge/main.py\n"))
+    result = await CodexProvider().run_code_change(request="Поправь код", thread_id="developer-thread")
+    assert result.checks_passed and len(checks) == 5
+    assert fake_codex.resume_kwargs[-1]["sandbox"] == Sandbox.workspace_write
+    assert fake_codex.resume_kwargs[-1]["approval_mode"] == ApprovalMode.deny_all
+    assert calls[-1]["sandbox"] == Sandbox.workspace_write
+
+
+@pytest.mark.asyncio
 async def test_codex_suggest_resumes_only_the_main_thread(fake_codex) -> None:
     provider = CodexProvider()
     first = await provider.suggest(

@@ -1213,6 +1213,35 @@ class AgentBridgeApplication:
             understanding += "\n\nПосле подтверждения создам одно изображение и отправлю его сюда. Генерация оплачивается отдельно по тарифу OpenAI API."
         return OwnerQueryResult(f"Я понял задачу так:\n\n{understanding}", general_task_id=task_id)
 
+    def developer_mode(self, user_id: int) -> bool:
+        return self.store.developer_mode(self.owner_chat_id or 0, user_id)
+
+    def set_developer_mode(self, user_id: int, enabled: bool) -> str:
+        self.store.set_developer_mode(self.owner_chat_id or 0, user_id, enabled)
+        return ("Режим разработчика включён. Напишите задачу; перед правкой я покажу, как её понял. "
+                "Для выхода: /dev off или «Рик, обычный режим»." if enabled
+                else "Режим разработчика выключен.")
+
+    async def prepare_developer_task(self, user_id: int, request: str, update_id: int | None = None) -> OwnerQueryResult | None:
+        if update_id is not None and self.store.is_update_processed(update_id):
+            return None
+        planner = getattr(self.owner_provider, "plan_developer_task", None)
+        if planner is None:
+            return OwnerQueryResult("Режим разработчика недоступен.")
+        try:
+            plan = await planner(request, self._owner_query_thread_id_for_provider(-1))
+        except Exception as exc:
+            logger.exception("event=developer_task_plan_failed")
+            return OwnerQueryResult(self._owner_failure_text(exc, what="задачу разработки"))
+        self.store.save_owner_query_thread(-1, "Разработка AgentBridge", plan.thread_id,
+            prompt_version=getattr(self.owner_provider, "prompt_version", None))
+        task_id = self.store.create_general_task(self.owner_chat_id or 0, request, plan.understanding,
+            "code_change", {"developer_user_id": user_id})
+        if update_id is not None:
+            self.store.mark_update_processed(update_id)
+        return OwnerQueryResult(f"Задача разработки:\n\n{plan.understanding}\n\nПравка будет в текущем каталоге VPS. Перезапуск отдельно.",
+            general_task_id=task_id)
+
     def attach_general_task(self, task_id: int, owner_message_id: int) -> None:
         self.store.attach_general_task_message(task_id, owner_message_id)
 
@@ -1222,6 +1251,10 @@ class AgentBridgeApplication:
     def general_task_needs_confirmation(self, task_id: int) -> bool:
         task = self.store.get_general_task(task_id)
         return task is not None and task.status == "confirming"
+
+    def general_task_user_allowed(self, task_id: int, user_id: int | None) -> bool:
+        task = self.store.get_general_task(task_id)
+        return task is not None and (task.kind != "code_change" or task.payload.get("developer_user_id") == user_id)
 
     async def handle_general_task_clarification(
         self, owner_chat_id: int, reply_to_message_id: int, text: str, update_id: int | None = None,
@@ -1252,10 +1285,13 @@ class AgentBridgeApplication:
             self.store.mark_update_processed(update_id)
         return result
 
-    async def handle_general_task_action(self, task_id: int, action: str, owner_chat_id: int) -> OwnerQueryResult:
+    async def handle_general_task_action(self, task_id: int, action: str, owner_chat_id: int,
+                                         user_id: int | None = None) -> OwnerQueryResult:
         task = self.store.get_general_task(task_id)
         if task is None or task.owner_chat_id != owner_chat_id or task.status != "confirming":
             return OwnerQueryResult("Эта задача уже обработана или больше недоступна.")
+        if task.kind == "code_change" and task.payload.get("developer_user_id") != user_id:
+            return OwnerQueryResult("Эту задачу разработки подтверждает её автор.")
         if action == "cancel":
             self.store.set_general_task_status(task_id, "confirming", "cancelled")
             return OwnerQueryResult("Кладу задачу на полку. Отменено.")
@@ -1314,6 +1350,20 @@ class AgentBridgeApplication:
                     "Готово, отправляю изображение.", general_task_id=task_id,
                     media_path=str(media_path),
                 )
+            if task.kind == "code_change":
+                runner = getattr(self.owner_provider, "run_code_change", None)
+                thread_id = self._owner_query_thread_id_for_provider(-1)
+                if runner is None or not thread_id:
+                    raise RuntimeError("developer task runner unavailable")
+                result = await runner(request=task.request_text, thread_id=thread_id)
+                self.store.save_owner_query_thread(-1, "Разработка AgentBridge", result.thread_id,
+                    prompt_version=getattr(self.owner_provider, "prompt_version", None))
+                passed = result.checks_passed
+                self.store.set_general_task_status(task_id, "executing", "done" if passed else "failed")
+                tail = ("Для перезапуска: /dev off, затем попросите Рика перезапуститься." if passed
+                        else "Проверки не прошли. Перезапускать этот код пока не стоит.")
+                return OwnerQueryResult(result.answer + "\n\n" + tail,
+                    general_task_id=task_id)
             runner = getattr(self.owner_provider, "run_general_task", None)
             thread_id = self._owner_query_thread_id_for_provider(0)
             if runner is None or not thread_id:
@@ -1417,6 +1467,24 @@ class AgentBridgeApplication:
 
     def acknowledge_self_restart(self, restart_id: int) -> bool:
         return self.store.acknowledge_self_restart(restart_id)
+
+    def current_run_id(self) -> str:
+        return self.store.current_run_id()
+
+    def queue_startup_notice(self, stage: str, text: str) -> None:
+        run_id = self.store.current_run_id()
+        if run_id:
+            self.store.queue_operational_notice(f"startup:{run_id}:{stage}", text)
+
+    async def probe_codex(self) -> str:
+        probe = getattr(self.owner_provider, "probe", None)
+        if probe is None:
+            return "Codex не проверен: проверка недоступна."
+        try:
+            await probe()
+        except Exception as exc:
+            return "Codex не ответил. " + self._owner_failure_text(exc, what="проверку Codex")
+        return "Codex ответил на новый запрос. Рик готов к работе."
 
     def pending_due_reminders(self) -> list[ReminderRecord]:
         return self.store.pending_due_reminders(self.owner_chat_id)

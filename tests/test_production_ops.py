@@ -545,9 +545,10 @@ def test_known_future_reset_time_blocks_until_reset_then_allows(tmp_path: Path) 
     store = ChatThreadStore(tmp_path / "state.sqlite3")
     bridge = LimitBridge(store)
     provider = bridge.provider()
-    reset_hint = _future_reset_hint(hours=2)
+    reset_hint = (datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow"))
+                  + timedelta(hours=2)).strftime("%I:%M %p")
     provider._note_failure(
-        SimpleNamespace(message=f"You've hit your usage limit. try again at {reset_hint} AM.")
+        SimpleNamespace(message=f"You've hit your usage limit. try again at {reset_hint}.")
     )
 
     state = store.codex_usage_limit_probe_state()

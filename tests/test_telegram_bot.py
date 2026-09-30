@@ -9,7 +9,7 @@ import pytest
 from telegram.error import BadRequest, NetworkError
 from telegram import BotCommandScopeChat, BotCommandScopeDefault
 
-from agentbridge.application import AgentBridgeApplication, Suggestion
+from agentbridge.application import AgentBridgeApplication, OwnerQueryResult, Suggestion
 from agentbridge.storage.sqlite import ChatThreadStore
 from agentbridge.telegram.bot import create_telegram_application, register_owner_command_menu
 from agentbridge.telegram.formatter import format_owner_message, split_owner_message
@@ -438,6 +438,40 @@ async def test_live_pending_chat_path_still_sends_only_to_the_owner() -> None:
     assert all(item["chat_id"] != source_chat_id for item in bot.sent)
 
 
+@pytest.mark.asyncio
+async def test_owner_developer_phrase_routes_followup_without_client_context() -> None:
+    class Service:
+        enabled = False
+        tasks = []
+
+        def ingest_telegram_message(self, **kwargs):
+            return True
+
+        def set_developer_mode(self, user_id, enabled):
+            self.enabled = enabled
+            return "Режим разработчика включён."
+
+        def developer_mode(self, user_id):
+            return self.enabled
+
+        async def prepare_developer_task(self, user_id, request, update_id):
+            self.tasks.append((user_id, request, update_id))
+            return OwnerQueryResult("Задача разработки принята.")
+
+    service = Service()
+    app = create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service)
+    bot = FakeBot()
+    user = SimpleNamespace(id=42, is_bot=False, full_name="Владелец")
+    await _message_callback(app)(
+        FakeUpdate(FakeMessage("Рик, режим разработчика"), FakeChat(7654321), user, update_id=1), FakeContext(bot),
+    )
+    await _message_callback(app)(
+        FakeUpdate(FakeMessage("Поправь код"), FakeChat(7654321), user, update_id=2), FakeContext(bot),
+    )
+    assert service.tasks == [(42, "Поправь код", 2)]
+    assert [item["chat_id"] for item in bot.sent] == [7654321, 7654321]
+
+
 @dataclass
 class CatchupLifecycleService:
     catchups: list[str] = field(default_factory=list)
@@ -526,6 +560,7 @@ async def test_owner_command_menu_is_scoped_to_owner_chat_only() -> None:
     assert default_call["commands"] == []
     assert isinstance(default_call["scope"], BotCommandScopeDefault)
     assert [(item.command, item.description) for item in owner_call["commands"]] == [
+        ("dev", "Режим разработчика"),
         ("rules", "Показать активные правила"),
         ("undo", "Отменить последнее правило"),
         ("remind", "Создать напоминание"),

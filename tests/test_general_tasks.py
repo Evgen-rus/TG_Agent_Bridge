@@ -53,6 +53,38 @@ async def test_general_task_waits_for_confirmation_and_reuses_thread(tmp_path, c
 
 
 @pytest.mark.asyncio
+async def test_developer_mode_uses_its_own_thread_and_confirmation(tmp_path, chat_registry) -> None:
+    class DeveloperProvider(GeneralProvider):
+        async def plan_developer_task(self, request, thread_id):
+            assert thread_id is None
+            assert request == "Поправь диагностику"
+            return GeneralTaskPlan("developer-thread", "Поправить диагностику.", "code_change")
+
+        async def run_code_change(self, *, request, thread_id):
+            assert (request, thread_id) == ("Поправь диагностику", "developer-thread")
+            return OwnerQueryAnswer(thread_id, "Изменён код. Проверки прошли.")
+
+    store = ChatThreadStore(tmp_path / "developer.sqlite3")
+    provider = DeveloperProvider()
+    service = AgentBridgeApplication(chat_registry, store, provider, owner_chat_id=77)
+    assert "включён" in service.set_developer_mode(123, True)
+    assert ChatThreadStore(tmp_path / "developer.sqlite3").developer_mode(77, 123)
+    assert not service.developer_mode(124)
+    prepared = await service.prepare_developer_task(123, "Поправь диагностику", update_id=100)
+    assert store.get_owner_query_thread_id(-1) == "developer-thread"
+    assert store.get_owner_query_thread_id(0) is None
+    assert store.get_general_task(prepared.general_task_id).status == "confirming"
+    assert not service.general_task_user_allowed(prepared.general_task_id, 124)
+    assert service.general_task_user_allowed(prepared.general_task_id, 123)
+    denied = await service.handle_general_task_action(prepared.general_task_id, "confirm", 77, user_id=124)
+    assert "автор" in denied.text
+    result = await service.handle_general_task_action(prepared.general_task_id, "confirm", 77, user_id=123)
+    assert "Изменён код" in result.text
+    assert store.get_general_task(prepared.general_task_id).status == "done"
+    assert await service.prepare_developer_task(123, "Поправь диагностику", update_id=100) is None
+
+
+@pytest.mark.asyncio
 async def test_reply_to_completed_general_task_starts_confirmable_followup(tmp_path, chat_registry) -> None:
     provider = GeneralProvider()
     store = ChatThreadStore(tmp_path / "followup.sqlite3")

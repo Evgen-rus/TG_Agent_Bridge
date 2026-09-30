@@ -68,6 +68,7 @@ class ChatOnboardingDraft:
 class OwnerQueryAnswer:
     thread_id: str
     answer: str
+    checks_passed: bool = True
 
 
 @dataclass(frozen=True)

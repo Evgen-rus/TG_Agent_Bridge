@@ -498,6 +498,27 @@ class ChatThreadStore:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_now(),),
             )
 
+    def current_run_id(self) -> str:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value FROM operational_state WHERE key='run_started_at'").fetchone()
+        return str(row[0]) if row else ""
+
+    def developer_mode(self, owner_chat_id: int, user_id: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM operational_state WHERE key=?",
+                (f"developer_mode:{owner_chat_id}:{user_id}",),
+            ).fetchone()
+        return row is not None and row[0] == "on"
+
+    def set_developer_mode(self, owner_chat_id: int, user_id: int, enabled: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO operational_state(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"developer_mode:{owner_chat_id}:{user_id}", "on" if enabled else "off"),
+            )
+
     def record_poll_success(self) -> None:
         with self._connect() as connection:
             connection.execute(

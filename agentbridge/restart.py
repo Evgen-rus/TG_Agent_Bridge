@@ -26,6 +26,10 @@ def process_is_going_away(pid: int) -> bool:
     except PermissionError:
         # Процесс есть, но он наш: значит, нас ещё не остановили.
         return False
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 87:  # Windows: invalid/nonexistent PID.
+            return True
+        raise
     return False
 
 

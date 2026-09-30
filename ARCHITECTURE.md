@@ -119,8 +119,23 @@ confirmable general task in the same persistent owner thread.
 An explicit self-restart request is also planned there; deterministic code
 performs it only after confirmation. Under Linux systemd it requests only
 `/usr/bin/sudo -n /usr/bin/systemctl --no-block restart rick.service`.
-SQLite keeps the restart marker and the new process acknowledges it to the
-owner through existing durable delivery parts.
+SQLite keeps the restart marker. Every new process queues an owner-only startup
+notice after Telegram starts, then makes one fresh, ephemeral read-only Codex
+turn through the owner provider and queues the success or failure result. Both
+notices use the existing durable delivery queue and a per-run key, including
+after a manual systemd restart. The new process acknowledges a self-restart
+marker after queueing the startup notice; it sends no extra restart message.
+
+The owner can enter developer mode with `/dev` or «Рик, режим разработчика»
+and leave with `/dev off` or «Рик, обычный режим». The mode is persisted per
+owner-chat user in SQLite. While active, that user's owner-chat messages plan
+code tasks in a reserved owner thread under key `-1`, separate from general
+tasks (`0`) and all client threads. Each code task requires the existing owner
+confirmation card. The confirmed Codex turn uses `workspace_write` in the
+current project checkout with denied sandbox escalations; ordinary turns stay
+read-only. Trusted code then runs the fixed test/compile/dependency/diff checks
+and reports their status. Applying code still requires a separately requested
+restart. This is conversation isolation, not OS-level isolation of project files.
 
 At startup SQLite records `operational_state.run_status=running`; a clean
 shutdown writes `stopped`. A previous `running` value means an unclean stop,

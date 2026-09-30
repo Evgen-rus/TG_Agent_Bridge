@@ -38,6 +38,7 @@ journalctl -u rick.service --since '1 hour ago' --no-pager
 | Симптом | Где смотреть | Что делать |
 | --- | --- | --- |
 | Рик молчит | `service.status`, `app.run_status`, `telegram.poll_last_log`, очереди, `recent_failure` | Сначала причина, потом рестарт: `sudo systemctl restart rick.service` |
+| После рестарта пришло «Рик запущен», но Codex не ответил | Второе стартовое сообщение, `codex.verdict`, `codex.last_failure` | Telegram уже работает; проверьте названную причину Codex, не считайте первую карточку проверкой модели |
 | Поллинг встал | `telegram_poll_stalled`, `telegram_poll_restart_success`, `telegram_polling_fatal` | Проверить сеть, токен, второй процесс-поллер. Сторож сам перезапустит зависший updater, systemd — упавший процесс |
 | **Codex падает** | `codex.verdict`, `codex.turn_failures_in_logs`, `codex.active_failures`, `codex.last_failure` | См. раздел «Codex и лимиты» ниже — самая частая причина |
 | «Рик молчит, лимит давно кончился» | `codex.limit_active`, `codex.limit_recovery_probe`, `codex.limit_seen_at`, `codex.verdict` | Метка лимита живёт в SQLite и переживает рестарт. `WAIT` — ещё ждём сброса, `READY` — пора задать вопрос в чате, Рик сам проверит модель |

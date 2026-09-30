@@ -44,6 +44,7 @@ _ADMIN_STATUSES = {"administrator", "creator"}
 _LEFT_STATUSES = {"left", "kicked"}
 _TYPING_REFRESH_SECONDS = 4.0
 _OWNER_BOT_COMMANDS = (
+    BotCommand("dev", "Режим разработчика"),
     BotCommand("rules", "Показать активные правила"),
     BotCommand("undo", "Отменить последнее правило"),
     BotCommand("remind", "Создать напоминание"),
@@ -265,6 +266,8 @@ def _accepted_author_kwargs(func, user, prefix: str) -> dict:
         f"{prefix}_username": username,
         f"{prefix}_name": name,
     }
+    if prefix == "user":
+        payload = {"user_id": getattr(user, "id", None)}
     if all(value is None for value in payload.values()):
         return {}
     try:
@@ -418,7 +421,7 @@ def create_telegram_application(
     retry_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     watchdog_task: asyncio.Task[None] | None = None
-    restart_ack_task: asyncio.Task[None] | None = None
+    startup_check_task: asyncio.Task[None] | None = None
     live_enabled = catchup_idle_seconds <= 0
     last_ingest_at = time.monotonic()
 
@@ -811,25 +814,22 @@ def create_telegram_application(
             await _retry_pending_deliveries(application.bot)
             await asyncio.sleep(delivery_retry_seconds)
 
-    async def _restart_ack_loop(application: Application) -> None:
+    async def _startup_check(application: Application) -> None:
         await _wait_until_polling_ready(application)
+        queue_notice = getattr(message_service, "queue_startup_notice", None)
+        if queue_notice is None:
+            return
+        queue_notice("telegram", "Рик запущен, Telegram работает. Проверяю Codex.")
+        await _retry_pending_deliveries(application.bot)
         pending = getattr(message_service, "pending_self_restart", None)
         acknowledge = getattr(message_service, "acknowledge_self_restart", None)
-        if pending is None or acknowledge is None:
-            return
-        while marker := pending(os.getpid()):
-            try:
-                await _send(
-                    application.bot, chat_id=owner_chat_id,
-                    text="Я вернулся. Мозги обновил, реальность не развалилась. Работаем.",
-                    delivery_key=f"restart-ack:{marker.id}",
-                )
+        if pending is not None and acknowledge is not None:
+            while marker := pending(os.getpid()):
                 acknowledge(marker.id)
-            except (BadRequest, NetworkError):
-                await asyncio.sleep(delivery_retry_seconds)
-            except Exception:
-                logger.exception("event=self_restart_ack_pending")
-                await asyncio.sleep(delivery_retry_seconds)
+        probe = getattr(message_service, "probe_codex", None)
+        result = await probe() if probe is not None else "Codex не проверен: проверка недоступна."
+        queue_notice("codex", result)
+        await _retry_pending_deliveries(application.bot)
 
     async def _wait_for_ingest_idle() -> None:
         if catchup_idle_seconds <= 0:
@@ -890,7 +890,7 @@ def create_telegram_application(
             await _analyze_chat(chat_id, [], application.bot)
 
     async def _post_init(application: Application) -> None:
-        nonlocal retry_task, recovery_task, watchdog_task, restart_ack_task, last_ingest_at, live_enabled
+        nonlocal retry_task, recovery_task, watchdog_task, startup_check_task, last_ingest_at, live_enabled
         await register_owner_command_menu(application.bot, owner_chat_id)
         last_ingest_at = time.monotonic()
         if catchup_idle_seconds > 0:
@@ -900,13 +900,13 @@ def create_telegram_application(
             live_enabled = True
         retry_task = asyncio.create_task(_delivery_retry_loop(application), name="agentbridge-delivery-retry")
         watchdog_task = asyncio.create_task(watchdog.run(application), name="agentbridge-polling-watchdog")
-        restart_ack_task = asyncio.create_task(_restart_ack_loop(application), name="agentbridge-restart-ack")
+        startup_check_task = asyncio.create_task(_startup_check(application), name="agentbridge-startup-check")
         application.bot_data["agentbridge_bootstrapped"] = True
         logger.info("event=process_started component=telegram")
 
     async def _post_stop(application: Application) -> None:
-        nonlocal retry_task, recovery_task, watchdog_task, restart_ack_task
-        for task in (recovery_task, retry_task, watchdog_task, restart_ack_task):
+        nonlocal retry_task, recovery_task, watchdog_task, startup_check_task
+        for task in (recovery_task, retry_task, watchdog_task, startup_check_task):
             if task is None:
                 continue
             task.cancel()
@@ -914,7 +914,7 @@ def create_telegram_application(
         recovery_task = None
         retry_task = None
         watchdog_task = None
-        restart_ack_task = None
+        startup_check_task = None
 
     def _ingest(update: Update, chat_id: int, is_owner_chat: bool) -> IncomingMessage:
         nonlocal last_ingest_at
@@ -1260,6 +1260,23 @@ def create_telegram_application(
                 if general_result is not None:
                     await _deliver_owner_query(context.bot, general_result)
                     return True
+        command_text = _plain_owner_text(owner_text, context.bot)
+        normalized = " ".join(command_text.casefold().strip().rstrip(".! ").split())
+        mode_setter = getattr(message_service, "set_developer_mode", None)
+        mode_getter = getattr(message_service, "developer_mode", None)
+        user_id = getattr(sender, "id", 0)
+        if normalized in {"рик, режим разработчика", "рик режим разработчика", "режим разработчика"} and mode_setter is not None:
+            await _send(context.bot, chat_id=owner_chat_id, text=mode_setter(user_id, True))
+            return True
+        if normalized in {"рик, обычный режим", "рик обычный режим", "обычный режим"} and mode_setter is not None:
+            await _send(context.bot, chat_id=owner_chat_id, text=mode_setter(user_id, False))
+            return True
+        if mode_getter is not None and mode_getter(user_id):
+            prepare = getattr(message_service, "prepare_developer_task", None)
+            if prepare is not None:
+                async with _typing(context.bot, owner_chat_id):
+                    await _deliver_owner_query(context.bot, await prepare(user_id, command_text, update.update_id))
+                return True
         if replied_to_this_bot and reply_id is not None:
             general_followup = getattr(message_service, "handle_general_task_followup", None)
             if general_followup is not None:
@@ -1280,7 +1297,6 @@ def create_telegram_application(
                     if draft is not None:
                         await _deliver_onboarding_draft(context.bot, draft)
                         return True
-        command_text = _plain_owner_text(owner_text, context.bot)
         is_global_command = getattr(message_service, "is_global_memory_command", lambda _: False)
         if is_global_command(command_text):
             # Префикс сам вызывает бота: тег не обязателен, клиентский чат не нужен.
@@ -1464,16 +1480,22 @@ def create_telegram_application(
             handler = getattr(message_service, "handle_general_task_action", None)
             if handler is None:
                 return
+            allowed = getattr(message_service, "general_task_user_allowed", None)
+            if allowed is not None and not allowed(task_id, getattr(update.effective_user, "id", None)):
+                await _send(context.bot, chat_id=owner_chat_id, text="Эту задачу разработки подтверждает её автор.")
+                return
             await _telegram_try("clear_general_task_buttons", query.edit_message_reply_markup(reply_markup=None))
             if action == "refine":
-                result = await handler(task_id, action, owner_chat_id)
+                result = await handler(task_id, action, owner_chat_id,
+                    **_accepted_author_kwargs(handler, update.effective_user, "user"))
                 prompt = await _send(context.bot, chat_id=owner_chat_id, text=result.text)
                 marker = getattr(message_service, "mark_general_task_clarification", None)
                 if prompt is not None and marker is not None:
                     marker(task_id, prompt.message_id)
             else:
                 async with _typing(context.bot, owner_chat_id):
-                    result = await handler(task_id, action, owner_chat_id)
+                    result = await handler(task_id, action, owner_chat_id,
+                        **_accepted_author_kwargs(handler, update.effective_user, "user"))
                 if result.restart_marker_id is None:
                     await _deliver_owner_query(context.bot, result)
                 else:
@@ -1702,6 +1724,16 @@ def create_telegram_application(
         text = "Активных правил для отмены нет." if rule is None else f"Последнее правило отменено:\n{rule.rule_text}"
         await _send(context.bot, chat_id=owner_chat_id, text=text)
 
+    async def dev_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or update.effective_chat.id != owner_chat_id:
+            return
+        setter = getattr(message_service, "set_developer_mode", None)
+        if setter is None:
+            return
+        user_id = getattr(update.effective_user, "id", 0)
+        enabled = not (context.args and context.args[0].casefold() in {"off", "выкл", "stop"})
+        await _send(context.bot, chat_id=owner_chat_id, text=setter(user_id, enabled))
+
     polling_request = HeartbeatHTTPXRequest(heartbeat, polling_hard_timeout_seconds)
     application = (
         Application.builder()
@@ -1724,4 +1756,5 @@ def create_telegram_application(
     application.add_handler(CommandHandler("undo", undo_command))
     application.add_handler(CommandHandler("remind", remind_command))
     application.add_handler(CommandHandler("reminders", reminders_command))
+    application.add_handler(CommandHandler("dev", dev_command))
     return application

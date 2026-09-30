@@ -5,11 +5,13 @@ import json
 import logging
 import time
 import re
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai_codex import Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
+from openai_codex import ApprovalMode, Codex, LocalImageInput, MentionInput, RunInput, Sandbox, TextInput
 from openai_codex.errors import InvalidRequestError, MethodNotFoundError, TransportClosedError
 
 from .base import AgentAction, AgentReply, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
@@ -279,6 +281,10 @@ _GENERAL_TASK_RUN_INSTRUCTIONS = """Ты личный Codex-помощник в�
 Работай в текущем окружении и соблюдай его разрешения. Перед рискованным или внешним действием используй
 штатный механизм запроса разрешения. Не подмешивай клиентские чаты. Не отправляй сообщения, не делай deploy,
 push, платные вызовы и удаления, если это явно не входит в подтверждённую задачу. Верни короткий фактический итог."""
+_DEVELOPER_INSTRUCTIONS = """Ты разработчик AgentBridge. Работай только с кодом и документацией этого проекта.
+Не читай клиентские чаты, runtime, .env, учётные данные и чужие проекты. Не отправляй сообщения,
+не делай deploy, commit, push и restart. Выполни только подтверждённую правку. Верни JSON по схеме
+с коротким фактическим итогом; проверки после твоего ответа запустит приложение."""
 _ONBOARDING_SCHEMA = {
     "type": "object",
     "properties": {
@@ -538,6 +544,82 @@ class CodexProvider:
     ) -> GeneralTaskPlan:
         return await asyncio.to_thread(self._plan_general_task_sync, request, timezone_name, now_local, thread_id)
 
+    async def probe(self) -> None:
+        await asyncio.to_thread(self._probe_sync)
+
+    def _probe_sync(self) -> None:
+        with Codex() as codex:
+            thread = codex.thread_start(
+                model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
+                approval_mode=ApprovalMode.deny_all, ephemeral=True,
+                developer_instructions="Ответь только JSON по заданной схеме. Не читай файлы и не запускай команды.",
+                config={"model_reasoning_effort": "low"},
+            )
+            payload = self._run_json(thread, "Верни answer='Codex отвечает'.", _OWNER_QUERY_SCHEMA,
+                approval_mode=ApprovalMode.deny_all, effort="low")
+        if payload.get("answer") != "Codex отвечает":
+            raise RuntimeError("Codex probe returned an unexpected answer")
+
+    async def plan_developer_task(self, request: str, thread_id: str | None) -> GeneralTaskPlan:
+        return await asyncio.to_thread(self._plan_developer_task_sync, request, thread_id)
+
+    def _plan_developer_task_sync(self, request: str, thread_id: str | None) -> GeneralTaskPlan:
+        with Codex() as codex:
+            if thread_id:
+                try:
+                    thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd,
+                        sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all, include_turns=False)
+                except Exception:
+                    thread = None
+            else:
+                thread = None
+            if thread is None:
+                thread = codex.thread_start(model=self.model, cwd=self.cwd,
+                    sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all,
+                    developer_instructions="Кратко сформулируй задачу по коду AgentBridge. Ничего не выполняй и не читай клиентские данные.",
+                    config={"model_reasoning_effort": self.reasoning_effort})
+            payload = self._run_json(thread, f"Задача разработчика: {request}", _OWNER_QUERY_SCHEMA,
+                approval_mode=ApprovalMode.deny_all)
+        return GeneralTaskPlan(thread.id, str(payload["answer"]).strip(), "code_change")
+
+    async def run_code_change(self, *, request: str, thread_id: str) -> OwnerQueryAnswer:
+        return await asyncio.to_thread(self._run_code_change_sync, request, thread_id)
+
+    def _run_code_change_sync(self, request: str, thread_id: str) -> OwnerQueryAnswer:
+        with Codex() as codex:
+            try:
+                thread = codex.thread_resume(thread_id, model=self.model, cwd=self.cwd,
+                    sandbox=Sandbox.workspace_write, approval_mode=ApprovalMode.deny_all,
+                    developer_instructions=_DEVELOPER_INSTRUCTIONS, include_turns=False)
+            except Exception:
+                thread = codex.thread_start(model=self.model, cwd=self.cwd,
+                    sandbox=Sandbox.workspace_write, approval_mode=ApprovalMode.deny_all,
+                    developer_instructions=_DEVELOPER_INSTRUCTIONS,
+                    config={"model_reasoning_effort": self.reasoning_effort})
+            payload = self._run_json(thread, f"Подтверждённая задача разработчика:\n{request}",
+                _OWNER_QUERY_SCHEMA, sandbox=Sandbox.workspace_write, approval_mode=ApprovalMode.deny_all)
+        checks = (
+            [sys.executable, "-m", "pytest", "-q", "tests"],
+            [sys.executable, "-m", "compileall", "-q", "agentbridge", "tests"],
+            [sys.executable, "-m", "pip", "check"],
+            ["git", "diff", "--check"],
+        )
+        results = []
+        passed = True
+        for command in checks:
+            try:
+                result = subprocess.run(command, cwd=self.cwd, capture_output=True, text=True, timeout=300)
+                results.append(f"{' '.join(command[1:] if command[0] == sys.executable else command)}: {'OK' if result.returncode == 0 else 'ОШИБКА'}")
+                passed &= result.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                results.append(f"{' '.join(command[1:] if command[0] == sys.executable else command)}: ОШИБКА")
+                passed = False
+        changed = subprocess.run(["git", "status", "--short", "--untracked-files=all"],
+            cwd=self.cwd, capture_output=True, text=True, timeout=30)
+        files = "\n".join(changed.stdout.splitlines()[:30]) if changed.returncode == 0 else "недоступно"
+        return OwnerQueryAnswer(thread.id, str(payload["answer"]).strip() + "\n\nИзменённые файлы:\n" +
+            (files or "нет") + "\n\nПроверки:\n" + "\n".join(results), passed)
+
     def _plan_general_task_sync(self, request: str, timezone_name: str, now_local: str, thread_id: str | None) -> GeneralTaskPlan:
         prompt = f"Текущее локальное время: {now_local}\nЧасовой пояс: {timezone_name}\n\nЗадача владельца:\n{request}"
         with Codex() as codex:
@@ -683,7 +765,8 @@ class CodexProvider:
             directory_slug=str(payload.get("directory_slug") or "").strip(),
         )
 
-    def _run_json(self, thread, prompt: RunInput, schema: dict) -> dict:
+    def _run_json(self, thread, prompt: RunInput, schema: dict, *, sandbox: Sandbox = Sandbox.read_only,
+                  approval_mode: ApprovalMode | None = None, effort: str | None = None) -> dict:
         started = time.monotonic()
         # Момент старта в UTC, а не длительность: по нему получатель события
         # поймёт, мог ли этот turn знать о лимите, который возник уже в пути.
@@ -692,7 +775,8 @@ class CodexProvider:
         turn_started_at = datetime.now(timezone.utc).isoformat()
         logger.info("event=codex_turn_started component=codex thread_id=%s model=%s effort=%s", thread.id, self.model, self.reasoning_effort)
         try:
-            result = thread.run(prompt, model=self.model, effort=self.reasoning_effort, output_schema=schema, sandbox=Sandbox.read_only)
+            result = thread.run(prompt, model=self.model, effort=effort or self.reasoning_effort, output_schema=schema,
+                sandbox=sandbox, approval_mode=approval_mode)
         except Exception as exc:
             logger.error("event=codex_turn_failed component=codex thread_id=%s error_type=%s reason=%s duration_ms=%d", thread.id, type(exc).__name__, _error_reason(exc), (time.monotonic() - started) * 1000)
             self._note_failure(exc)

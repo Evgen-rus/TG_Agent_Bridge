@@ -9,7 +9,7 @@ import pytest
 from telegram.ext import CallbackQueryHandler
 
 from agentbridge.agents.base import GeneralTaskPlan
-from agentbridge.application import AgentBridgeApplication
+from agentbridge.application import AgentBridgeApplication, OwnerQueryResult
 from agentbridge.restart import process_is_going_away, spawn_restart_helper
 from agentbridge.storage.sqlite import ChatThreadStore
 from agentbridge.telegram.bot import create_telegram_application
@@ -68,14 +68,29 @@ def test_callback_handler_accepts_current_general_and_portfolio_buttons() -> Non
 
 
 @pytest.mark.asyncio
-async def test_new_process_acknowledges_pending_restart_once() -> None:
+@pytest.mark.parametrize("self_restart", [False, True])
+async def test_every_start_checks_codex_and_self_restart_is_acknowledged(self_restart) -> None:
     marker = SimpleNamespace(id=9)
 
     class Service:
         acknowledged = False
+        delivered = 0
+        notices = []
+
+        def queue_startup_notice(self, stage, text):
+            self.notices.append(text)
+
+        def pending_owner_query_deliveries(self):
+            return [OwnerQueryResult(text, delivery_id=i + 1) for i, text in enumerate(self.notices[self.delivered:])]
+
+        def record_owner_query_delivery(self, delivery_id, owner_message_id):
+            self.delivered += 1
+
+        async def probe_codex(self):
+            return "Codex ответил на новый запрос. Рик готов к работе."
 
         def pending_self_restart(self, current_pid):
-            return None if self.acknowledged else marker
+            return None if not self_restart or self.acknowledged else marker
 
         def acknowledge_self_restart(self, restart_id):
             self.acknowledged = restart_id == marker.id
@@ -101,8 +116,11 @@ async def test_new_process_acknowledges_pending_restart_once() -> None:
     await asyncio.sleep(0.05)
     await app.post_stop(app)
 
-    assert service.acknowledged
-    assert [item["text"] for item in bot.sent] == ["Я вернулся. Мозги обновил, реальность не развалилась. Работаем."]
+    assert service.acknowledged is self_restart
+    assert [item["text"] for item in bot.sent] == [
+        "Рик запущен, Telegram работает. Проверяю Codex.",
+        "Codex ответил на новый запрос. Рик готов к работе.",
+    ]
 
 
 def test_restart_counts_as_done_when_the_process_is_already_dying(tmp_path, monkeypatch) -> None:
