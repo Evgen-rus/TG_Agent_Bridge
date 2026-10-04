@@ -572,6 +572,9 @@ def test_codex_output_schemas_match_structured_outputs_subset() -> None:
     analytics = _GENERAL_TASK_PLAN_SCHEMA["properties"]["analytics"]
     assert "skip_new_projects" in analytics["required"]
     assert analytics["properties"]["skip_new_projects"]["type"] == "boolean"
+    assert "periods" in analytics["required"]
+    period = analytics["properties"]["periods"]["items"]
+    assert period["required"] == ["period_start", "period_end"]
 
 
 def test_structured_output_schema_rejects_the_errors_we_already_hit() -> None:

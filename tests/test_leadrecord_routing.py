@@ -85,6 +85,6 @@ async def test_running_job_timeout_can_resume_without_answer(monkeypatch):
             "job": {"status": "running"}}
     client.call = call
     with pytest.raises(leadrecord.LeadRecordInput) as error:
-        await client._wait(8, "pending", 5, [10], "2026-09-01", "2026-09-30")
+        await client._wait(8, "pending", 5, [10], [{"period_start": "2026-09-01", "period_end": "2026-09-30"}])
     assert error.value.run_id == "pending"
     assert error.value.needs_input is False

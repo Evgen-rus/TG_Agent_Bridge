@@ -1209,7 +1209,7 @@ class AgentBridgeApplication:
             "image_prompt": plan.image_prompt.strip(),
         }
         if plan.kind == "leadrecord_analytics":
-            from .leadrecord import LeadRecordInput
+            from .leadrecord import LeadRecordInput, periods_for_request
             if self.leadrecord_client is None:
                 return OwnerQueryResult("Подключение LeadRecord по SSH ещё не настроено.")
             request_data = dict(plan.analytics or {})
@@ -1217,7 +1217,23 @@ class AgentBridgeApplication:
             if previous and previous.kind == "leadrecord_analytics":
                 old = previous.payload.get("analytics", {})
                 if old.get("run_id") and not request_data.get("run_id"):
-                    if request_data.get("start") == old.get("start") and request_data.get("end") == old.get("end"):
+                    requested_group = request_data.get("group_id") or 0
+                    try:
+                        same_group = int(requested_group) > 0 and int(requested_group) == int(old.get("group_id") or 0)
+                    except (TypeError, ValueError):
+                        same_group = False
+                    if not same_group and not requested_group:
+                        normalize_query = lambda field: " ".join(str(request_data.get(field, "")).split()).casefold()
+                        same_group = all(
+                            normalize_query(field)
+                            and normalize_query(field) == " ".join(str(old.get(field, "")).split()).casefold()
+                            for field in ("client_query", "project_query")
+                        )
+                    try:
+                        same_periods = periods_for_request(request_data)[2] == periods_for_request(old)[2]
+                    except LeadRecordInput:
+                        same_periods = False
+                    if same_group and same_periods:
                         request_data["run_id"] = old["run_id"]
                         request_data["group_id"] = old["group_id"]
             try:
@@ -1351,8 +1367,8 @@ class AgentBridgeApplication:
                     value["run_id"] = run_id
                     self.store.update_general_task_payload(task_id, {**task.payload, "analytics": value})
                 try:
-                    text, report = await self.leadrecord_client.run(
-                        value, self.generated_media_dir / f"leadrecord-task-{task_id}.xlsx", remember_run,
+                    text, report, media_path = await self.leadrecord_client.run(
+                        value, self.generated_media_dir / f"leadrecord-task-{task_id}", remember_run,
                     )
                 except LeadRecordInput as exc:
                     if exc.run_id:
@@ -1365,7 +1381,7 @@ class AgentBridgeApplication:
                     return OwnerQueryResult(str(exc), general_task_id=task_id)
                 self.store.set_general_task_status(task_id, "executing", "done")
                 return OwnerQueryResult(text, general_task_id=task_id,
-                    media_path=str(self.generated_media_dir / f"leadrecord-task-{task_id}.xlsx"), media_kind="document")
+                    media_path=str(media_path), media_kind="document")
             if task.kind == "reminder":
                 remind_at = str(task.payload.get("remind_at_utc") or "")
                 reminder_text = str(task.payload.get("reminder_text") or "")

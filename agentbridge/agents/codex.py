@@ -157,13 +157,16 @@ _GENERAL_TASK_PLAN_SCHEMA = {
         "analytics": {"type": "object", "properties": {
             "client_query": {"type": "string"}, "project_query": {"type": "string"},
             "group_id": {"type": "integer"}, "start": {"type": "string"}, "end": {"type": "string"},
+            "periods": {"type": "array", "items": {"type": "object", "properties": {
+                "period_start": {"type": "string"}, "period_end": {"type": "string"},
+            }, "required": ["period_start", "period_end"], "additionalProperties": False}},
             "run_id": {"type": "string"},
             "confirmed_project_ids": {"type": "array", "items": {"type": "integer"}},
             "skip_new_projects": {"type": "boolean"},
             "status_rules": {"type": "array", "items": {"type": "object", "properties": {
                 "status": {"type": "string"}, "category": {"type": "string"}},
                 "required": ["status", "category"], "additionalProperties": False}},
-        }, "required": ["client_query", "project_query", "group_id", "start", "end", "run_id", "confirmed_project_ids", "skip_new_projects", "status_rules"],
+        }, "required": ["client_query", "project_query", "group_id", "start", "end", "periods", "run_id", "confirmed_project_ids", "skip_new_projects", "status_rules"],
         "additionalProperties": False},
     },
     "required": ["understanding", "kind", "remind_at_utc", "local_label", "reminder_text", "image_prompt", "analytics"],
@@ -285,12 +288,18 @@ restart для повторного анализа/запроса, обновл�
 не создавай. Запрос редактировать существующее изображение не классифицируй как image. Поля напоминания оставь пустыми.
 Если владелец просит аналитику лидов LeadRecord/ЛК по бизнес-проекту, kind=leadrecord_analytics.
 Это расчёт по клиентской таблице, не сводка Telegram-переписки. Заполни analytics: клиент,
-название проекта или явно названный group_id, даты YYYY-MM-DD включительно. Не выдумывай
-клиента, ID, период, вкладку. Пустые строки/0 означают, что нужно уточнение. run_id передавай
+название проекта или явно названный group_id, общий диапазон start/end YYYY-MM-DD включительно
+и массив periods с конкретными period_start/period_end в требуемом порядке. Для обычного одного
+периода положи в periods одну запись, совпадающую с общим диапазоном. Если владелец явно просит
+разбивку, включай только запрошенные срезы. Для «месяц и понедельно» первой записью укажи весь
+месяц, затем календарные недели с понедельника по воскресенье, обрезанные границами месяца.
+Если начало недели или иной формат разбивки неясен, оставь периоды пустыми и попроси уточнить.
+Не меняй порядок периодов и не добавляй месячный/недельный разрез без просьбы владельца.
+Не выдумывай клиента, ID, период, вкладку. Пустые строки/0 означают, что нужно уточнение. run_id передавай
 только названный владельцем или сохранённый в задаче. confirmed_project_ids и status_rules
 заполняй только явными подтверждениями владельца; категории не назначай самостоятельно.
 skip_new_projects=true ставь только если владелец явно отказался добавлять все найденные новые проекты; в этом случае confirmed_project_ids оставь пустым массивом. Во всех остальных случаях ставь false. Не трактуй отсутствие подтверждённых ID или пустой массив как отказ.
-При другой kind analytics заполни пустыми строками, group_id=0, пустыми массивами и skip_new_projects=false.
+При другой kind analytics заполни пустыми строками, group_id=0, periods и остальные массивы пустыми, skip_new_projects=false.
 После подтверждения Bridge выполнит разрешённые lkctl-команды по SSH, а Excel отправит владельцу.
 Для остальных задач kind=general. understanding кратко перечисляет цель и существенные действия,
 особенно запись файлов, сеть, SSH, отправку сообщений, deploy или удаление. Поля напоминания и image_prompt пустые.
@@ -351,7 +360,7 @@ _SEPIA_INSTRUCTIONS = """Ты выполняешь только финальну
 После редактуры сравни результат с draft. facts_preserved и commitments_preserved=true только если ничего критического не добавлено, не удалено и не изменено.
 Верни только JSON по схеме."""
 
-AGENT_PROMPT_VERSION = 12
+AGENT_PROMPT_VERSION = 13
 
 
 class CodexProvider:

@@ -28,12 +28,115 @@ def _same_project_ids(actual, expected):
         return False
 
 
-def _period_matches(periods, start, end):
+def _iso_date(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError()
+    return date.fromisoformat(value)
+
+
+def periods_for_request(value):
+    """Return the inclusive envelope and exact ordered periods from a plan."""
+    raw_periods = value.get("periods")
+    if raw_periods is None:
+        raw_start, raw_end = value.get("start", ""), value.get("end", "")
+        if not raw_start or not raw_end:
+            raise LeadRecordInput("Уточните точный период анализа включительно, например 2026-09-01 — 2026-09-30.")
+        raw_periods = [{"period_start": raw_start, "period_end": raw_end}]
+    if not isinstance(raw_periods, list) or not raw_periods:
+        raise LeadRecordInput("Уточните точные периоды анализа; список периодов не должен быть пустым.")
+    if len(raw_periods) > 64:
+        raise LeadRecordInput("За один запуск можно указать не более 64 периодов.")
+
+    parsed = []
+    seen = set()
+    try:
+        for item in raw_periods:
+            if not isinstance(item, dict):
+                raise ValueError()
+            start_text, end_text = item.get("period_start"), item.get("period_end")
+            period_start, period_end = _iso_date(start_text), _iso_date(end_text)
+            if period_start > period_end:
+                raise ValueError()
+            key = (start_text, end_text)
+            if key in seen:
+                raise ValueError("duplicate")
+            seen.add(key)
+            parsed.append((period_start, period_end, start_text, end_text))
+
+        raw_start, raw_end = value.get("start", ""), value.get("end", "")
+        if bool(raw_start) != bool(raw_end):
+            raise ValueError("partial envelope")
+        if raw_start and raw_end:
+            envelope_start, envelope_end = _iso_date(raw_start), _iso_date(raw_end)
+        else:
+            envelope_start = min(item[0] for item in parsed)
+            envelope_end = max(item[1] for item in parsed)
+        if envelope_start > envelope_end or (envelope_end - envelope_start).days > 365:
+            raise ValueError("envelope")
+        if any(start < envelope_start or end > envelope_end for start, end, _, _ in parsed):
+            raise ValueError("outside")
+    except (TypeError, ValueError):
+        raise LeadRecordInput(
+            "Укажите корректные неповторяющиеся периоды внутри общего диапазона (не более 366 календарных дней)."
+        ) from None
+
+    periods = [{"period_start": start, "period_end": end} for _, _, start, end in parsed]
+    return envelope_start.isoformat(), envelope_end.isoformat(), periods
+
+
+def _periods_match(actual, expected):
+    if not isinstance(actual, list) or len(actual) != len(expected):
+        return False
+    try:
+        actual_values = []
+        for item in actual:
+            if not isinstance(item, dict):
+                return False
+            start, end = item.get("period_start"), item.get("period_end")
+            if _iso_date(start) > _iso_date(end):
+                return False
+            actual_values.append((start, end))
+        return actual_values == [(item["period_start"], item["period_end"]) for item in expected]
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def _report_filename(value, fallback):
+    name = value if isinstance(value, str) and value else fallback
+    stem = name.rsplit(".", 1)[0].casefold() if isinstance(name, str) else ""
+    if (
+        not isinstance(name, str) or not name or name in {".", ".."}
+        or len(name.encode("utf-8")) > 240 or Path(name).name != name
+        or any(char in name for char in '<>:"/\\|?*')
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+        or name.endswith((".", " ")) or not name.casefold().endswith(".xlsx")
+        or stem in {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+    ):
+        raise LeadRecordInput("LeadRecord вернул небезопасное имя Excel-файла.")
+    return name
+
+
+def _format_report(value, report):
+    periods = value["periods"]
+    if len(periods) > 1:
+        details = report.get("periods")
+        lines = []
+        if isinstance(details, list) and len(details) == len(periods) and _periods_match(details, periods):
+            for period, item in zip(periods, details):
+                lines.append(
+                    f"{period['period_start']} — {period['period_end']}: "
+                    f"идентификаций {item.get('total_count')}, недозвон {item.get('missed_count')}, "
+                    f"качественные {item.get('quality_count')}, сигнал спроса {item.get('demand_count')}"
+                )
+        if not lines:
+            lines.append(f"Выбрано периодов: {len(periods)}. Показатели по каждому периоду приведены в Excel.")
+        return "Отчёт содержит отдельные результаты по периодам; общий итог не складываю, так как периоды могут пересекаться.\n" + "\n".join(lines) + f"\nОтчёт #{report['export_number']}. Качественные входят в сигнал спроса; сигнал спроса не равен продажам."
+    period = periods[0]
     return (
-        isinstance(periods, list) and len(periods) == 1
-        and isinstance(periods[0], dict)
-        and periods[0].get("period_start") == start
-        and periods[0].get("period_end") == end
+        f"{period['period_start']} - {period['period_end']}: идентификаций в знаменателе отчёта {report['total_count']}, "
+        f"недозвон {report['missed_count']}, качественные {report['quality_count']}, "
+        f"сигнал спроса {report['demand_count']}. Отчёт #{report['export_number']}.\n"
+        "Качественные входят в сигнал спроса. Это не число продаж."
     )
 
 
@@ -75,12 +178,8 @@ class LeadRecordClient:
 
     async def plan(self, request):
         value = dict(request)
-        try:
-            start, end = date.fromisoformat(value.get("start", "")), date.fromisoformat(value.get("end", ""))
-            if start > end or (end-start).days >= 366:
-                raise ValueError()
-        except (TypeError, ValueError):
-            raise LeadRecordInput("Укажите точные даты начала и конца анализа.") from None
+        start_text, end_text, periods = periods_for_request(value)
+        start, end = date.fromisoformat(start_text), date.fromisoformat(end_text)
         raw_gid = value.get("group_id") or 0
         if isinstance(raw_gid, bool) or not re.fullmatch(r"\d+", str(raw_gid)):
             raise LeadRecordInput("Некорректный ID группы.")
@@ -119,15 +218,15 @@ class LeadRecordClient:
                 or saved_run.get("client_id") != plan.get("client_id")
             ):
                 raise LeadRecordInput("Сохранённый запуск не относится к подтверждённому клиенту и группе.", str(run_id))
-            if not _period_matches(saved_run.get("periods"), start.isoformat(), end.isoformat()):
-                raise LeadRecordInput("Период сохранённого запуска изменился. Уточните задачу заново.", str(run_id))
+            if not _periods_match(saved_run.get("periods"), periods):
+                raise LeadRecordInput("Список периодов сохранённого запуска изменился. Уточните задачу заново.", str(run_id))
             if not _same_project_ids(saved_run.get("project_ids"), plan.get("project_ids")):
                 raise LeadRecordInput(
                     "Сохранённый запуск использует другой состав проектов. Для текущего состава создайте новую задачу на анализ без старого run_id.",
                     str(run_id),
                 )
         value.update(
-            group_id=gid, client_id=plan["client_id"], start=start.isoformat(), end=end.isoformat(),
+            group_id=gid, client_id=plan["client_id"], start=start.isoformat(), end=end.isoformat(), periods=periods,
             project_ids=plan["project_ids"], saved_sheets=plan.get("saved_sheets", {}),
         )
         candidates = plan.get("new_projects", [])
@@ -147,11 +246,16 @@ class LeadRecordClient:
         if skip_new_projects and candidates:
             excluded = "; ".join(f"{x.get('project_id', x.get('id'))}: {x['name']}" for x in candidates)
             excluded_note = f"\nНовые проекты не добавляю по вашему выбору: {excluded}."
+        period_lines = "\n".join(
+            f"{index}. {item['period_start']} — {item['period_end']}"
+            for index, item in enumerate(periods, 1)
+        )
+        period_label = "Периоды в порядке отчёта:" if len(periods) > 1 else "Период:"
         return value, (f"LeadRecord: {plan['group_name']} (группа {gid}, клиент {plan['client_id']}).\n"
                        f"Проектов: {len(plan['project_ids'])}. Вкладки: {plan.get('saved_sheets', {})}.\n"
-                       f"Период: {start} - {end}.{excluded_note} {next_step}")
+                       f"Общий диапазон: {start} — {end}.\n{period_label}\n{period_lines}.{excluded_note} {next_step}")
 
-    async def _wait(self, gid, rid, client_id, project_ids, start, end):
+    async def _wait(self, gid, rid, client_id, project_ids, periods):
         deadline = time.monotonic() + 300
         while True:
             result = await self.call(["analytics", "result", "--group", str(gid), "--run", rid])
@@ -166,10 +270,9 @@ class LeadRecordClient:
                 raise LeadRecordInput(
                     f"Состав проектов запуска {rid} не совпадает с подтверждённым. Уточните задачу заново.", rid,
                 )
-            periods = result.get("periods")
-            if not _period_matches(periods, start, end):
+            if not _periods_match(result.get("periods"), periods):
                 raise LeadRecordInput(
-                    f"Период запуска {rid} не совпадает с подтверждённым периодом. Уточните задачу заново.", rid,
+                    f"Список периодов запуска {rid} не совпадает с подтверждённым. Уточните задачу заново.", rid,
                 )
             job = result.get("job") or {}
             if job.get("status") not in {"queued", "running"}:
@@ -181,6 +284,8 @@ class LeadRecordClient:
             await asyncio.sleep(2)
 
     async def run(self, value, output, remember_run):
+        start, end, periods = periods_for_request(value)
+        value.update(start=start, end=end, periods=periods)
         gid = value["group_id"]
         rid = value.get("run_id", "")
         try:
@@ -192,7 +297,9 @@ class LeadRecordClient:
             ):
                 raise LeadRecordInput("Клиент, состав или вкладки группы изменились после подтверждения. Уточните задачу заново.", rid)
             if not rid:
-                args = ["analytics", "prepare", "--group", str(gid), "--period", f"{value['start']}:{value['end']}"]
+                args = ["analytics", "prepare", "--group", str(gid)]
+                for period in periods:
+                    args += ["--period", f"{period['period_start']}:{period['period_end']}"]
                 if value.get("confirmed_project_ids"):
                     args += ["--confirm-projects", ",".join(map(str, value["confirmed_project_ids"]))]
                 elif value.get("skip_new_projects"):
@@ -204,7 +311,7 @@ class LeadRecordClient:
                     value["project_ids"] = sorted(set(value["project_ids"]) | set(added_project_ids))
                 remember_run(rid)
             result = await self._wait(
-                gid, rid, value["client_id"], value["project_ids"], value["start"], value["end"],
+                gid, rid, value["client_id"], value["project_ids"], periods,
             )
             if not result.get("result"):
                 assignments = value.get("status_rules") or []
@@ -215,11 +322,18 @@ class LeadRecordClient:
                     await self.call(args, compute=True)
                 await self.call(["analytics", "run", "--group", str(gid), "--run", rid], compute=True)
                 result = await self._wait(
-                    gid, rid, value["client_id"], value["project_ids"], value["start"], value["end"],
+                    gid, rid, value["client_id"], value["project_ids"], periods,
                 )
             report = result.get("result")
             if not report:
                 raise LeadRecordInput("Отчёт пока не готов.", rid)
+            if report.get("periods") is not None and not _periods_match(report.get("periods"), periods):
+                raise LeadRecordInput("Периоды в готовом Excel не совпадают с подтверждённым списком.", rid)
+            output_dir = Path(output)
+            filename = _report_filename(
+                report.get("download_filename"), f"leadrecord-task-{rid}.xlsx",
+            )
+            output = output_dir / filename
             process = await self._ssh(["fetch", str(gid), str(report["id"])])
             content = process.stdout
             if process.returncode or len(content) > 100*1024*1024:
@@ -236,6 +350,12 @@ class LeadRecordClient:
                 with output.open("xb") as stream:
                     created_output = True
                     stream.write(content)
+            except FileExistsError:
+                try:
+                    if output.read_bytes() != content:
+                        raise OSError()
+                except OSError:
+                    raise LeadRecordInput("Файл Excel с таким именем уже существует и отличается от результата.", rid) from None
             except OSError:
                 if created_output:
                     try:
@@ -243,9 +363,6 @@ class LeadRecordClient:
                     except OSError:
                         pass
                 raise LeadRecordInput("Не удалось сохранить Excel отчёта.", rid) from None
-            return (f"{value['start']} - {value['end']}: идентификаций в знаменателе отчёта {report['total_count']}, "
-                    f"недозвон {report['missed_count']}, качественные {report['quality_count']}, "
-                    f"сигнал спроса {report['demand_count']}. Отчёт #{report['export_number']}.\n"
-                    "Качественные входят в сигнал спроса. Это не число продаж."), report
+            return _format_report(value, report), report, output
         except LeadRecordInput as exc:
             raise LeadRecordInput(str(exc), exc.run_id or rid, needs_input=exc.needs_input) from None

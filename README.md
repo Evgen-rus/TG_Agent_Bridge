@@ -228,6 +228,6 @@ git diff --check                                     # пробелы в diff
 
 ## LeadRecord analytics
 
-Set LEADRECORD_SSH_TARGET and LEADRECORD_SSH_IDENTITY for the restricted lkctl SSH entry point. Owner requests name the client, configured analytics group and inclusive period. Discovery is shown before the existing confirmation card; new projects/statuses require explicit owner input. The existing owner delivery queue sends the resulting XLSX as a document only to OWNER_CHAT_ID.
+Set LEADRECORD_SSH_TARGET and LEADRECORD_SSH_IDENTITY for the restricted lkctl SSH entry point. Owner requests name the client, configured analytics group and inclusive period. A request may include an ordered set of up to 64 periods inside a 366-day envelope; Rick lists every period in the confirmation card and requires an exact match when resuming. Discovery is shown before the existing confirmation card; new projects/statuses require explicit owner input. The existing owner delivery queue sends the XLSX as a document only to OWNER_CHAT_ID, using the safe filename returned by LeadRecord.
 
 Example owner request: «Рик, сделай аналитику LeadRecord: клиент CLIENT, проект PROJECT, с YYYY-MM-DD по YYYY-MM-DD». Explicit LeadRecord / «аналитика ЛК» requests enter the analytics confirmation flow directly.
