@@ -80,6 +80,7 @@ class GeneralTaskPlan:
     local_label: str = ""
     reminder_text: str = ""
     image_prompt: str = ""
+    analytics: dict | None = None
 
 
 @dataclass(frozen=True)

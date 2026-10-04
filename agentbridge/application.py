@@ -163,6 +163,7 @@ class AgentBridgeApplication:
         speech_provider_registry: SpeechProviderRegistry | None = None,
         owner_voice_provider_order: tuple[str, ...] = ("openrouter",),
         owner_voice_max_cost_usd: Decimal = Decimal("0"),
+        leadrecord_client=None,
     ):
         self.registry = registry
         self.store = store
@@ -172,6 +173,7 @@ class AgentBridgeApplication:
         self.attachment_fetcher = None
         self.owner_timezone = owner_timezone
         self.image_generator = image_generator
+        self.leadrecord_client = leadrecord_client
         self.generated_media_dir = generated_media_dir or Path("runtime/media/owner_generated")
         self.speech_provider_registry = speech_provider_registry
         self.owner_voice_provider_order = owner_voice_provider_order
@@ -910,6 +912,13 @@ class AgentBridgeApplication:
             continued = await self.continue_owner_query(reply_to_message_id, text, update_id)
             if continued is not None:
                 return continued
+        if "leadrecord" in text.casefold() or ("аналит" in text.casefold() and re.search(r"\bлк\b", text.casefold())):
+            planned = await self._prepare_general_task(
+                text, author=_reminder_author(author_user_id, author_username, author_name),
+            )
+            if update_id is not None:
+                self.store.mark_update_processed(update_id)
+            return planned
         chat = None
         scope_for_chat: OwnerQueryScope | None = None
         named_in_question = False
@@ -1187,7 +1196,7 @@ class AgentBridgeApplication:
             if reminder_only:
                 return None
             return OwnerQueryResult(self._owner_failure_text(exc, what="понимание задачи"))
-        if not isinstance(plan, GeneralTaskPlan) or (reminder_only and plan.kind != "reminder"):
+        if not isinstance(plan, GeneralTaskPlan) or (reminder_only and plan.kind not in {"reminder", "leadrecord_analytics"}):
             return None if reminder_only else OwnerQueryResult("Не удалось подготовить понимание задачи.")
         self.store.save_owner_query_thread(0, "Общие задачи", plan.thread_id,
             prompt_version=getattr(self.owner_provider, "prompt_version", None))
@@ -1199,6 +1208,33 @@ class AgentBridgeApplication:
             "reminder_text": plan.reminder_text,
             "image_prompt": plan.image_prompt.strip(),
         }
+        if plan.kind == "leadrecord_analytics":
+            from .leadrecord import LeadRecordInput
+            if self.leadrecord_client is None:
+                return OwnerQueryResult("Подключение LeadRecord по SSH ещё не настроено.")
+            request_data = dict(plan.analytics or {})
+            previous = self.store.get_general_task(task_id) if task_id is not None else None
+            if previous and previous.kind == "leadrecord_analytics":
+                old = previous.payload.get("analytics", {})
+                if old.get("run_id") and not request_data.get("run_id"):
+                    if request_data.get("start") == old.get("start") and request_data.get("end") == old.get("end"):
+                        request_data["run_id"] = old["run_id"]
+                        request_data["group_id"] = old["group_id"]
+            try:
+                payload["analytics"], understanding = await self.leadrecord_client.plan(request_data)
+            except LeadRecordInput as exc:
+                payload["analytics"] = request_data
+                payload["needs_input"] = True
+                payload["pending_question"] = str(exc)
+                if task_id is None:
+                    task_id = self.store.create_general_task(
+                        self.owner_chat_id or 0, request, str(exc), plan.kind, payload,
+                    )
+                elif not self.store.revise_general_task(task_id, request, str(exc), plan.kind, payload):
+                    return OwnerQueryResult("Эта задача уже обработана или отменена.")
+                return OwnerQueryResult(str(exc), general_task_id=task_id)
+            # Keep deterministic discovery in the actual confirmation card.
+            plan = GeneralTaskPlan(plan.thread_id, understanding, plan.kind, analytics=payload["analytics"])
         if related_chat is not None:
             payload["related_chat_id"] = related_chat.telegram_chat_id
             payload["related_chat_name"] = related_chat.name
@@ -1264,7 +1300,11 @@ class AgentBridgeApplication:
             return None
         if update_id is not None and self.store.is_update_processed(update_id):
             return None
-        result = await self._prepare_general_task(task.request_text + "\n\nУточнение владельца: " + text, task.id)
+        pending_question = task.payload.get("pending_question", "")
+        context = ("\n\nВопрос LeadRecord:\n" + pending_question) if pending_question else ""
+        result = await self._prepare_general_task(
+            task.request_text + context + "\n\nУточнение владельца: " + text, task.id,
+        )
         if update_id is not None:
             self.store.mark_update_processed(update_id)
         return result
@@ -1297,9 +1337,35 @@ class AgentBridgeApplication:
             return OwnerQueryResult("Кладу задачу на полку. Отменено.")
         if action == "refine":
             return OwnerQueryResult("Напишите или наговорите нюанс ответом на это сообщение.", general_task_id=task_id)
+        if action == "confirm" and task.kind == "leadrecord_analytics" and task.payload.get("needs_input"):
+            return OwnerQueryResult(task.understanding + "\nСначала уточните задачу.", general_task_id=task_id)
         if action != "confirm" or not self.store.set_general_task_status(task_id, "confirming", "executing"):
             return OwnerQueryResult("Эта задача уже обрабатывается или обработана.")
         try:
+            if task.kind == "leadrecord_analytics":
+                from .leadrecord import LeadRecordInput
+                if self.leadrecord_client is None:
+                    raise RuntimeError("LeadRecord unavailable")
+                value = dict(task.payload["analytics"])
+                def remember_run(run_id):
+                    value["run_id"] = run_id
+                    self.store.update_general_task_payload(task_id, {**task.payload, "analytics": value})
+                try:
+                    text, report = await self.leadrecord_client.run(
+                        value, self.generated_media_dir / f"leadrecord-task-{task_id}.xlsx", remember_run,
+                    )
+                except LeadRecordInput as exc:
+                    if exc.run_id:
+                        remember_run(exc.run_id)
+                    self.store.update_general_task_payload(task_id, {
+                        **task.payload, "analytics": value, "needs_input": exc.needs_input,
+                        "pending_question": str(exc),
+                    })
+                    self.store.set_general_task_status(task_id, "executing", "confirming")
+                    return OwnerQueryResult(str(exc), general_task_id=task_id)
+                self.store.set_general_task_status(task_id, "executing", "done")
+                return OwnerQueryResult(text, general_task_id=task_id,
+                    media_path=str(self.generated_media_dir / f"leadrecord-task-{task_id}.xlsx"), media_kind="document")
             if task.kind == "reminder":
                 remind_at = str(task.payload.get("remind_at_utc") or "")
                 reminder_text = str(task.payload.get("reminder_text") or "")

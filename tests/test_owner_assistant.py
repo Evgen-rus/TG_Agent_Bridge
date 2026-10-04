@@ -212,6 +212,114 @@ async def test_generated_photo_is_sent_only_to_owner_and_removed_after_delivery(
 
 
 @pytest.mark.asyncio
+async def test_generated_document_delivery_persists_and_retries_after_restart(tmp_path, chat_registry) -> None:
+    import os
+    import time
+
+    media_dir = tmp_path / "runtime" / "media"
+    generated_dir = media_dir / "owner_generated"
+    generated_dir.mkdir(parents=True)
+    document_path = generated_dir / "owner-report.xlsx"
+    document_bytes = b"PK\x03\x04synthetic-xlsx"
+    document_path.write_bytes(document_bytes)
+    os.utime(document_path, (time.time() - 3600, time.time() - 3600))
+    store_path = tmp_path / "owner-query.sqlite3"
+    provider = SimpleNamespace()
+
+    class DocumentService(AgentBridgeApplication):
+        async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
+            return OwnerQueryResult(
+                "Сводка готова", media_path=str(document_path), media_kind="document",
+            )
+
+    class OfflineDocumentBot(FakeBot):
+        async def send_document(self, **kwargs):
+            assert kwargs["chat_id"] == 7654321
+            assert kwargs["caption"] == "Сводка готова"
+            assert kwargs["document"].read() == document_bytes
+            raise NetworkError("offline")
+
+    class OnlineDocumentBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.documents: list[dict] = []
+
+        async def send_document(self, **kwargs):
+            self.documents.append({
+                "chat_id": kwargs["chat_id"], "caption": kwargs.get("caption"),
+                "bytes": kwargs["document"].read(),
+            })
+            return FakeSentMessage(3030)
+
+    service = DocumentService(chat_registry, ChatThreadStore(store_path), provider, 7654321)
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=service,
+        media_dir=media_dir, media_ttl_seconds=10, delivery_retry_seconds=30,
+    )
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent подготовь таблицу"), FakeChat(7654321), FakeUser()),
+        FakeContext(OfflineDocumentBot()),
+    )
+
+    pending = service.pending_owner_query_deliveries()
+    assert len(pending) == 1
+    assert pending[0].media_kind == "document"
+    assert pending[0].media_path == str(document_path)
+    assert document_path.exists()
+
+    restarted_service = DocumentService(chat_registry, ChatThreadStore(store_path), provider, 7654321)
+    restarted_application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=restarted_service,
+        media_dir=media_dir, media_ttl_seconds=10, delivery_retry_seconds=30,
+    )
+    online_bot = OnlineDocumentBot()
+    await _deliver_pending(restarted_application, online_bot)
+
+    assert online_bot.documents == [{
+        "chat_id": 7654321, "caption": "Сводка готова", "bytes": document_bytes,
+    }]
+    assert restarted_service.pending_owner_query_deliveries() == []
+    assert not document_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_kind", ["missing", "outside"])
+async def test_unavailable_or_outside_generated_document_uses_safe_owner_message(tmp_path, path_kind) -> None:
+    media_dir = tmp_path / "runtime" / "media"
+    generated_dir = media_dir / "owner_generated"
+    generated_dir.mkdir(parents=True)
+    if path_kind == "missing":
+        document_path = generated_dir / "missing.xlsx"
+    else:
+        document_path = tmp_path / "private.xlsx"
+        document_path.write_bytes(b"synthetic")
+
+    class DocumentService(OwnerAssistantService):
+        async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):
+            return OwnerQueryResult(
+                "Сводка готова", media_path=str(document_path), media_kind="document",
+            )
+
+    class NoDocumentBot(FakeBot):
+        async def send_document(self, **kwargs):
+            raise AssertionError("invalid document path must not be opened or sent")
+
+    bot = NoDocumentBot()
+    application = create_telegram_application(
+        token="test-token", owner_chat_id=7654321, message_service=DocumentService(),
+        media_dir=media_dir, batch_seconds=0,
+    )
+    await _callback(application)(
+        FakeUpdate(FakeMessage("@agent покажи файл"), FakeChat(7654321), FakeUser()), FakeContext(bot),
+    )
+
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["chat_id"] == 7654321
+    assert bot.sent[0]["text"] == "Не удалось отправить документ: файл больше недоступен."
+    assert str(document_path) not in bot.sent[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_codex_file_citation_and_local_path_never_reach_telegram() -> None:
     class CitationService(OwnerAssistantService):
         async def handle_owner_query(self, text, reply_to_message_id=None, update_id=None):

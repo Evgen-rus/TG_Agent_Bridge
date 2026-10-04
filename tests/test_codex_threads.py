@@ -568,7 +568,10 @@ def test_codex_output_schemas_match_structured_outputs_subset() -> None:
     assert field["properties"]["summary"]["type"] == ["string", "null"]
     assert field["properties"]["facts"]["type"] == ["array", "null"]
     assert set(_SUGGEST_SCHEMA["required"]) == set(_SUGGEST_SCHEMA["properties"])
-    assert _GENERAL_TASK_PLAN_SCHEMA["properties"]["kind"]["enum"][-1] == "image"
+    assert {"image", "leadrecord_analytics"} <= set(_GENERAL_TASK_PLAN_SCHEMA["properties"]["kind"]["enum"])
+    analytics = _GENERAL_TASK_PLAN_SCHEMA["properties"]["analytics"]
+    assert "skip_new_projects" in analytics["required"]
+    assert analytics["properties"]["skip_new_projects"]["type"] == "boolean"
 
 
 def test_structured_output_schema_rejects_the_errors_we_already_hit() -> None:

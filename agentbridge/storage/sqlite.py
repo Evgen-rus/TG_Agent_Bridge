@@ -2340,6 +2340,14 @@ class ChatThreadStore:
             )
             return cursor.rowcount == 1
 
+    def update_general_task_payload(self, task_id: int, payload: dict) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE owner_general_tasks SET payload_json=?, updated_at=? WHERE id=? AND status='executing'",
+                (json.dumps(payload, ensure_ascii=False), _now(), task_id),
+            )
+            return cursor.rowcount == 1
+
     def set_general_task_status(self, task_id: int, expected: str, status: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(

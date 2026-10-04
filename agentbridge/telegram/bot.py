@@ -498,6 +498,24 @@ def create_telegram_application(
             with path.open("rb") as audio:
                 return await bot.send_voice(chat_id=chat_id, voice=audio)
 
+    async def _send_owner_document(bot, *, chat_id: int, media_path: str, caption: str):
+        if chat_id != owner_chat_id:
+            raise ValueError("Outbound media must target the owner chat")
+        path = Path(media_path).resolve()
+        try:
+            path.relative_to(owner_generated_media_dir)
+        except ValueError as exc:
+            raise ValueError("Owner media path is outside the generated-media directory") from exc
+        if not path.is_file():
+            raise FileNotFoundError("Owner document is no longer available")
+        async with send_lock:
+            with path.open("rb") as document:
+                kwargs = {"chat_id": chat_id, "document": document}
+                safe_caption = _telegram_safe_text(caption)[:1024]
+                if safe_caption:
+                    kwargs["caption"] = safe_caption
+                return await bot.send_document(**kwargs)
+
     async def _send_typing(bot, chat_id: int) -> None:
         send_action = getattr(bot, "send_chat_action", None)
         if send_action is None:
@@ -605,7 +623,12 @@ def create_telegram_application(
                     raise FileNotFoundError
             except (OSError, ValueError):
                 logger.warning("event=owner_media_delivery_unavailable media_kind=%s reason=missing_or_invalid_file", media_kind or "unknown")
-                text = "Не удалось отправить аудио: файл больше недоступен." if media_kind == "audio" else "Не удалось отправить изображение: файл больше недоступен."
+                if media_kind == "audio":
+                    text = "Не удалось отправить аудио: файл больше недоступен."
+                elif media_kind == "document":
+                    text = "Не удалось отправить документ: файл больше недоступен."
+                else:
+                    text = "Не удалось отправить изображение: файл больше недоступен."
                 media_path = ""
                 media_kind = ""
         save = getattr(message_service, "save_pending_owner_query_delivery", None)
@@ -616,7 +639,7 @@ def create_telegram_application(
                     media_path=media_path, media_kind=media_kind,
                 )
             except TypeError:
-                if media_path and media_kind == "audio":
+                if media_path and media_kind in {"audio", "document"}:
                     raise
                 delivery_id = save(text, prompt_id)
         try:
@@ -640,6 +663,10 @@ def create_telegram_application(
                 # Отложенное аудио из прошлой попытки: текст этой доставки уже
                 # закрыт её же текстовым ключом, поэтому заново не отправляется.
                 sent = await _send_owner_audio(bot, chat_id=owner_chat_id, media_path=media_path)
+            elif media_path and media_kind == "document":
+                sent = await _send_owner_document(
+                    bot, chat_id=owner_chat_id, media_path=media_path, caption=text,
+                )
             else:
                 sent = await _send(
                     bot, chat_id=owner_chat_id, text=text, reply_markup=reply_markup,

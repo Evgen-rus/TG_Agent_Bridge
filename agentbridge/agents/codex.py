@@ -149,13 +149,24 @@ _GENERAL_TASK_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
         "understanding": {"type": "string"},
-        "kind": {"type": "string", "enum": ["general", "reminder", "restart", "image"]},
+        "kind": {"type": "string", "enum": ["general", "reminder", "restart", "image", "leadrecord_analytics"]},
         "remind_at_utc": {"type": "string"},
         "local_label": {"type": "string"},
         "reminder_text": {"type": "string"},
         "image_prompt": {"type": "string"},
+        "analytics": {"type": "object", "properties": {
+            "client_query": {"type": "string"}, "project_query": {"type": "string"},
+            "group_id": {"type": "integer"}, "start": {"type": "string"}, "end": {"type": "string"},
+            "run_id": {"type": "string"},
+            "confirmed_project_ids": {"type": "array", "items": {"type": "integer"}},
+            "skip_new_projects": {"type": "boolean"},
+            "status_rules": {"type": "array", "items": {"type": "object", "properties": {
+                "status": {"type": "string"}, "category": {"type": "string"}},
+                "required": ["status", "category"], "additionalProperties": False}},
+        }, "required": ["client_query", "project_query", "group_id", "start", "end", "run_id", "confirmed_project_ids", "skip_new_projects", "status_rules"],
+        "additionalProperties": False},
     },
-    "required": ["understanding", "kind", "remind_at_utc", "local_label", "reminder_text", "image_prompt"],
+    "required": ["understanding", "kind", "remind_at_utc", "local_label", "reminder_text", "image_prompt", "analytics"],
     "additionalProperties": False,
 }
 _OWNER_SCOPE_SCHEMA = {
@@ -272,6 +283,15 @@ restart для повторного анализа/запроса, обновл�
 содержать короткое описание одного изображения. understanding говорит, что после подтверждения владельца
 будет сделана одна генерация и изображение отправится только в чат владельца. Пока планируешь, изображение
 не создавай. Запрос редактировать существующее изображение не классифицируй как image. Поля напоминания оставь пустыми.
+Если владелец просит аналитику лидов LeadRecord/ЛК по бизнес-проекту, kind=leadrecord_analytics.
+Это расчёт по клиентской таблице, не сводка Telegram-переписки. Заполни analytics: клиент,
+название проекта или явно названный group_id, даты YYYY-MM-DD включительно. Не выдумывай
+клиента, ID, период, вкладку. Пустые строки/0 означают, что нужно уточнение. run_id передавай
+только названный владельцем или сохранённый в задаче. confirmed_project_ids и status_rules
+заполняй только явными подтверждениями владельца; категории не назначай самостоятельно.
+skip_new_projects=true ставь только если владелец явно отказался добавлять все найденные новые проекты; в этом случае confirmed_project_ids оставь пустым массивом. Во всех остальных случаях ставь false. Не трактуй отсутствие подтверждённых ID или пустой массив как отказ.
+При другой kind analytics заполни пустыми строками, group_id=0, пустыми массивами и skip_new_projects=false.
+После подтверждения Bridge выполнит разрешённые lkctl-команды по SSH, а Excel отправит владельцу.
 Для остальных задач kind=general. understanding кратко перечисляет цель и существенные действия,
 особенно запись файлов, сеть, SSH, отправку сообщений, deploy или удаление. Поля напоминания и image_prompt пустые.
 Не добавляй действий, которых владелец не просил. Пиши по-русски.
@@ -331,7 +351,7 @@ _SEPIA_INSTRUCTIONS = """Ты выполняешь только финальну
 После редактуры сравни результат с draft. facts_preserved и commitments_preserved=true только если ничего критического не добавлено, не удалено и не изменено.
 Верни только JSON по схеме."""
 
-AGENT_PROMPT_VERSION = 11
+AGENT_PROMPT_VERSION = 12
 
 
 class CodexProvider:
@@ -637,7 +657,7 @@ class CodexProvider:
             payload = self._run_json(thread, prompt, _GENERAL_TASK_PLAN_SCHEMA)
         return GeneralTaskPlan(thread.id, str(payload["understanding"]).strip(), str(payload["kind"]),
             str(payload["remind_at_utc"]).strip(), str(payload["local_label"]).strip(),
-            str(payload["reminder_text"]).strip(), str(payload["image_prompt"]).strip())
+            str(payload["reminder_text"]).strip(), str(payload["image_prompt"]).strip(), payload.get("analytics"))
 
     async def run_general_task(self, *, request: str, thread_id: str) -> OwnerQueryAnswer:
         return await self._owner_turn_with_retry(self._run_general_task_sync, request, thread_id)

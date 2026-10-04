@@ -50,6 +50,9 @@ class Settings:
     openrouter_tts_voice: str = "933563129e564b19a115bedd57b7406a"
     openrouter_tts_timeout_seconds: float = 120.0
 
+    leadrecord_ssh_target: str = ""
+    leadrecord_ssh_identity: str = ""
+
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
         root = (project_root or Path.cwd()).resolve()
@@ -77,6 +80,8 @@ class Settings:
         )
 
         return cls(
+            leadrecord_ssh_target=os.getenv("LEADRECORD_SSH_TARGET", "").strip(),
+            leadrecord_ssh_identity=os.getenv("LEADRECORD_SSH_IDENTITY", "").strip(),
             telegram_bot_token=token,
             owner_chat_id=owner_chat_id,
             chats_dir=root / os.getenv("CHATS_DIR", "chats"),

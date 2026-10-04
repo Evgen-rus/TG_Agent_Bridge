@@ -111,10 +111,13 @@ def main() -> None:
                 timeout_seconds=settings.openrouter_tts_timeout_seconds,
             ),
         ))
+    from .leadrecord import LeadRecordClient
+    leadrecord_client = LeadRecordClient(settings.leadrecord_ssh_target, settings.leadrecord_ssh_identity) if settings.leadrecord_ssh_target else None
     service = AgentBridgeApplication(
         registry, store, provider, settings.owner_chat_id, settings.catchup_episode_size, settings.chats_dir,
         knowledge_dir=root / "knowledge", owner_provider=owner_provider,
         owner_timezone=settings.owner_timezone, image_generator=image_generator,
+        leadrecord_client=leadrecord_client,
         generated_media_dir=settings.media_dir / "owner_generated",
         speech_provider_registry=speech_provider_registry,
         owner_voice_provider_order=settings.owner_voice_provider_order,

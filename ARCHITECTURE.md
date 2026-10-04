@@ -391,3 +391,7 @@ failure leaves the inbox row pending.
   so an immediate voice retry continues the intended bot-message chain.
 - `AgentProvider` is the only application-to-agent dependency; Telegram code
   must not depend on Codex SDK details.
+
+## LeadRecord owner analytics
+
+The owner planner can return leadrecord_analytics inputs. Trusted leadrecord.py resolves configured groups through restricted SSH lkctl commands, refreshes snapshots and polls existing backend jobs after the ordinary task confirmation. run_id is persisted in owner_general_tasks.payload_json so needs_input resumes the same run. XLSX is fetched below runtime/media/owner_generated and delivered as media_kind=document through the existing durable owner delivery queue. No client chat sends or unrestricted model shell are added.

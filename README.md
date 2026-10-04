@@ -225,3 +225,9 @@ git diff --check                                     # пробелы в diff
 
 - **[Установка с нуля](Docs/VPS_DEPLOY.md)** — если VPS пересоздали.
 - **[Что делать, когда сломалось](Docs/OPERATIONS.md)** — таблица симптомов.
+
+## LeadRecord analytics
+
+Set LEADRECORD_SSH_TARGET and LEADRECORD_SSH_IDENTITY for the restricted lkctl SSH entry point. Owner requests name the client, configured analytics group and inclusive period. Discovery is shown before the existing confirmation card; new projects/statuses require explicit owner input. The existing owner delivery queue sends the resulting XLSX as a document only to OWNER_CHAT_ID.
+
+Example owner request: «Рик, сделай аналитику LeadRecord: клиент CLIENT, проект PROJECT, с YYYY-MM-DD по YYYY-MM-DD». Explicit LeadRecord / «аналитика ЛК» requests enter the analytics confirmation flow directly.
