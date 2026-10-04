@@ -354,4 +354,3 @@ async def test_application_confirmation_persists_added_projects_and_resumes_run(
     assert store.get_general_task(task_id).status == "done"
     assert client.calls[1]["run_id"] == "run-synthetic"
     assert client.calls[1]["project_ids"] == [10, 20]
-
