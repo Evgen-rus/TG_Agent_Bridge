@@ -10,6 +10,7 @@ from .application import AgentBridgeApplication
 from .chats.loader import ChatRegistry
 from .image_generation import OpenAIImageGenerator
 from .logging import OperationalEventHandler, configure_logging
+from .owner_memory import OWNER_MEMORY_RELATIVE_PATH
 from .settings import Settings
 from .speech import OpenRouterSpeechProvider, SpeechProviderRegistry
 from .storage.sqlite import (
@@ -91,6 +92,7 @@ def main() -> None:
         reasoning_effort=settings.owner_codex_reasoning_effort,
         cwd=root,
         sepia_enabled=False,
+        owner_context_path=(root / OWNER_MEMORY_RELATIVE_PATH) if settings.owner_working_memory_enabled else None,
         on_usage_limit=note_owner_codex_limit,
         on_usage_recovered=note_owner_codex_recovered,
         usage_limit_active=limit_active,
@@ -122,6 +124,8 @@ def main() -> None:
         speech_provider_registry=speech_provider_registry,
         owner_voice_provider_order=settings.owner_voice_provider_order,
         owner_voice_max_cost_usd=settings.owner_voice_max_cost_usd,
+        owner_working_memory_enabled=settings.owner_working_memory_enabled,
+        owner_working_memory_path=root / OWNER_MEMORY_RELATIVE_PATH,
     )
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,

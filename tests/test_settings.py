@@ -19,6 +19,7 @@ def test_owner_codex_defaults_match_current_configuration(monkeypatch, tmp_path)
     assert settings.codex_reasoning_effort == "xhigh"
     assert settings.owner_codex_model == "gpt-6-luna"
     assert settings.owner_codex_reasoning_effort == "xhigh"
+    assert settings.owner_working_memory_enabled is True
     assert settings.sepia_enabled is True
     assert settings.image_generation_model == "gpt-image-2.5-flare"
     assert settings.image_generation_size == "1024x1024"
@@ -43,3 +44,11 @@ def test_owner_codex_model_and_reasoning_are_configurable(monkeypatch, tmp_path)
 
     assert settings.owner_codex_model == "gpt-6-sol"
     assert settings.owner_codex_reasoning_effort == "none"
+
+
+def test_owner_working_memory_can_be_disabled_with_one_setting(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("OWNER_CHAT_ID", "7654321")
+    monkeypatch.setenv("OWNER_WORKING_MEMORY_ENABLED", "false")
+
+    assert Settings.from_env(tmp_path).owner_working_memory_enabled is False

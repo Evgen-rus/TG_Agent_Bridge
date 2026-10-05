@@ -93,6 +93,15 @@ OWNER_CHAT_ID
   -> /rules and /undo from the owner-chat command menu only
   -> ordinary human conversation is ignored
 
+After a substantive owner query or a completed general/developer/LeadRecord
+task, the application schedules a best-effort memory update without awaiting it
+before returning the owner result. The dedicated Memory Agent receives only the
+current `owner_context/working_context.md` and that interaction's request,
+outcome, type and compact work summary. It never receives SQLite owner/client
+history, client context packs or raw client history. Typing, callbacks, startup
+notices, duplicate updates, acknowledgements and TTS do not trigger updates.
+Memory failures do not affect owner delivery.
+
 Ambiguous owner queries include an explicit «Общая задача» choice. This path has
 one persistent owner-only Codex thread under reserved key `0` and receives no
 client wiki, history, state, or scoped memory. It first stores a durable task
@@ -207,6 +216,8 @@ a series of outdated recommendations.
   chat_state updates, and owner assistant queries.
 - `agentbridge/owner_query.py`: owner-query scope/summary value objects and
   deterministic local-time to UTC period parsing.
+- `agentbridge/owner_memory.py`: validation, atomic persistence and
+  path-scoped local commit for the OWNER working-context Markdown file.
 - `agentbridge/agents/base.py`: provider boundary and action types.
 - `agentbridge/agents/codex.py`: official `openai-codex` implementation and
   structured Codex output.
@@ -248,6 +259,32 @@ Durable context layers, in order of authority:
    and an explicit `chat`, `project`, or `global` scope.
 6. Confirmed learning rules and recent confirmed experience are added to the
    context pack when relevant.
+
+### Experimental OWNER working context
+
+`owner_context/working_context.md` is Git-tracked current state, not a
+conversation history; Git provides its change history. The primary owner
+provider adds it to owner prompts as explicitly untrusted/model-maintained data.
+It cannot override developer/system instructions, permissions, sandbox or
+security policy. The client provider never receives it.
+
+The Memory Agent uses reserved `owner_query_threads` key `-2`, separate from
+general task key `0`, developer key `-1`, and client thread tables. It uses the
+OWNER provider's configured model/reasoning in `read_only`/`deny_all`, with cwd
+limited to `owner_context/`. The database stores its thread ID and prompt
+version for continuity; the Markdown remains the recoverable source of truth.
+No database schema change is needed.
+
+Trusted Python validates the structured response and fixed Markdown headings,
+checks credentials and size, writes by atomic replacement, then runs a
+path-scoped `git commit --only` for this file alone. The initial target is 8000
+characters, soft limit 10000, hard limit 12000, plus a 16 KiB UTF-8 guard. A
+single compaction turn may run on the same memory thread. An oversized or
+invalid result leaves the previous state. If Git fails, the new file may remain
+locally and the error is logged; owner flow stays successful. There is no
+push, automatic retry loop, or project commit from this runtime task. Set
+`OWNER_WORKING_MEMORY_ENABLED=false` to disable both owner context injection
+and memory updates.
 
 Before a model turn the application builds a compact context pack: wiki, shared
 core if attached, current `chat_state`, recent history, the current episode,
@@ -346,6 +383,8 @@ selected IDs and time metadata so a follow-up reruns the same portfolio.
   confirmation, and only the replacement PID can close the restart marker.
 - Wiki is read-only at runtime, except creating a new `wiki.md` after confirmed
   onboarding.
+- Owner working memory is isolated from client turns, treated as untrusted
+  data, and committed only by trusted code with a one-file local Git commit.
 - Bot-authored messages and commands do not invoke Codex.
 - Senders identified by an active, chat-scoped internal-participant rule are
   captured as local context and do not create a recommendation on their own.

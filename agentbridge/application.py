@@ -10,12 +10,27 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerQueryAnswer
+from .agents.base import AgentAction, AgentProvider, ChatOnboardingDraft, FeedbackAnalysis, GeneralTaskPlan, MediaAttachment, OwnerMemoryUpdate, OwnerQueryAnswer
 from .chats.loader import ChatConfig, ChatRegistry, slugify_chat_name, write_new_chat
 from .image_generation import ImageGenerationError, ImageGenerator
 from .knowledge import load_knowledge_pack, load_knowledge_pack_documents
 from .media import delete_media_file, display_message_text, has_message_content, media_file_ready, media_label
 from .owner_query import OwnerQueryIntent, OwnerQueryScope, PortfolioChatSummary, parse_owner_time_phrase
+from .owner_memory import (
+    ABSOLUTE_LIMIT_BYTES,
+    HARD_LIMIT_CHARS,
+    OWNER_MEMORY_PROMPT_VERSION,
+    OWNER_MEMORY_THREAD_KEY,
+    OWNER_MEMORY_THREAD_NAME,
+    SOFT_LIMIT_CHARS,
+    WorkingContextCommitError,
+    WorkingContextValidationError,
+    commit_working_context,
+    memory_size,
+    read_working_context,
+    validate_working_context,
+    write_working_context,
+)
 from .speech import MAX_SPEECH_BYTES, SpeechProviderError, SpeechProviderRegistry
 from .storage.sqlite import ChatOnboarding, ChatThreadStore, DEFAULT_CHAT_STATE, LearningDraft, ReminderRecord, RuleRecord, StoredMessage, codex_limit_notice
 
@@ -164,6 +179,8 @@ class AgentBridgeApplication:
         owner_voice_provider_order: tuple[str, ...] = ("openrouter",),
         owner_voice_max_cost_usd: Decimal = Decimal("0"),
         leadrecord_client=None,
+        owner_working_memory_enabled: bool = False,
+        owner_working_memory_path: Path | None = None,
     ):
         self.registry = registry
         self.store = store
@@ -174,6 +191,10 @@ class AgentBridgeApplication:
         self.owner_timezone = owner_timezone
         self.image_generator = image_generator
         self.leadrecord_client = leadrecord_client
+        self.owner_working_memory_enabled = bool(owner_working_memory_enabled)
+        self.owner_working_memory_path = owner_working_memory_path.resolve() if owner_working_memory_path is not None else None
+        self._owner_memory_tasks: set[asyncio.Task] = set()
+        self._owner_memory_lock = asyncio.Lock()
         self.generated_media_dir = generated_media_dir or Path("runtime/media/owner_generated")
         self.speech_provider_registry = speech_provider_registry
         self.owner_voice_provider_order = owner_voice_provider_order
@@ -1378,8 +1399,16 @@ class AgentBridgeApplication:
                         "pending_question": str(exc),
                     })
                     self.store.set_general_task_status(task_id, "executing", "confirming")
+                    self._schedule_owner_memory_update(
+                        task.request_text, str(exc), result_type="leadrecord_blocker",
+                        completed_work="Аналитика остановилась на уточнении входных данных.",
+                    )
                     return OwnerQueryResult(str(exc), general_task_id=task_id)
                 self.store.set_general_task_status(task_id, "executing", "done")
+                self._schedule_owner_memory_update(
+                    task.request_text, text, result_type="leadrecord_analytics",
+                    completed_work="LeadRecord analytics completed; итог и XLSX подготовлены.",
+                )
                 return OwnerQueryResult(text, general_task_id=task_id,
                     media_path=str(media_path), media_kind="document")
             if task.kind == "reminder":
@@ -1444,6 +1473,11 @@ class AgentBridgeApplication:
                 self.store.set_general_task_status(task_id, "executing", "done" if passed else "failed")
                 tail = ("Для перезапуска: /dev off, затем попросите Рика перезапуститься." if passed
                         else "Проверки не прошли. Перезапускать этот код пока не стоит.")
+                self._schedule_owner_memory_update(
+                    task.request_text, result.answer + "\n\n" + tail,
+                    result_type="developer_task" if passed else "developer_task_blocker",
+                    completed_work=result.answer,
+                )
                 return OwnerQueryResult(result.answer + "\n\n" + tail,
                     general_task_id=task_id)
             runner = getattr(self.owner_provider, "run_general_task", None)
@@ -1458,6 +1492,11 @@ class AgentBridgeApplication:
             else:
                 answer = str(result)
             self.store.set_general_task_status(task_id, "executing", "done")
+            if task.kind == "general":
+                self._schedule_owner_memory_update(
+                    task.request_text, answer, result_type="general_task",
+                    completed_work="Подтверждённая общая задача завершена.",
+                )
             return OwnerQueryResult(answer, general_task_id=task_id, speak=True)
         except ImageGenerationError:
             logger.warning("event=image_generation_failed task_id=%s", task_id)
@@ -1469,6 +1508,17 @@ class AgentBridgeApplication:
         except Exception as exc:
             logger.exception("event=general_task_failed task_id=%s", task_id)
             self.store.set_general_task_status(task_id, "executing", "failed")
+            if task.kind in {"general", "code_change", "leadrecord_analytics"}:
+                self._schedule_owner_memory_update(
+                    task.request_text,
+                    self._owner_failure_text(exc, what="задачу"),
+                    result_type={
+                        "general": "general_task_blocker",
+                        "code_change": "developer_task_blocker",
+                        "leadrecord_analytics": "leadrecord_blocker",
+                    }[task.kind],
+                    completed_work="Задача завершилась известной ошибкой; подробности не прикладываются.",
+                )
             return OwnerQueryResult(
                 self._owner_failure_text(exc, what="общую задачу") + " Изменения автоматически не повторяю.",
                 general_task_id=task_id,
@@ -1689,11 +1739,13 @@ class AgentBridgeApplication:
                         )
                     }, "history": f"показано {result['shown']} из {result['total']}" + ("; обрезано" if result["truncated"] else "")})
         aggregate = getattr(self.owner_provider, "aggregate_owner_portfolio", None)
+        aggregate_succeeded = False
         if aggregate is not None:
             try:
                 answer = await aggregate(
                     question=scope.question, period=scope.time_label, detail_level=scope.detail_level, summaries=compact,
                 )
+                aggregate_succeeded = True
             except Exception as exc:
                 logger.exception("event=owner_portfolio_aggregate_failed")
                 answer = self._owner_failure_text(exc, what="общий итог") + " Отдельные сводки временно недоступны."
@@ -1701,6 +1753,12 @@ class AgentBridgeApplication:
             answer = "\n\n".join(
                 f"{item['chat_name']}: {item.get('failure') or (item.get('summary') or {}).get('current_status', '')}"
                 for item in compact
+            )
+            aggregate_succeeded = True
+        if aggregate_succeeded:
+            self._schedule_owner_memory_update(
+                scope.question, str(answer), result_type="owner_portfolio_query",
+                completed_work="Сформирован сводный ответ по выбранным чатам.",
             )
         prompt_id = self.store.create_owner_query_prompt(
             scope.question, self.owner_chat_id,
@@ -1780,8 +1838,16 @@ class AgentBridgeApplication:
                     chat.agent_provider,
                     prompt_version=getattr(self.owner_provider, "prompt_version", None),
                 )
+                answer = result.answer
+            else:
+                answer = str(result)
+            self._schedule_owner_memory_update(
+                question, answer, result_type="owner_query",
+                completed_work="Подготовлен ответ владельцу на owner query.",
+            )
+            if isinstance(result, OwnerQueryAnswer):
                 return result.answer
-            return str(result)
+            return answer
         return self._local_status(chat)
 
     def _owner_query_thread_id_for_provider(self, telegram_chat_id: int) -> str | None:
@@ -1799,6 +1865,169 @@ class AgentBridgeApplication:
             telegram_chat_id, saved, current,
         )
         return None
+
+    def _schedule_owner_memory_update(
+        self, owner_request: str, owner_outcome: str, *, result_type: str,
+        completed_work: str = "",
+    ) -> None:
+        if (
+            not self.owner_working_memory_enabled
+            or self.owner_working_memory_path is None
+            or self.owner_chat_id is None
+            or not self._is_substantive_owner_memory_input(owner_request)
+            or not callable(getattr(self.owner_provider, "update_owner_memory", None))
+        ):
+            return
+        task = asyncio.create_task(
+            self._update_owner_working_memory(
+                self._bounded_owner_memory_text(owner_request, 3000),
+                self._bounded_owner_memory_text(owner_outcome, 3000),
+                result_type=result_type,
+                completed_work=self._bounded_owner_memory_text(completed_work, 1600),
+            ),
+            name="agentbridge-owner-working-memory",
+        )
+        self._owner_memory_tasks.add(task)
+        task.add_done_callback(self._owner_memory_tasks.discard)
+
+    @staticmethod
+    def _is_substantive_owner_memory_input(text: str) -> bool:
+        normalized = " ".join(str(text or "").casefold().split())
+        if not normalized or normalized.startswith("/") or len(normalized) < 8:
+            return False
+        return normalized not in {
+            "принято", "понял", "поняла", "спасибо", "ок", "окей", "хорошо",
+            "👍", "👌", "✅", "принял", "приняла", "ясно, спасибо",
+        }
+
+    @staticmethod
+    def _bounded_owner_memory_text(text: str, limit: int) -> str:
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        return value[:limit].rstrip() + "\n[сокращено trusted-кодом]"
+
+    def _owner_memory_thread_id(self) -> str | None:
+        thread_id = self.store.get_owner_query_thread_id(OWNER_MEMORY_THREAD_KEY)
+        if not thread_id:
+            return None
+        version = getattr(self.owner_provider, "memory_prompt_version", OWNER_MEMORY_PROMPT_VERSION)
+        saved_version = self.store.get_owner_query_thread_prompt_version(OWNER_MEMORY_THREAD_KEY)
+        if saved_version == version:
+            return thread_id
+        logger.info(
+            "event=owner_memory_thread_reset reason=prompt_version saved=%s current=%s",
+            saved_version, version,
+        )
+        return None
+
+    def _save_owner_memory_thread(self, thread_id: str) -> None:
+        self.store.save_owner_query_thread(
+            OWNER_MEMORY_THREAD_KEY, OWNER_MEMORY_THREAD_NAME, thread_id,
+            prompt_version=getattr(self.owner_provider, "memory_prompt_version", OWNER_MEMORY_PROMPT_VERSION),
+        )
+
+    async def _update_owner_working_memory(
+        self, owner_request: str, owner_outcome: str, *, result_type: str, completed_work: str,
+    ) -> None:
+        # Serialize only memory updates. The main owner request never awaits this
+        # lock or the Memory Agent, and the file is re-read after acquiring it.
+        async with self._owner_memory_lock:
+            root = self.owner_working_memory_path.parent.parent
+            current = read_working_context(root)
+            before_chars, before_bytes = memory_size(current)
+            logger.info(
+                "event=owner_memory_update_started result_type=%s chars_before=%d bytes_before=%d",
+                result_type, before_chars, before_bytes,
+            )
+            updater = getattr(self.owner_provider, "update_owner_memory", None)
+            if not callable(updater):
+                logger.error("event=owner_memory_agent_failed reason=provider_unavailable")
+                return
+            try:
+                result = await updater(
+                    current_content=current,
+                    owner_request=owner_request,
+                    owner_outcome=owner_outcome,
+                    result_type=result_type,
+                    completed_work=completed_work,
+                    thread_id=self._owner_memory_thread_id(),
+                )
+                result = self._coerce_owner_memory_update(result)
+                self._save_owner_memory_thread(result.thread_id)
+                if not result.changed:
+                    logger.info(
+                        "event=owner_memory_unchanged result_type=%s chars=%d bytes=%d",
+                        result_type, before_chars, before_bytes,
+                    )
+                    return
+
+                candidate = validate_working_context(result.content)
+                chars, byte_count = memory_size(candidate)
+                if chars > SOFT_LIMIT_CHARS or byte_count > ABSOLUTE_LIMIT_BYTES:
+                    logger.info(
+                        "event=owner_memory_compaction_retry result_type=%s chars=%d bytes=%d",
+                        result_type, chars, byte_count,
+                    )
+                    compact = getattr(self.owner_provider, "compact_owner_memory", None)
+                    if not callable(compact):
+                        logger.error("event=owner_memory_agent_failed reason=compaction_unavailable")
+                        return
+                    result = self._coerce_owner_memory_update(
+                        await compact(content=candidate, thread_id=result.thread_id)
+                    )
+                    self._save_owner_memory_thread(result.thread_id)
+                    if not result.changed:
+                        logger.info(
+                            "event=owner_memory_unchanged result_type=%s reason=compaction_unchanged chars=%d bytes=%d",
+                            result_type, before_chars, before_bytes,
+                        )
+                        return
+                    candidate = validate_working_context(result.content)
+                    chars, byte_count = memory_size(candidate)
+
+                if chars > HARD_LIMIT_CHARS or byte_count > ABSOLUTE_LIMIT_BYTES:
+                    logger.warning(
+                        "event=owner_memory_rejected_size result_type=%s chars=%d bytes=%d chars_before=%d bytes_before=%d",
+                        result_type, chars, byte_count, before_chars, before_bytes,
+                    )
+                    return
+
+                write = write_working_context(root, candidate)
+                if not write.changed:
+                    logger.info(
+                        "event=owner_memory_unchanged result_type=%s reason=same_content chars=%d bytes=%d",
+                        result_type, write.chars_after, write.bytes_after,
+                    )
+                    return
+                logger.info(
+                    "event=owner_memory_updated result_type=%s chars_before=%d bytes_before=%d chars_after=%d bytes_after=%d",
+                    result_type, write.chars_before, write.bytes_before, write.chars_after, write.bytes_after,
+                )
+                try:
+                    commit_working_context(root)
+                except WorkingContextCommitError as exc:
+                    logger.error(
+                        "event=owner_memory_git_commit_failed error_type=%s returncode=%s",
+                        exc.error_type, exc.returncode if exc.returncode is not None else "unknown",
+                    )
+                else:
+                    logger.info("event=owner_memory_git_commit_succeeded path=owner_context/working_context.md")
+            except WorkingContextValidationError:
+                logger.error("event=owner_memory_agent_failed reason=invalid_memory_output")
+            except Exception as exc:
+                # Never log exception text: it can echo prompts or owner data.
+                logger.error("event=owner_memory_agent_failed error_type=%s", type(exc).__name__)
+
+    @staticmethod
+    def _coerce_owner_memory_update(result) -> OwnerMemoryUpdate:
+        if isinstance(result, OwnerMemoryUpdate):
+            return result
+        if isinstance(result, dict):
+            thread_id, changed, content = result.get("thread_id"), result.get("changed"), result.get("content")
+            if isinstance(thread_id, str) and isinstance(changed, bool) and isinstance(content, str):
+                return OwnerMemoryUpdate(thread_id, changed, content)
+        raise ValueError("Memory Agent returned an invalid response")
 
     def _local_status(self, chat: ChatConfig) -> str:
         state = self.store.get_chat_state(chat.telegram_chat_id)

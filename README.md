@@ -26,6 +26,9 @@
   «залпов» из десятков старых рекомендаций.
 - **У каждого чата свой тред Codex и свой контекст** — `config.yaml` и `wiki.md`
   разных чатов никогда не смешиваются.
+- **Рабочая память владельца экспериментальная и отдельная.**
+  `owner_context/working_context.md` хранит текущее состояние OWNER, а Git —
+  историю его изменений. Клиентские turns этот файл не получают.
 - **Голосовые распознаются** через `gpt-4o-mini-transcribe` и передаются в
   Codex как обычный текст.
 - **Утренний отчёт** владельцу в 07:30 по Москве.
@@ -183,6 +186,7 @@ cd /home/rick/TG_Agent_Bridge
 | `CODEX_REASONING_EFFORT` | `xhigh` | Глубина рассуждения |
 | `OWNER_CODEX_MODEL` | `gpt-6-luna` | Модель для чата владельца |
 | `OWNER_CODEX_REASONING_EFFORT` | `xhigh` | Глубина для чата владельца |
+| `OWNER_WORKING_MEMORY_ENABLED` | `true` | Включить экспериментальную рабочую память только для OWNER |
 | `OWNER_TIMEZONE` | `Asia/Novosibirsk` | Часовой пояс фраз «сегодня», «за неделю» |
 | `CODEX_SESSION_TIMEZONE` | `Europe/Moscow` | Предполагаемая зона времени сброса лимита Codex |
 | `MESSAGE_BATCH_SECONDS` | `20` | Окно накопления эпизода |
@@ -190,6 +194,14 @@ cd /home/rick/TG_Agent_Bridge
 | `LOG_RETENTION_DAYS` | `7` | Сколько дней хранить логи |
 | `TRANSCRIPTION_MODEL` | `gpt-4o-mini-transcribe` | Модель распознавания голоса |
 | `OPENROUTER_API_KEY` | — | Голосовые ответы владельцу (OpenRouter TTS) |
+
+`OWNER_WORKING_MEMORY_ENABLED=false` отключает и подмешивание рабочего контекста
+в owner prompts, и обновления памяти. Сам файл — компактное текущее состояние,
+не история переписки. Memory Agent использует отдельный persistent thread только
+для continuity; если thread потерян, состояние восстанавливается из Markdown.
+Agent не получает write-доступ: AgentBridge проверяет ответ, атомарно обновляет
+файл и делает локальный commit только этого файла. Ошибка памяти или Git не
+задерживает owner-ответ. Автоматического push нет.
 
 ### Голосовые ответы владельцу
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 from agentbridge.storage.sqlite import ChatThreadStore
+from agentbridge.owner_memory import OWNER_MEMORY_THREAD_KEY, OWNER_MEMORY_THREAD_NAME, OWNER_MEMORY_PROMPT_VERSION
 
 
 def test_thread_mapping_survives_a_new_store_instance(tmp_path) -> None:
@@ -43,6 +44,22 @@ def test_owner_query_thread_is_stored_separately_and_survives_restart(tmp_path) 
     assert restarted.get_thread_id(-100123456) == "client-thread"
     assert restarted.get_owner_query_thread_id(-100123456) == "owner-thread"
     assert restarted.get_owner_query_thread_prompt_version(-100123456) == 3
+
+
+def test_owner_memory_thread_reuses_owner_thread_storage_and_survives_restart(tmp_path) -> None:
+    database_path = tmp_path / "agentbridge.sqlite3"
+    store = ChatThreadStore(database_path)
+    store.save_owner_query_thread(
+        OWNER_MEMORY_THREAD_KEY, OWNER_MEMORY_THREAD_NAME, "memory-thread",
+        prompt_version=OWNER_MEMORY_PROMPT_VERSION,
+    )
+
+    restarted = ChatThreadStore(database_path)
+
+    assert restarted.get_owner_query_thread_id(OWNER_MEMORY_THREAD_KEY) == "memory-thread"
+    assert restarted.get_owner_query_thread_prompt_version(OWNER_MEMORY_THREAD_KEY) == OWNER_MEMORY_PROMPT_VERSION
+    assert restarted.get_owner_query_thread_id(0) is None
+    assert restarted.get_owner_query_thread_id(-1) is None
 
 
 def test_sepia_thread_is_stored_separately_and_survives_restart(tmp_path) -> None:

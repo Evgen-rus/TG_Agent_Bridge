@@ -19,12 +19,16 @@ from agentbridge.agents.codex import (
     _ONBOARDING_SCHEMA,
     _OWNER_QUERY_INSTRUCTIONS,
     _OWNER_QUERY_SCHEMA,
+    _OWNER_CONTEXT_TRUST_BOUNDARY,
+    _OWNER_MEMORY_INSTRUCTIONS,
+    _OWNER_MEMORY_SCHEMA,
     _SEPIA_INSTRUCTIONS,
     _SEPIA_SCHEMA,
     _SUGGEST_SCHEMA,
     validate_structured_output_schema,
 )
 from agentbridge.application import AgentBridgeApplication
+from agentbridge.owner_memory import EMPTY_WORKING_CONTEXT
 from agentbridge.storage.sqlite import ChatThreadStore
 
 
@@ -219,6 +223,7 @@ class _FakeCodex:
     suggest_payload: dict = _suggest_payload()
     critique_payload: dict = _suggest_payload(action="observe", suggested_reply="", observation="Closed.")
     owner_payload: dict = {"answer": "Owner answer"}
+    memory_payload: dict = {"changed": False, "content": EMPTY_WORKING_CONTEXT}
     sepia_payload: dict = {
         "refactored_reply": "Пришлю ссылку завтра в 10:00.",
         "facts_preserved": True,
@@ -235,7 +240,9 @@ class _FakeCodex:
         self.starts.append(kwargs)
         if kwargs.get("developer_instructions") == _CRITIQUE_INSTRUCTIONS:
             thread = _FakeThread("thread-critique", self.critique_payload)
-        elif kwargs.get("developer_instructions") == _OWNER_QUERY_INSTRUCTIONS:
+        elif str(kwargs.get("developer_instructions") or "").startswith(_OWNER_MEMORY_INSTRUCTIONS):
+            thread = _FakeThread("thread-memory", self.memory_payload)
+        elif str(kwargs.get("developer_instructions") or "").startswith(_OWNER_QUERY_INSTRUCTIONS):
             thread = _FakeThread("thread-owner", self.owner_payload)
         elif kwargs.get("developer_instructions") == _SEPIA_INSTRUCTIONS:
             thread = _FakeThread("thread-sepia", self.sepia_payload)
@@ -249,6 +256,8 @@ class _FakeCodex:
         self.resume_kwargs.append(kwargs)
         if thread_id == "thread-owner":
             payload = self.owner_payload
+        elif thread_id == "thread-memory":
+            payload = self.memory_payload
         elif thread_id == "thread-sepia":
             payload = self.sepia_payload
         else:
@@ -264,6 +273,7 @@ def fake_codex(monkeypatch):
     _FakeCodex.resumes = []
     _FakeCodex.resume_kwargs = []
     _FakeCodex.threads = []
+    _FakeCodex.memory_payload = {"changed": False, "content": EMPTY_WORKING_CONTEXT}
     _FakeCodex.sepia_payload = {
         "refactored_reply": "Пришлю ссылку завтра в 10:00.",
         "facts_preserved": True,
@@ -434,6 +444,102 @@ async def test_developer_turn_is_workspace_write_and_checks_are_fixed(fake_codex
 
 
 @pytest.mark.asyncio
+async def test_owner_memory_uses_its_own_persistent_read_only_thread(fake_codex, tmp_path) -> None:
+    from openai_codex import ApprovalMode, Sandbox
+
+    memory_path = tmp_path / "owner_context" / "working_context.md"
+    memory_path.parent.mkdir()
+    memory_path.write_text(EMPTY_WORKING_CONTEXT, encoding="utf-8")
+    payload = {"changed": False, "content": EMPTY_WORKING_CONTEXT}
+    fake_codex.memory_payload = payload
+    provider = CodexProvider(
+        model="gpt-6-luna", reasoning_effort="high", cwd=tmp_path,
+        owner_context_path=memory_path,
+    )
+
+    first = await provider.update_owner_memory(
+        current_content=EMPTY_WORKING_CONTEXT,
+        owner_request="Продолжить исследование рынка",
+        owner_outcome="Сравнили три сегмента",
+        result_type="owner_query",
+        completed_work="Черновой анализ готов",
+        thread_id=None,
+    )
+    second = await provider.compact_owner_memory(content=EMPTY_WORKING_CONTEXT, thread_id=first.thread_id)
+
+    assert first.thread_id == second.thread_id == "thread-memory"
+    start = fake_codex.starts[-1]
+    assert start["developer_instructions"].startswith(_OWNER_MEMORY_INSTRUCTIONS)
+    assert _OWNER_CONTEXT_TRUST_BOUNDARY in start["developer_instructions"]
+    assert start["model"] == "gpt-6-luna"
+    assert start["config"]["model_reasoning_effort"] == "high"
+    assert start["cwd"] == str(memory_path.parent)
+    assert start["sandbox"] == Sandbox.read_only
+    assert start["approval_mode"] == ApprovalMode.deny_all
+    assert fake_codex.resume_kwargs[-1]["sandbox"] == Sandbox.read_only
+    assert fake_codex.resume_kwargs[-1]["approval_mode"] == ApprovalMode.deny_all
+    assert fake_codex.threads[-2].prompts[-1].find("Продолжить исследование рынка") >= 0
+    assert "full owner history" not in fake_codex.threads[-2].prompts[-1]
+    assert "Compact further" in fake_codex.threads[-1].prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_owner_memory_replaces_an_unavailable_saved_thread(fake_codex, monkeypatch, tmp_path) -> None:
+    def unavailable(self, thread_id: str, **kwargs):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(_FakeCodex, "thread_resume", unavailable)
+    memory_path = tmp_path / "owner_context" / "working_context.md"
+    memory_path.parent.mkdir()
+    provider = CodexProvider(owner_context_path=memory_path)
+
+    result = await provider.update_owner_memory(
+        current_content=EMPTY_WORKING_CONTEXT,
+        owner_request="Выбрал следующий проект",
+        owner_outcome="Работа начата",
+        result_type="owner_query",
+        completed_work="",
+        thread_id="lost-memory-thread",
+    )
+
+    assert result.thread_id == "thread-memory"
+    assert fake_codex.starts[-1]["developer_instructions"].startswith(_OWNER_MEMORY_INSTRUCTIONS)
+
+
+@pytest.mark.asyncio
+async def test_owner_context_is_untrusted_and_never_added_to_client_turns(fake_codex, tmp_path) -> None:
+    from agentbridge.owner_memory import validate_working_context
+
+    memory_path = tmp_path / "owner_context" / "working_context.md"
+    memory_path.parent.mkdir()
+    content = validate_working_context(
+        "# Rick Owner Working Context\n\n## Goal\n\nSentinel owner state\n\n"
+        "## Active\n\n## Decisions\n\n## Constraints\n\n## Known Issues\n\n"
+        "## Rejected\n\n## Next\n\n## References\n"
+    )
+    memory_path.write_text(content, encoding="utf-8")
+    owner = CodexProvider(owner_context_path=memory_path)
+    client = CodexProvider()
+
+    await owner.answer_owner_query(
+        question="What is the current goal?", chat_name="Owner", context_pack="", thread_id=None,
+    )
+    owner_thread = fake_codex.threads[-1]
+    assert "Sentinel owner state" in owner_thread.prompts[-1]
+    assert _OWNER_CONTEXT_TRUST_BOUNDARY in fake_codex.starts[-1]["developer_instructions"]
+    assert "Sentinel owner state" not in fake_codex.starts[-1]["developer_instructions"]
+    assert owner.prompt_version != client.prompt_version
+
+    await client.suggest(
+        message="Need the contract", sender_name="Client", chat_name="Client chat",
+        wiki="", rules=[], thread_id=None,
+    )
+    client_thread = fake_codex.threads[-1]
+    assert "Sentinel owner state" not in client_thread.prompts[-1]
+    assert "working_context" not in client_thread.prompts[-1]
+
+
+@pytest.mark.asyncio
 async def test_codex_suggest_resumes_only_the_main_thread(fake_codex) -> None:
     provider = CodexProvider()
     first = await provider.suggest(
@@ -560,7 +666,10 @@ async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_co
 
 
 def test_codex_output_schemas_match_structured_outputs_subset() -> None:
-    for schema in (_SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _GENERAL_TASK_PLAN_SCHEMA, _ONBOARDING_SCHEMA, _SEPIA_SCHEMA):
+    for schema in (
+        _SUGGEST_SCHEMA, _FEEDBACK_SCHEMA, _OWNER_QUERY_SCHEMA, _OWNER_MEMORY_SCHEMA,
+        _GENERAL_TASK_PLAN_SCHEMA, _ONBOARDING_SCHEMA, _SEPIA_SCHEMA,
+    ):
         validate_structured_output_schema(schema)
     field = _SUGGEST_SCHEMA["properties"]["candidate_state"]
     assert field["additionalProperties"] is False

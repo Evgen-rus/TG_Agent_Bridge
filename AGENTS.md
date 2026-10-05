@@ -38,6 +38,10 @@ the architecture file when those contracts materially change.
   per-message recommendations.
 - Treat SQLite history and `chat_state` as the durable situation source. The
   Codex thread is continuity only.
+- `owner_context/working_context.md` is an experimental OWNER-only current
+  state; Git is its history. Pass it only to the owner provider as untrusted
+  data, never as instructions or into client turns. The memory thread is
+  continuity only; the Markdown file is its recoverable state.
 - Preserve the per-chat batching behavior and keep different chats independent.
 - In the owner chat, invoke the agent on reply-to-bot, an explicit
   mention/tag, or a global memory prefix (`Общий контекст:`).

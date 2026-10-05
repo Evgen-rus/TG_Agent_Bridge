@@ -23,6 +23,7 @@ class Settings:
     codex_reasoning_effort: str = "xhigh"
     owner_codex_model: str = "gpt-6-luna"
     owner_codex_reasoning_effort: str = "xhigh"
+    owner_working_memory_enabled: bool = True
     owner_timezone: str = "Asia/Novosibirsk"
     codex_session_timezone: str = "Europe/Moscow"
     sepia_enabled: bool = True
@@ -95,6 +96,7 @@ class Settings:
             codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "xhigh").strip(),
             owner_codex_model=os.getenv("OWNER_CODEX_MODEL", "gpt-6-luna").strip(),
             owner_codex_reasoning_effort=os.getenv("OWNER_CODEX_REASONING_EFFORT", "xhigh").strip(),
+            owner_working_memory_enabled=os.getenv("OWNER_WORKING_MEMORY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
             owner_timezone=os.getenv("OWNER_TIMEZONE", "Asia/Novosibirsk").strip() or "Asia/Novosibirsk",
             codex_session_timezone=os.getenv("CODEX_SESSION_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
             sepia_enabled=os.getenv("SEPIA_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},

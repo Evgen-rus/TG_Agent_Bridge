@@ -72,6 +72,13 @@ class OwnerQueryAnswer:
 
 
 @dataclass(frozen=True)
+class OwnerMemoryUpdate:
+    thread_id: str
+    changed: bool
+    content: str
+
+
+@dataclass(frozen=True)
 class GeneralTaskPlan:
     thread_id: str
     understanding: str
@@ -145,6 +152,13 @@ class AgentProvider(Protocol):
     ) -> GeneralTaskPlan: ...
 
     async def run_general_task(self, *, request: str, thread_id: str) -> OwnerQueryAnswer: ...
+
+    async def update_owner_memory(
+        self, *, current_content: str, owner_request: str, owner_outcome: str,
+        result_type: str, completed_work: str, thread_id: str | None,
+    ) -> OwnerMemoryUpdate: ...
+
+    async def compact_owner_memory(self, *, content: str, thread_id: str) -> OwnerMemoryUpdate: ...
 
     async def resolve_owner_query_scope(
         self, *, question: str, known_chats: Sequence[dict[str, str]],
