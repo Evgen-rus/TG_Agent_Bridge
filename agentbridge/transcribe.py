@@ -39,7 +39,7 @@ async def transcribe_audio_bytes(
         transcript = await client.audio.transcriptions.create(
             model=model,
             file=(filename, io.BytesIO(audio)),
-            language=language,
+            **({"extra_body": {"languages": [language]}} if model == "gpt-transcribe" else {"language": language}),
         )
     finally:
         await client.close()

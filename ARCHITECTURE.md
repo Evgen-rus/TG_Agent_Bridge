@@ -229,6 +229,8 @@ a series of outdated recommendations.
   document copies, and labels for history.
 - `agentbridge/transcribe.py`: OpenAI speech-to-text call used for client voice
   notes; the configured `TRANSCRIPTION_MODEL` is the only transcription model.
+  `gpt-transcribe` receives `languages` via SDK `extra_body`; other models
+  retain the singular `language` hint.
 - `agentbridge/speech.py`: reusable speech-provider interface, ordered provider
   selector with a per-response cost ceiling, and the OpenRouter TTS adapter with
   a short-lived in-memory pricing catalog cache.
