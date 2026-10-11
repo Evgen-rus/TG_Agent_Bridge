@@ -393,9 +393,13 @@ def create_telegram_application(
     daily_report_enabled: bool = False,
     daily_report_time: str = "07:30",
     daily_report_timezone: str = "Europe/Moscow",
+    self_audit=None,
+    self_audit_owner_user_id: int | None = None,
 ) -> Application:
     if not token.strip():
         raise ValueError("Telegram bot token must not be empty.")
+    if self_audit_owner_user_id is not None and self_audit_owner_user_id <= 0:
+        raise ValueError('Self-audit owner must be a positive user ID')
     if batch_seconds < 0:
         raise ValueError("Message batch interval must not be negative.")
     if delivery_retry_seconds <= 0:
@@ -816,6 +820,21 @@ def create_telegram_application(
         if pending_queries is not None:
             for query_result in query_results:
                 await _deliver_owner_query(bot, query_result)
+        if self_audit is not None and daily_report_enabled and live_enabled:
+            # The model task is independent of this delivery loop and Telegram handlers.
+            self_audit.schedule()
+            try:
+                for proposal in self_audit.store.pending_self_audit_proposals():
+                    proposal_id = proposal['id']
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton(label, callback_data=f"audit:{action}:{proposal_id}")
+                        for label, action in (("Принять", "accepted"), ("Отклонить", "rejected"), ("Позже", "later"))
+                    ]])
+                    sent = await _send(bot, chat_id=owner_chat_id, text=proposal['text'], reply_markup=keyboard,
+                                       delivery_key=f"self-audit:{proposal_id}")
+                    self_audit.store.record_self_audit_delivery(proposal_id, sent.message_id)
+            except Exception:
+                logger.warning('event=self_audit_delivery_pending component=telegram')
         notices = getattr(message_service, "pending_onboarding_notices", None)
         if notices is not None:
             try:
@@ -938,6 +957,8 @@ def create_telegram_application(
                 continue
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if self_audit is not None:
+            await self_audit.stop()
         recovery_task = None
         retry_task = None
         watchdog_task = None
@@ -1498,6 +1519,24 @@ def create_telegram_application(
             return
         await _telegram_try("answer_callback", query.answer())
         data = query.data or ""
+        if data.startswith('audit:'):
+            sender = update.effective_user
+            authorized_id = self_audit_owner_user_id or (owner_chat_id if owner_chat_id > 0 else None)
+            if self_audit is None or authorized_id is None or sender is None or sender.is_bot or sender.id != authorized_id:
+                return
+            try:
+                _, action, raw_id = data.split(':')
+                proposal_id = int(raw_id)
+            except ValueError:
+                return
+            if self_audit.store.decide_self_audit(proposal_id, action, user_id=sender.id, message_id=query.message.message_id):
+                if action != 'later':
+                    await _telegram_try('clear_self_audit_buttons', query.edit_message_reply_markup(reply_markup=None))
+                labels = {'accepted': 'Идея согласована. Для реализации кода: /dev и отдельное подтверждение задачи.',
+                          'rejected': 'Отклонено. Без существенно новых доказательств повторять не буду.',
+                          'later': 'Отложено. Кнопки остаются для решения позже.'}
+                await _send(context.bot, chat_id=owner_chat_id, text=labels[action])
+            return
         if data.startswith("general:"):
             try:
                 _, action, raw_id = data.split(":", 2)
@@ -1776,7 +1815,7 @@ def create_telegram_application(
     ))
     application.add_handler(CallbackQueryHandler(
         learning_callback,
-        pattern=r"^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$|^general:(?:confirm|refine|cancel):\d+$|^portfolio:(?:all|multi|single|general|done|reset|cancel):\d+$|^portfolio:choose:\d+:\d+$|^portfolio:item(?:_add|_remove)?:\d+:\d+$",
+        pattern=r"^audit:(?:accepted|rejected|later):\d+$|^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$|^general:(?:confirm|refine|cancel):\d+$|^portfolio:(?:all|multi|single|general|done|reset|cancel):\d+$|^portfolio:choose:\d+:\d+$|^portfolio:item(?:_add|_remove)?:\d+:\d+$",
     ))
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("rules", rules_command))

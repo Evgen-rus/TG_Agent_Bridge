@@ -734,7 +734,7 @@ class ChatThreadStore:
                 (event, level, _now()),
             )
             connection.execute("DELETE FROM operational_events WHERE created_at<?",
-                               ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),))
+                               ((datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),))
 
     def queue_daily_report(self, report_date: str, start_utc: str, end_utc: str) -> int:
         with self._connect() as connection:
@@ -765,6 +765,8 @@ class ChatThreadStore:
             cursor = connection.execute("INSERT INTO owner_query_deliveries(text, created_at) VALUES(?, ?)", (text, _now()))
             connection.execute("INSERT INTO daily_reports(report_date, delivery_id, created_at) VALUES(?, ?, ?)",
                                (report_date, cursor.lastrowid, _now()))
+            connection.execute("INSERT INTO self_audit_runs(report_date, end_utc, status) VALUES(?, ?, 'pending')",
+                               (report_date, _now()))
             logger.info("event=daily_report_queued component=storage report_date=%s delivery_id=%s", report_date, cursor.lastrowid)
             return cursor.lastrowid
 
@@ -772,6 +774,63 @@ class ChatThreadStore:
         with self._connect() as connection:
             row = connection.execute("SELECT max(report_date) FROM daily_reports").fetchone()
             return row[0]
+
+    def recover_self_audits(self) -> None:
+        # Called once at process startup, before any audit task exists.
+        with self._connect() as connection:
+            connection.execute("UPDATE self_audit_runs SET status='pending' WHERE status='running'")
+
+    def claim_self_audit(self) -> dict | None:
+        with self._write_locked() as connection:
+            row = connection.execute("""SELECT a.* FROM self_audit_runs a
+                JOIN daily_reports r USING(report_date)
+                JOIN owner_query_deliveries d ON d.id=r.delivery_id
+                WHERE a.status='pending' AND d.owner_message_id IS NOT NULL
+                ORDER BY a.report_date DESC LIMIT 1""").fetchone()
+            if row is None:
+                return None
+            connection.execute("UPDATE self_audit_runs SET status='running' WHERE report_date=?", (row['report_date'],))
+            connection.execute("UPDATE self_audit_runs SET status='superseded' WHERE status='pending' AND report_date<?", (row['report_date'],))
+            return dict(row)
+
+    def finish_self_audit(self, report_date: str, proposals: list[dict], *, failed: bool = False) -> None:
+        with self._write_locked() as connection:
+            run = connection.execute("SELECT status FROM self_audit_runs WHERE report_date=?", (report_date,)).fetchone()
+            if run is None or run[0] != 'running':
+                return
+            for proposal in proposals:
+                previous = connection.execute("SELECT * FROM self_audit_proposals WHERE issue=? ORDER BY id DESC LIMIT 1",
+                                              (proposal['issue'],)).fetchone()
+                if previous:
+                    old_evidence = json.loads(previous['evidence_json'])
+                    old_count = old_evidence['current_count']
+                    new_kind = set(proposal['evidence'].get('failure_kinds', {})) - set(old_evidence.get('failure_kinds', {}))
+                    if previous['status'] != 'rejected' or (not new_kind and proposal['evidence']['current_count'] < max(old_count * 2, old_count + 3)):
+                        continue
+                connection.execute("""INSERT INTO self_audit_proposals
+                    (report_date, issue, text, evidence_json, status, created_at)
+                    VALUES(?, ?, ?, ?, 'pending', ?)""",
+                    (report_date, proposal['issue'], proposal['text'], json.dumps(proposal['evidence']), _now()))
+            connection.execute("UPDATE self_audit_runs SET status=? WHERE report_date=?",
+                               ('failed' if failed else 'completed', report_date))
+
+    def pending_self_audit_proposals(self) -> list[dict]:
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM self_audit_proposals WHERE owner_message_id IS NULL ORDER BY id")]
+
+    def record_self_audit_delivery(self, proposal_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE self_audit_proposals SET owner_message_id=? WHERE id=? AND owner_message_id IS NULL",
+                               (message_id, proposal_id))
+
+    def decide_self_audit(self, proposal_id: int, action: str, *, user_id: int, message_id: int) -> bool:
+        if action not in {'accepted', 'rejected', 'later'}:
+            return False
+        with self._connect() as connection:
+            return bool(connection.execute("""UPDATE self_audit_proposals SET status=?, decided_by=?, decided_at=?
+                WHERE id=? AND owner_message_id=? AND status IN ('pending', 'later') AND status<>?""",
+                (action, user_id, _now(), proposal_id, message_id, action)).rowcount)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -976,6 +1035,24 @@ class ChatThreadStore:
                     delivery_id INTEGER NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(delivery_id) REFERENCES owner_query_deliveries(id)
+                );
+                CREATE TABLE IF NOT EXISTS self_audit_runs (
+                    report_date TEXT PRIMARY KEY,
+                    end_utc TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS self_audit_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_date TEXT NOT NULL,
+                    issue TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    owner_message_id INTEGER,
+                    decided_by INTEGER,
+                    decided_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(report_date, issue)
                 );
                 CREATE TABLE IF NOT EXISTS owner_query_selections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

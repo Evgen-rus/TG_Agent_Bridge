@@ -208,6 +208,37 @@ a series of outdated recommendations.
 
 ## Components
 
+The daily report transaction also inserts a `self_audit_runs` job. The existing
+Telegram delivery retry loop starts `SelfAudit` as an independent asyncio task
+only after that report's delivery ID is linked. Collection and model work run
+outside the event loop. Windows cover 24 hours before report queueing plus the
+preceding seven days; delayed reports coalesce their audits into the newest job.
+At startup, interrupted `running` jobs become `pending`. Completed/failed jobs
+are never replayed automatically. An explicit durable Codex limit skips a turn.
+
+`self_audit.py` reads only allowlisted technical log fields and SQLite counters,
+with source row/line references and partial-coverage notes. It never reads Codex
+session files, client message bodies, prompts or working context. CodexProvider
+records only completed tool kind/status/duration and fixed failure categories.
+Process-local HMACs of textual turn inputs detect exact repeated requests without
+retaining prompts or a recoverable key. Cross-restart and media-input comparisons
+are unavailable; repeated requests alone do not prove wasted model usage.
+Successful same-thread turns after failures and same-kind tool recoveries are
+indicators, not proof of a causal fix or useful/pointless work.
+
+The audit uses a fresh ephemeral read-only Codex thread in `runtime/self_audit`,
+without owner-context instructions, inherited tools, hooks or approvals. Output
+is limited to three proposals with validated evidence keys and bounded text.
+`self_audit_proposals` stores cards, canonical event identity, evidence and owner
+decisions. Creation/completion is atomic; delivery reuses durable message parts.
+Private-chat callbacks require the owner's user ID; group callbacks require
+`SELF_AUDIT_OWNER_USER_ID`, and both bind to the delivered message ID. Acceptance
+only records consent: implementing code still requires a new confirmed `/dev`
+task. No audit callback enters learning, Memory Agent or general-task execution.
+Rejected event identities return only with doubled frequency and at least three
+additional cases, or a new fixed failure category. Accepted, pending and deferred
+identities stay suppressed. Telegram's existing send/DB-ack crash gap remains.
+
 - `agentbridge/main.py`: composition root and polling lifecycle.
 - `agentbridge/settings.py`: `.env` configuration.
 - `agentbridge/telegram/`: Telegram adapter, persist-first ingest, per-chat

@@ -19,6 +19,7 @@ class Settings:
     daily_report_enabled: bool = True
     daily_report_time: str = "07:30"
     daily_report_timezone: str = "Europe/Moscow"
+    self_audit_owner_user_id: int | None = None
     codex_model: str = "gpt-6-luna"
     codex_reasoning_effort: str = "xhigh"
     owner_codex_model: str = "gpt-6-luna"
@@ -79,6 +80,10 @@ class Settings:
             item.strip() for item in os.getenv("OWNER_VOICE_PROVIDER_ORDER", "openrouter").split(",")
             if item.strip()
         )
+        audit_owner = os.getenv('SELF_AUDIT_OWNER_USER_ID', '').strip()
+        audit_owner_id = int(audit_owner) if audit_owner else None
+        if audit_owner_id is not None and audit_owner_id <= 0:
+            raise ValueError('SELF_AUDIT_OWNER_USER_ID must be a positive user ID')
 
         return cls(
             leadrecord_ssh_target=os.getenv("LEADRECORD_SSH_TARGET", "").strip(),
@@ -92,6 +97,7 @@ class Settings:
             daily_report_enabled=os.getenv("DAILY_REPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
             daily_report_time=os.getenv("DAILY_REPORT_TIME", "07:30").strip(),
             daily_report_timezone=os.getenv("DAILY_REPORT_TIMEZONE", "Europe/Moscow").strip(),
+            self_audit_owner_user_id=audit_owner_id,
             codex_model=os.getenv("CODEX_MODEL", "gpt-6-luna").strip(),
             codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "xhigh").strip(),
             owner_codex_model=os.getenv("OWNER_CODEX_MODEL", "gpt-6-luna").strip(),

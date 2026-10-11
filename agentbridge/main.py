@@ -12,6 +12,7 @@ from .image_generation import OpenAIImageGenerator
 from .logging import OperationalEventHandler, configure_logging
 from .owner_memory import OWNER_MEMORY_RELATIVE_PATH
 from .settings import Settings
+from .self_audit import SelfAudit
 from .speech import OpenRouterSpeechProvider, SpeechProviderRegistry
 from .storage.sqlite import (
     CODEX_RECOVERED_NOTICE,
@@ -127,6 +128,15 @@ def main() -> None:
         owner_working_memory_enabled=settings.owner_working_memory_enabled,
         owner_working_memory_path=root / OWNER_MEMORY_RELATIVE_PATH,
     )
+    store.recover_self_audits()
+    audit_dir = settings.database_path.parent / 'self_audit'
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_provider = CodexProvider(
+        model=settings.owner_codex_model, reasoning_effort=settings.owner_codex_reasoning_effort,
+        cwd=audit_dir, sepia_enabled=False, on_usage_limit=note_owner_codex_limit,
+        on_usage_recovered=note_owner_codex_recovered, usage_limit_active=limit_active,
+    )
+    self_audit = SelfAudit(store, audit_provider, settings.log_dir)
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,
         owner_chat_id=settings.owner_chat_id,
@@ -149,6 +159,8 @@ def main() -> None:
         daily_report_enabled=settings.daily_report_enabled,
         daily_report_time=settings.daily_report_time,
         daily_report_timezone=settings.daily_report_timezone,
+        self_audit=self_audit,
+        self_audit_owner_user_id=settings.self_audit_owner_user_id,
     )
     previous_unclean = store.start_run()
     if previous_unclean:

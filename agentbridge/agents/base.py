@@ -99,6 +99,8 @@ class MediaAttachment:
 
 
 class AgentProvider(Protocol):
+    async def analyze_self_audit(self, *, summary: dict) -> dict: ...
+
     async def suggest(
         self,
         *,
