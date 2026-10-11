@@ -46,7 +46,10 @@ class SalesTelegram:
         if title:
             text = f'Название сделки: {title}'
         if text.startswith('/'):
-            if text.split()[0].split('@')[0] in {'/start', '/help'}:
+            command, separator, target = text.split()[0].partition('@')
+            if separator and target.lower() != (context.bot.username or '').lower():
+                return
+            if command in {'/start', '/help'}:
                 await asyncio.to_thread(self.service.store.ingest,
                     update_id=update.update_id, chat_id=self.chat_id, topic_id=topic,
                     title=title or f'Тема {topic}', message_id=message.message_id,

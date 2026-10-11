@@ -203,6 +203,10 @@ async def test_quiet_messages_commands_and_duplicate_help(tmp_path):
     await adapter.ingest(help_update, context)
     assert len(store.deliveries()) == 1
     assert not context.bot.sent
+    other_bot_command = update(text='/help@another_bot')
+    other_bot_command.update_id = other_bot_command.effective_message.message_id = 3
+    await adapter.ingest(other_bot_command, context)
+    assert len(store.deliveries()) == 1
 
 
 @pytest.mark.asyncio
