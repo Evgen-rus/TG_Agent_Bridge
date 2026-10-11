@@ -85,6 +85,8 @@ reports/
 knowledge/
 !knowledge/
 knowledge/*
+!knowledge/sales_buddy/
+!knowledge/sales_buddy/**
 !knowledge/leadgenbureau/
 !knowledge/leadgenbureau/**
 !knowledge/clients/

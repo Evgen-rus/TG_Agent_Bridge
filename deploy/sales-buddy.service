@@ -1,0 +1,21 @@
+[Unit]
+Description=Sales Buddy (Sali) Telegram deal assistant
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=rick
+Group=rick
+WorkingDirectory=/home/rick/TG_Agent_Bridge
+ExecStart=/home/rick/TG_Agent_Bridge/.venv/bin/python -m agentbridge.sales.main --env-file /home/rick/TG_Agent_Bridge/runtime/sales_buddy/.env
+Restart=on-failure
+RestartSec=10
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
