@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию или текст разговора. В этой теме я помню вашу сделку. Аудио и документы пока не разбираю — вставьте текст.'
 
 
+def member_allowed(member):
+    return member.status in {'creator', 'administrator', 'member'} or (
+        member.status == 'restricted' and getattr(member, 'is_member', False))
+
+
 class SalesTelegram:
     def __init__(self, chat_id, service):
         self.chat_id, self.service = chat_id, service
@@ -27,15 +32,15 @@ class SalesTelegram:
         if not topic or not getattr(message, 'is_topic_message', False):
             return
         # Membership is the user-authorized access policy; fail closed on API failures.
+        authorization_pending = False
         try:
             member = await context.bot.get_chat_member(self.chat_id, user.id)
         except Exception:
-            logger.warning('event=sales_membership_unavailable')
-            return
-        if member.status not in {'creator', 'administrator', 'member', 'restricted'}:
-            return
-        if member.status == 'restricted' and not getattr(member, 'is_member', False):
-            return
+            authorization_pending = True
+            logger.warning('event=sales_membership_deferred')
+        else:
+            if not member_allowed(member):
+                return
         text = message_text(message)
         title = getattr(getattr(message, 'forum_topic_created', None), 'name', '')
         if title:
@@ -46,13 +51,13 @@ class SalesTelegram:
                     update_id=update.update_id, chat_id=self.chat_id, topic_id=topic,
                     title=title or f'Тема {topic}', message_id=message.message_id,
                     author_id=user.id, author=user.full_name, date=message.date.isoformat(),
-                    text=text, source='command', respond=False, response_text=HELP)
+                    text=text, source='command', respond=False, response_text=HELP,
+                    authorization_pending=authorization_pending)
             return
+        if any(getattr(message, kind, None) for kind in ('document', 'voice', 'audio', 'photo', 'video')):
+            text = '[Вложение не разобрано. Содержимое неизвестно.]' + ('\n' + text if text else '')
         if not text:
-            if getattr(message, 'document', None) or getattr(message, 'voice', None) or getattr(message, 'audio', None):
-                text = '[Вложение не разобрано. Содержимое неизвестно.]'
-            else:
-                return
+            return
         reply = getattr(message, 'reply_to_message', None)
         addressed_elsewhere = bool(reply and getattr(reply, 'from_user', None)
             and reply.from_user.id != context.bot.id)
@@ -66,11 +71,25 @@ class SalesTelegram:
             title=title or f'Тема {topic}', message_id=message.message_id,
             author_id=user.id, author=user.full_name, date=message.date.isoformat(),
             text=text, reply_to=getattr(reply, 'message_id', None), respond=respond,
+            authorization_pending=authorization_pending,
             source='unsupported_attachment' if text.startswith('[Вложение') else 'telegram_text')
+
+    async def authorize_pending(self, bot):
+        permissions = {}
+        for row in await asyncio.to_thread(self.service.store.awaiting_authorization, self.chat_id):
+            author = row['author_id']
+            if author not in permissions:
+                try:
+                    permissions[author] = member_allowed(await bot.get_chat_member(self.chat_id, author))
+                except Exception:
+                    permissions[author] = None
+            if permissions[author] is not None:
+                await asyncio.to_thread(self.service.store.authorize, row['id'], permissions[author], HELP)
 
     async def analyze_pending(self, app):
         while True:
             try:
+                await self.authorize_pending(app.bot)
                 topics = await asyncio.to_thread(self.service.store.pending_topics)
                 for chat_id, topic_id in topics:
                     if chat_id == self.chat_id:

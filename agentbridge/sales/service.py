@@ -27,8 +27,9 @@ def validate_result(result, context):
     sources = {r['id']: r['text'] for r in context['history'] + context['events']}
     current_ids = {row['id'] for row in context['events']}
     existing = {row['id']: row for row in context['facts']}
+    available_sources = set(sources) | {row['event_id'] for row in context['facts']}
     if not isinstance(result['basis'], list) or len(result['basis']) > 20 or any(
-        type(i) is not int or i not in sources for i in result['basis']
+        type(i) is not int or i not in available_sources for i in result['basis']
     ):
         raise ValueError('Invalid recommendation source')
     if result['next_action'].strip() and not result['basis']:
@@ -69,8 +70,6 @@ def validate_result(result, context):
         elif any(all(old[key] == fact[key] for key in ('field', 'text', 'kind')) for old in existing.values()):
             continue
         clean.append(fact)
-    if len(existing) - len(replaced) + len(clean) > 120:
-        raise ValueError('Card too large; requires explicit consolidation')
     return {**result, 'facts': clean}
 
 

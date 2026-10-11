@@ -333,3 +333,73 @@ def test_long_original_is_retained_with_explicit_excerpt_flag(tmp_path):
     assert event['original_length'] == 20000
     with store.connect() as db:
         assert db.execute('SELECT text FROM events').fetchone()[0] == text
+
+
+@pytest.mark.asyncio
+async def test_membership_failure_persists_and_recovers_without_leaking_to_model(tmp_path):
+    store = SalesStore(tmp_path / 'sales.sqlite3')
+    fake = Fake()
+    adapter = SalesTelegram(-100, SalesService(store, fake))
+    class Unavailable(Bot):
+        async def get_chat_member(self, *args):
+            raise OSError('temporary Telegram error')
+    await adapter.ingest(update(), NS(bot=Unavailable()))
+    assert len(store.awaiting_authorization(-100)) == 1
+    assert not store.pending_topics()
+    await adapter.service.process(-100, 10)
+    assert not fake.contexts
+    reopened = SalesStore(store.path)
+    adapter = SalesTelegram(-100, SalesService(reopened, fake))
+    await adapter.authorize_pending(Bot())
+    await adapter.service.process(-100, 10)
+    assert len(fake.contexts) == 1
+    assert not reopened.awaiting_authorization(-100)
+    denied = update(text='Недопустимый контекст')
+    denied.update_id = denied.effective_message.message_id = 2
+    await adapter.ingest(denied, NS(bot=Unavailable()))
+    await adapter.authorize_pending(Bot('left'))
+    assert not reopened.awaiting_authorization(-100)
+    assert not reopened.context(-100, 10)['events']
+    assert all(row['text'] != 'Недопустимый контекст' for row in reopened.context(-100, 10)['history'])
+
+
+@pytest.mark.asyncio
+async def test_attachment_caption_never_implies_read_contents(tmp_path):
+    store = SalesStore(tmp_path / 'sales.sqlite3')
+    adapter = SalesTelegram(-100, SalesService(store, Fake()))
+    await adapter.ingest(update(text='', caption='Вот КП, посмотри', document=NS(file_id='fake')), NS(bot=Bot()))
+    row = store.context(-100, 10)['events'][0]
+    assert row['source'] == 'unsupported_attachment'
+    assert 'не разобрано' in row['text'] and 'Вот КП' in row['text']
+
+
+def test_large_card_is_bounded_without_erasing_old_confirmed_facts(tmp_path):
+    store = SalesStore(tmp_path / 'sales.sqlite3')
+    ingest(store, text='Что известно про редкийартикул?')
+    with store.connect() as db:
+        for i in range(150):
+            text = 'редкийартикул согласован' if i == 0 else f'Подтверждённое условие {i}'
+            db.execute("INSERT INTO facts(chat_id,topic_id,field,text,kind,event_id,quote) VALUES (-100,10,'confirmed',?,'fact',1,?)", (text,text))
+    context = store.context(-100, 10)
+    assert any(f['text'] == 'редкийартикул согласован' for f in context['facts'])
+    assert len(context['facts']) <= 16
+    assert context['omitted_facts'] >= 134
+    # Further updates still work; a large ledger must not permanently stop analysis.
+    patch = validate_result(result(context), context)
+    assert store.complete(-100, 10, context['events'], patch)
+    with store.connect() as db:
+        assert db.execute('SELECT count(*) FROM facts').fetchone()[0] == 151
+
+
+def test_recommendation_can_cite_visible_old_fact_source(tmp_path):
+    store = SalesStore(tmp_path / 'sales.sqlite3')
+    ingest(store)
+    context = store.context(-100, 10)
+    context['facts'] = [dict(id=9, event_id=77, field='client', text='Птицефабрика',
+                            kind='fact', quote='Птицефабрика')]
+    payload = result(context)
+    payload['basis'] = [77]
+    assert validate_result(payload, context)['basis'] == [77]
+    payload['basis'] = [88]
+    with pytest.raises(ValueError):
+        validate_result(payload, context)

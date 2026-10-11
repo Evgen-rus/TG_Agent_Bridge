@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import re
 from pathlib import Path
 import sqlite3
 import time
@@ -59,7 +60,7 @@ class SalesStore:
 
     def ingest(self, *, update_id, chat_id, topic_id, title, message_id,
                author_id, author, date, text, source="telegram_text", reply_to=None,
-               respond=True, response_text=None):
+               respond=True, response_text=None, authorization_pending=False):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
@@ -69,13 +70,31 @@ class SalesStore:
             inserted = db.execute("""INSERT OR IGNORE INTO events
                 (update_id,chat_id,topic_id,message_id,author_id,author,date,text,source,reply_to,processed)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (update_id, chat_id, topic_id, message_id,
-                author_id, author, date, text, source, reply_to, int(not respond))).rowcount
+                author_id, author, date, text, source, reply_to,
+                (-1 if respond else -2) if authorization_pending else int(not respond))).rowcount
             if inserted:
                 db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
                            (chat_id, topic_id, title))
-                if response_text:
+                if response_text and not authorization_pending:
                     self._queue(db, chat_id, topic_id, f'help:{update_id}', response_text)
             return bool(inserted)
+
+    def awaiting_authorization(self, chat_id):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("""SELECT id,author_id,source FROM events
+                WHERE chat_id=? AND processed<0 ORDER BY id LIMIT 50""", (chat_id,))]
+
+    def authorize(self, row_id, allowed, help_text):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM events WHERE id=? AND processed<0', (row_id,)).fetchone()
+            if not row:
+                return
+            # 2 means denied: retain the ingress record, exclude it from all model context.
+            state = (0 if row['processed'] == -1 else 1) if allowed else 2
+            db.execute('UPDATE events SET processed=? WHERE id=?', (state, row_id))
+            if allowed and row['source'] == 'command':
+                self._queue(db, row['chat_id'], row['topic_id'], f"help:{row['update_id']}", help_text)
 
     def pending_topics(self):
         with self.connect() as db:
@@ -96,6 +115,23 @@ class SalesStore:
                 chat_id=? AND topic_id=? AND processed=1 ORDER BY id DESC LIMIT 200""", scope)]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE
                 chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 5""", scope)]
+        all_facts = facts
+        terms = set(re.findall(r'\w{4,}', ' '.join(row['text'].lower() for row in pending)))
+        terms -= {'клиент', 'ответить', 'нужно', 'сегодня', 'сделать', 'пожалуйста', 'сделка'}
+        # Keep each card field represented, plus older facts relevant to the new event.
+        chosen, per_field = {}, {}
+        for fact in reversed(all_facts):
+            if per_field.get(fact['field'], 0) < 4:
+                chosen[fact['id']] = fact
+                per_field[fact['field']] = per_field.get(fact['field'], 0) + 1
+        ranked = sorted(all_facts, key=lambda f: len(terms & set(re.findall(r'\w{4,}', f['text'].lower()))), reverse=True)
+        for fact in [f for f in ranked if terms & set(re.findall(r'\w{4,}', f['text'].lower()))][:12]:
+            chosen[fact['id']] = fact
+        for field in ('client', 'subject'):
+            first = next((f for f in all_facts if f['field'] == field), None)
+            if first:
+                chosen[first['id']] = first
+        facts = sorted(chosen.values(), key=lambda f: f['id'])
         # Recent sources plus older sources for the current ledger; no other topic is queried.
         source_ids = {fact['event_id'] for fact in facts}
         selected = history[:8] + [row for row in history[8:] if row['id'] in source_ids][:8]
@@ -104,7 +140,7 @@ class SalesStore:
             row['truncated'] = len(row['text']) > 16000
             row['original_length'] = len(row['text'])
             row['text'] = row['text'][:16000]
-        return dict(title=title, facts=facts, history=list(reversed(selected)),
+        return dict(title=title, facts=facts, omitted_facts=len(all_facts) - len(facts), history=list(reversed(selected)),
                     events=pending, previous_recommendations=[dict(id=r['id'], **json.loads(r['payload'])) for r in reversed(previous)])
 
     def complete(self, chat_id, topic_id, events, result):
