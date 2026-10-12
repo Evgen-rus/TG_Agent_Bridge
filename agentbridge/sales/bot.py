@@ -13,6 +13,7 @@ from agentbridge.telegram.polling import HeartbeatHTTPXRequest, PollingHeartbeat
 from .operations import restart_sales
 from .audio import AudioWorker, AUDIO_EXTENSIONS
 from .activity import SalesActivity
+from .storage import SALI_NAME, should_respond
 
 logger = logging.getLogger(__name__)
 HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
@@ -62,7 +63,7 @@ class SalesTelegram:
         command = text.split()[0].partition('@') if text.startswith('/') else ('', '', '')
         restart_requested = (command[0] == '/restart' and (not command[1] or
             command[2].lower() == (context.bot.username or '').lower())) or bool(
-            re.fullmatch(r'(?i)\s*сали[,! ]+перезапустись[.! ]*', text))
+            re.fullmatch(rf'(?i)\s*{SALI_NAME}[,! ]+перезапустись[.! ]*', text))
         if restart_requested:
             if authorization_pending or member.status not in {'administrator', 'creator'}:
                 return
@@ -112,12 +113,13 @@ class SalesTelegram:
             return
         reply = getattr(message, 'reply_to_message', None)
         addressed_elsewhere = bool(reply and getattr(reply, 'from_user', None)
+            and reply.message_id != topic
             and reply.from_user.id != context.bot.id)
-        other_mentions = re.findall(r'@([A-Za-z0-9_]+)', text)
-        mentions_sali = any(name.lower() == (context.bot.username or '').lower() for name in other_mentions)
-        explicit = mentions_sali or bool(re.search(r'(?i)\bсали\b', text))
-        quiet = bool(re.fullmatch(r'(?i)(спасибо|ок|окей|понял[аи]?|принято|\+)[.! ]*', text))
-        respond = explicit or not (quiet or addressed_elsewhere or (other_mentions and not mentions_sali))
+        routing = dict(bot_username=context.bot.username or '', addressed_elsewhere=addressed_elsewhere)
+        respond = should_respond(text, **routing)
+        if metadata is not None:
+            metadata['routing'] = routing
+            respond = True  # Decide from the caption and transcript after STT.
         await asyncio.to_thread(self.service.store.ingest,
             update_id=update.update_id, chat_id=self.chat_id, topic_id=topic,
             title=title or f'Тема {topic}', message_id=message.message_id,

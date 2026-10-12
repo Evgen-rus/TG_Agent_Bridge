@@ -16,6 +16,17 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+SALI_NAME = r'(?:сал{1,2}и|sal{1,2}[iy])'
+
+
+def should_respond(text, bot_username, addressed_elsewhere=False):
+    mentions = re.findall(r'@([A-Za-z0-9_]+)', text)
+    mentions_sali = any(name.lower() == bot_username.lower() for name in mentions)
+    explicit = mentions_sali or bool(re.search(rf'(?i)\b{SALI_NAME}\b', text))
+    quiet = bool(re.fullmatch(r'(?i)\s*(спасибо|ок|окей|понял[аи]?|принято|\+)\s*[.! ]*', text))
+    return explicit or not (quiet or addressed_elsewhere or (mentions and not mentions_sali))
+
+
 class SalesStore:
     """Separate SQLite database; raw events survive every model failure."""
 
@@ -390,6 +401,10 @@ class SalesStore:
             if not row or not transcript.strip():
                 return False
             text = ('Комментарий менеджера:\n' + row['caption'] + '\n\n' if row['caption'].strip() else '') + 'Распознанная речь:\n' + transcript
+            routing = json.loads(row['metadata']).get('routing')
+            if routing is not None:
+                respond = should_respond((row['caption'] + '\n' + transcript).strip(), **routing)
+                db.execute("UPDATE events SET processed=? WHERE id=? AND source='audio_pending' AND processed IN (0,1)", (int(not respond), row_id))
             db.execute("UPDATE audio_jobs SET transcript=?,state='transcribed',error_kind='',retry_at=0 WHERE event_id=?", (transcript, row_id))
             db.execute("UPDATE events SET text=?,source='audio_transcript' WHERE id=? AND source='audio_pending' AND processed IN (0,1)", (text, row_id))
             return True
