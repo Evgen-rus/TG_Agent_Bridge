@@ -10,6 +10,26 @@ from agentbridge.sales.service import SalesService, validate_result
 from agentbridge.sales.storage import SalesStore
 
 
+def test_profile_repair_cannot_silently_remove_fact_confirmation(tmp_path, monkeypatch):
+    from agentbridge.sales.provider import SalesCodexProvider
+    from test_sales_threads import SDK
+    from test_sales_communication import profile
+    store, context, result, old = seeded(tmp_path)
+    monkeypatch.setattr('agentbridge.sales.provider.Codex', SDK)
+    provider = SalesCodexProvider(model='fake', reasoning_effort='medium', cwd=tmp_path,
+        codex_home=tmp_path/'codex', knowledge='rules', store=store)
+    def run(thread, current, schema=None, **kwargs):
+        if 'profile_guard' in current:
+            return {**result, 'facts': [], 'communication_profiles': []}
+        return {**result, 'communication_profiles': [profile(event_id=2)]}
+    monkeypatch.setattr(provider, '_run', run)
+    validated = provider._analyze(context)
+    assert validated['facts'] == [] and len(validated['fact_reviews']) == 1
+    store.complete(-100, 10, context['events'], validated)
+    assert store.awaiting_fact_review(-100, 10)
+    assert active_facts(store)[0]['text'] == old['text']
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind,probe_calls', [('codex_turn_failed', 1), ('codex_usage_limit', 0), ('codex_network', 0)])
 async def test_restart_checks_old_validation_flag_without_bypassing_real_outage_backoff(tmp_path, kind, probe_calls):

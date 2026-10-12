@@ -226,6 +226,7 @@ class SalesCodexProvider(CodexProvider):
             raw = self._run(thread, model_context)
             payload = validate_result(raw, context, allow_fact_reviews=True)
             if raw.get('communication_profiles', []) != payload.get('communication_profiles', []):
+                fact_reviews = payload.get('fact_reviews', [])
                 # A neutralized profile must not survive as an unsupported claim in prose.
                 corrected_context = {**model_context,
                     'validated_profile_updates': payload.get('communication_profiles', []),
@@ -234,6 +235,11 @@ class SalesCodexProvider(CodexProvider):
                 if revised.get('communication_profiles'):
                     raise ValueError('Invalid communication profile repair')
                 payload = validate_result(revised, context, allow_fact_reviews=True)
+                for review in payload.get('fact_reviews', []):
+                    if review not in fact_reviews:
+                        fact_reviews.append(review)
+                if fact_reviews:
+                    payload['fact_reviews'] = fact_reviews
                 payload['communication_profiles'] = validate_result(raw, context, allow_fact_reviews=True).get('communication_profiles', [])
             if extracted:
                 merged = []
