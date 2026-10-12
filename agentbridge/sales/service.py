@@ -4,8 +4,10 @@ import asyncio
 import logging
 import re
 import time
+from contextlib import nullcontext
 from uuid import uuid4
 from typing import Protocol
+from .communication import validate_profile_updates
 
 logger = logging.getLogger(__name__)
 FIELDS = ('client', 'subject', 'stage', 'client_goal', 'needs', 'decision_makers',
@@ -19,8 +21,16 @@ class SalesProvider(Protocol):
 
 
 def validate_result(result, context, *, max_facts=25):
-    if not isinstance(result, dict) or set(result) != {'answer', 'facts', 'next_action', 'goal', 'basis'}:
+    if (not isinstance(result, dict) or
+            not {'answer', 'facts', 'next_action', 'goal', 'basis'} <= set(result) or
+            set(result) - {'answer', 'facts', 'next_action', 'goal', 'basis',
+                          'client_draft', 'communication_profiles', 'editing_failure'}):
         raise ValueError('Invalid sales result')
+    if 'client_draft' in result and type(result['client_draft']) is not bool:
+        raise ValueError('Invalid draft classification')
+    if result.get('editing_failure', '') not in {'', 'codex_auth', 'codex_network',
+            'codex_transport_closed', 'codex_sandbox_missing', 'codex_usage_limit', 'codex_turn_failed'}:
+        raise ValueError('Invalid editing failure')
     for key in ('answer', 'next_action', 'goal'):
         if not isinstance(result[key], str) or len(result[key]) > (8000 if key == 'answer' else 1000):
             raise ValueError('Invalid response text')
@@ -72,7 +82,10 @@ def validate_result(result, context, *, max_facts=25):
         elif any(all(old[key] == fact[key] for key in ('field', 'text', 'kind')) for old in existing.values()):
             continue
         clean.append(fact)
-    return {**result, 'facts': clean}
+    validated = {**result, 'facts': clean}
+    if 'communication_profiles' in result:
+        validated['communication_profiles'] = validate_profile_updates(result['communication_profiles'], context)
+    return validated
 
 
 class SalesService:
@@ -128,17 +141,28 @@ class SalesService:
             await self.recover()
             return True
 
-    async def process(self, chat_id, topic_id):
+    async def process(self, chat_id, topic_id, *, activity=None):
         async with self._lock:
             if not self.available():
                 return
             context = await asyncio.to_thread(self.store.context, chat_id, topic_id)
             if not context['events']:
                 return
+            model_task = None
             try:
-                result = validate_result(await self.provider.analyze(context), context, max_facts=2000)
-                await asyncio.to_thread(self.store.complete, chat_id, topic_id, context['events'], result)
+                async with activity(chat_id, topic_id) if activity else nullcontext():
+                    model_task = asyncio.create_task(self.provider.analyze(context))
+                    result = validate_result(await asyncio.shield(model_task), context, max_facts=2000)
+                    await asyncio.to_thread(self.store.complete, chat_id, topic_id, context['events'], result)
+                if result.get('editing_failure'):
+                    error = RuntimeError('sales_editor_failed')
+                    error.kind = result['editing_failure']
+                    await self.record_failure(error)
             except asyncio.CancelledError:
+                # Stop typing immediately, but retain the lock until the SDK worker exits.
+                if model_task:
+                    model_task.cancel()
+                    await asyncio.gather(model_task, return_exceptions=True)
                 raise
             except Exception as exc:
                 # Never log prompts, model output or transport exception contents.

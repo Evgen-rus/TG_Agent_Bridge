@@ -12,6 +12,7 @@ from agentbridge.telegram.media import message_text
 from agentbridge.telegram.polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
 from .operations import restart_sales
 from .audio import AudioWorker, AUDIO_EXTENSIONS
+from .activity import SalesActivity
 
 logger = logging.getLogger(__name__)
 HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
@@ -37,6 +38,7 @@ class SalesTelegram:
         self.service.system_chat_id = chat_id
         self.service.system_topic_id = system_topic_id
         self.audio_worker = audio_worker
+        self.activity = SalesActivity()
 
     async def ingest(self, update, context):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
@@ -233,7 +235,8 @@ class SalesTelegram:
                 topics = await asyncio.to_thread(self.service.store.pending_topics)
                 for chat_id, topic_id in topics:
                     if chat_id == self.chat_id:
-                        await self.service.process(chat_id, topic_id)
+                        await self.service.process(chat_id, topic_id,
+                            activity=lambda chat, topic: self.activity.scope(app.bot, chat, topic))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -243,7 +246,8 @@ class SalesTelegram:
     async def transcribe_pending(self, app):
         while True:
             try:
-                await self.audio_worker.run_once(app.bot, self.chat_id)
+                await self.audio_worker.run_once(app.bot, self.chat_id,
+                    activity=lambda chat, topic: self.activity.scope(app.bot, chat, topic))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -323,6 +327,7 @@ class SalesTelegram:
 
     async def stop(self, app):
         self.stopping = True
+        await self.activity.stop()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

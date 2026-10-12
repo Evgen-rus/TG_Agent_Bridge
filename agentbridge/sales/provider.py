@@ -13,6 +13,8 @@ from openai_codex.errors import InvalidRequestError, MethodNotFoundError
 from agentbridge.agents.codex import (CodexProvider, validate_structured_output_schema,
     _thread_is_unavailable, codex_failure_hint, limit_reset_hint)
 from .service import FIELDS, KINDS, validate_result
+from .editing import MANAGER_STYLE, EDITOR_INSTRUCTIONS, EDITOR_SCHEMA, REPLACEMENTS, apply_edits
+from .communication import PROFILE_UPDATES_SCHEMA, DISC_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
 _sales_turn = ContextVar('sales_diagnostic_turn', default=False)
@@ -48,9 +50,11 @@ def split_transcript(text, size=16000):
 
 SCHEMA = {
     'type': 'object', 'additionalProperties': False,
-    'required': ['answer', 'facts', 'next_action', 'goal', 'basis'],
+    'required': ['answer', 'facts', 'next_action', 'goal', 'basis', 'client_draft', 'communication_profiles'],
     'properties': {
         **{key: {'type': 'string'} for key in ('answer', 'next_action', 'goal')},
+        'client_draft': {'type': 'boolean'},
+        'communication_profiles': PROFILE_UPDATES_SCHEMA,
         'basis': {'type': 'array', 'items': {'type': 'integer'}},
         'facts': {'type': 'array', 'items': {
             'type': 'object', 'additionalProperties': False,
@@ -99,7 +103,7 @@ replaces=0 при дополнении. Чтобы заменить сущест
 omitted_facts>0 означает, что не все старые сведения переданы. Не объявляй их
 отсутствующими в истории: при нехватке источника попроси уточнение.
 Последнее содержательное взаимодействие бери из дат исходных событий, не придумай дату.
-"""
+""" + MANAGER_STYLE + DISC_INSTRUCTIONS
 TOOL_FREE = (
     'mcp_servers={}', 'plugins={}', 'features.apps=false', 'features.plugins=false',
     'features.shell_tool=false', 'features.unified_exec=false', 'features.js_repl=false',
@@ -115,9 +119,10 @@ class SalesCodexProvider(CodexProvider):
         super().__init__(model=model, reasoning_effort=reasoning_effort, cwd=cwd)
         self.codex_home, self.knowledge = codex_home, knowledge
         self.store = store
-        self.version = hashlib.sha256(('sales-v2\n' + INSTRUCTIONS + knowledge + model).encode()).hexdigest()
+        self.version = hashlib.sha256(('sales-v4\n' + INSTRUCTIONS + knowledge + model).encode()).hexdigest()
         self._last_failure = None
         validate_structured_output_schema(SCHEMA)
+        validate_structured_output_schema(EDITOR_SCHEMA)
 
     async def analyze(self, context):
         task = asyncio.create_task(asyncio.to_thread(self._analyze, context))
@@ -151,12 +156,12 @@ class SalesCodexProvider(CodexProvider):
             kind = 'codex_network'
         self._last_failure = SalesFailure(kind, limit_reset_hint(error))
 
-    def _run(self, thread, context, schema=SCHEMA):
+    def _run(self, thread, context, schema=SCHEMA, *, effort=None):
         self._last_failure = None
         token = _sales_turn.set(True)
         try:
             return self._run_json(thread, json.dumps(context, ensure_ascii=False), schema,
-                                  approval_mode=ApprovalMode.deny_all)
+                                  approval_mode=ApprovalMode.deny_all, effort=effort)
         except Exception as exc:
             if self._last_failure:
                 raise self._last_failure from None
@@ -208,21 +213,51 @@ class SalesCodexProvider(CodexProvider):
                 logger.info('event=sales_thread_started reason=%s', reason)
             else:
                 # The ledger snapshot is compact; avoid resending old conversation each turn.
-                model_context = {**model_context, 'history': [], 'previous_recommendations': model_context.get('previous_recommendations', [])[-2:]}
+                # Retain explicit DISC source lines when the model needs to update a profile.
+                model_context = {**model_context, 'history': model_context.get('history', []) if model_context.get('communication_profiles') else [], 'previous_recommendations': model_context.get('previous_recommendations', [])[-2:]}
             model_context['request_key'] = request_key
             model_context['retry_rule'] = 'This request may replay after a crash. SQLite snapshot is authoritative; return one result, never assume prior uncommitted advice was delivered.'
             if len(json.dumps(model_context, ensure_ascii=False)) > 180000:
                 raise SalesFailure('document_too_large')
-            payload = self._run(thread, model_context)
-            payload = validate_result(payload, context)
+            raw = self._run(thread, model_context)
+            payload = validate_result(raw, context)
+            if raw.get('communication_profiles', []) != payload.get('communication_profiles', []):
+                # A neutralized profile must not survive as an unsupported claim in prose.
+                corrected_context = {**model_context,
+                    'validated_profile_updates': payload.get('communication_profiles', []),
+                    'profile_guard': 'Предыдущая DISC-гипотеза не прошла проверку точных клиентских источников или уверенности. Пересоставь ответ и клиентский текст, учитывая ТОЛЬКО validated_profile_updates и сохранённые profiles. Не повторяй отклонённые наблюдения. При insufficient_evidence нейтральный тон. Не утверждай невалидированный стиль. communication_profiles=[]: приложение сохранит уже проверенные обновления.'}
+                revised = self._run(thread, corrected_context)
+                if revised.get('communication_profiles'):
+                    raise SalesFailure('codex_turn_failed')
+                payload = validate_result(revised, context)
+                payload['communication_profiles'] = validate_result(raw, context).get('communication_profiles', [])
             if extracted:
                 merged = []
                 for fact in extracted + payload['facts']:
                     if fact not in merged:
                         merged.append(fact)
                 payload = validate_result({**payload, 'facts': merged}, context, max_facts=2000)
+            if payload.get('client_draft'):
+                payload = self._edit(codex, payload)
             self.store.turn_result(request_key, payload)
             return payload
+
+    def _edit(self, codex, payload):
+        try:
+            thread = codex.thread_start(model=self.model, cwd=self.cwd,
+                sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all, ephemeral=True,
+                base_instructions=EDITOR_INSTRUCTIONS, developer_instructions=EDITOR_INSTRUCTIONS,
+                config={'model_reasoning_effort': 'low'})
+            edit = self._run(thread, dict(draft=payload['answer'], goal=payload['goal'],
+                next_action=payload['next_action'], allowed_replacements=REPLACEMENTS),
+                EDITOR_SCHEMA, effort='low')
+            result = apply_edits(payload, edit)
+            logger.info('event=sales_edit_completed changed=%s', result['answer'] != payload['answer'])
+            return result
+        except Exception as exc:
+            logger.warning('event=sales_edit_failed error_type=%s', type(exc).__name__)
+            # The finished analysis remains usable; provider backoff applies to future work.
+            return {**payload, 'editing_failure': getattr(exc, 'kind', None) or codex_failure_hint(exc)[0]}
 
     def _documents(self, codex, context):
         if sum(sum(1 for _ in split_transcript(e['text'])) for e in context['events'] if len(e['text']) > 16000) > 64:
@@ -243,7 +278,9 @@ class SalesCodexProvider(CodexProvider):
                            'events': [{**event, 'text': text, 'truncated': False}],
                            'document_part': dict(index=index, offset=offset),
                            'previous_part_tail': event['text'][max(0, offset-2000):offset],
-                           'task': 'Внутреннее извлечение материала, не рекомендация пользователю. Полностью прочитай эту часть. В answer подробно перечисли значимые изменения позиции, возражения, обещания, договорённости, ограничения, вопросы и их хронологию. facts содержит все новые существенные сведения с точными цитатами; максимум 25. Если больше, answer начни OVERFLOW. Не теряй факты середины или конца. Рекомендацию даст основной тред после всех частей.'}
+                           'task': 'Внутреннее извлечение материала, не рекомендация пользователю. client_draft=false. Полностью прочитай эту часть. В answer подробно перечисли значимые изменения позиции, возражения, обещания, договорённости, ограничения, вопросы и их хронологию. facts содержит все новые существенные сведения с точными цитатами; максимум 25. communication_profiles — только предварительные наблюдения этой части, не окончательный профиль. Окончательное объединение признаков и противоречий выполняет основной тред после ВСЕХ частей. Если больше, answer начни OVERFLOW. Не теряй факты середины или конца. Рекомендацию даст основной тред после всех частей.'}
+                if 'speech_offset' in event:
+                    partial['events'][0]['speech_offset'] = max(0, event['speech_offset'] - offset)
                 payload = self.store.chunk_result(event['id'], index, fingerprint)
                 if payload is None:
                     payload = validate_result(self._run(self._start(codex, ephemeral=True), partial), partial)
@@ -251,7 +288,8 @@ class SalesCodexProvider(CodexProvider):
                         raise SalesFailure('document_too_large')
                     self.store.chunk_result(event['id'], index, fingerprint, payload)
                 extracted.extend(payload['facts'])
-                summary = dict(part=index, offset=offset, length=len(text), summary=payload['answer'], facts=payload['facts'])
+                summary = dict(part=index, offset=offset, length=len(text), summary=payload['answer'], facts=payload['facts'],
+                    communication_observations=payload.get('communication_profiles', []))
                 summary_chars += len(json.dumps(summary, ensure_ascii=False))
                 if summary_chars > 120000:
                     raise SalesFailure('document_too_large')

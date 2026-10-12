@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,7 +67,7 @@ class AudioWorker:
         self.store.audio_failed(row.get("event_id", row.get("id")), reason,
                                 terminal=terminal or int(row.get("attempts", 0)) + 1 >= 5)
 
-    async def run_once(self, bot, chat_id: int):
+    async def run_once(self, bot, chat_id: int, *, activity=None):
         for row in self.store.audio_cleanup():
             path = self._path(row.get("path"))
             if path:
@@ -84,56 +85,60 @@ class AudioWorker:
             if int(row.get("file_size") or 0) > MAX_DOWNLOAD_BYTES:
                 self._failed(row, "audio_too_large", True)
                 continue
-            path = self._path(row.get("path"))
-            stage = "download"
-            try:
-                if not path or not path.is_file():
-                    remote = await bot.get_file(row["file_id"])
-                    if int(getattr(remote, "file_size", None) or 0) > MAX_DOWNLOAD_BYTES:
-                        self._failed(row, "audio_too_large", True)
-                        continue
-                    async def cached_file(_file_id):
-                        return remote
-                    dest = media_destination(self.media_dir, chat_id, row["message_id"], f"audio_{event_id}.bin", "audio")
-                    temp = dest.with_suffix(".part")
-                    downloaded = await download_telegram_file(SimpleNamespace(get_file=cached_file), row["file_id"], temp, attempts=1)
-                    if downloaded is None:
-                        self._failed(row, "audio_download_failed")
-                        continue
-                    if temp.stat().st_size > MAX_DOWNLOAD_BYTES:
-                        delete_media_file(temp)
-                        self._failed(row, "audio_too_large", True)
-                        continue
-                    temp.replace(dest)
-                    path = dest
-                    self.store.audio_downloaded(event_id, str(path))
-                size = path.stat().st_size
-                if not size or size > MAX_DOWNLOAD_BYTES:
-                    self._failed(row, "audio_empty" if not size else "audio_too_large", True)
-                    continue
-                with path.open("rb") as stream:
-                    suffix = audio_suffix(stream.read(4096))
-                if not suffix:
-                    self._failed(row, "audio_invalid", True)
-                    continue
-                if path.suffix != suffix:
-                    normalized = path.with_suffix(suffix)
-                    path.replace(normalized)
-                    path = normalized
-                    self.store.audio_downloaded(event_id, str(path))
-                if not self.api_key or not self.model:
-                    self._failed(row, "audio_auth", True)
-                    continue
-                stage = "stt"
-                transcript = await self.transcriber(path, api_key=self.api_key, model=self.model)
-                if not transcript or not transcript.strip():
-                    self._failed(row, "audio_transcription_empty", True)
-                    continue
-                self.store.audio_transcribed(event_id, transcript.strip())
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                reason, terminal = failure_reason(exc) if stage == "stt" else ("audio_download_failed", False)
-                if stage == 'download' and 'file is too big' in str(exc).lower():
-                    reason, terminal = 'audio_too_large', True
-                self._failed(row, reason, terminal)
+            async with activity(chat_id, row['topic_id']) if activity else nullcontext():
+                await self._process_row(bot, chat_id, row, event_id)
+
+    async def _process_row(self, bot, chat_id, row, event_id):
+        path = self._path(row.get("path"))
+        stage = "download"
+        try:
+            if not path or not path.is_file():
+                remote = await bot.get_file(row["file_id"])
+                if int(getattr(remote, "file_size", None) or 0) > MAX_DOWNLOAD_BYTES:
+                    self._failed(row, "audio_too_large", True)
+                    return
+                async def cached_file(_file_id):
+                    return remote
+                dest = media_destination(self.media_dir, chat_id, row["message_id"], f"audio_{event_id}.bin", "audio")
+                temp = dest.with_suffix(".part")
+                downloaded = await download_telegram_file(SimpleNamespace(get_file=cached_file), row["file_id"], temp, attempts=1)
+                if downloaded is None:
+                    self._failed(row, "audio_download_failed")
+                    return
+                if temp.stat().st_size > MAX_DOWNLOAD_BYTES:
+                    delete_media_file(temp)
+                    self._failed(row, "audio_too_large", True)
+                    return
+                temp.replace(dest)
+                path = dest
+                self.store.audio_downloaded(event_id, str(path))
+            size = path.stat().st_size
+            if not size or size > MAX_DOWNLOAD_BYTES:
+                self._failed(row, "audio_empty" if not size else "audio_too_large", True)
+                return
+            with path.open("rb") as stream:
+                suffix = audio_suffix(stream.read(4096))
+            if not suffix:
+                self._failed(row, "audio_invalid", True)
+                return
+            if path.suffix != suffix:
+                normalized = path.with_suffix(suffix)
+                path.replace(normalized)
+                path = normalized
+                self.store.audio_downloaded(event_id, str(path))
+            if not self.api_key or not self.model:
+                self._failed(row, "audio_auth", True)
+                return
+            stage = "stt"
+            transcript = await self.transcriber(path, api_key=self.api_key, model=self.model)
+            if not transcript or not transcript.strip():
+                self._failed(row, "audio_transcription_empty", True)
+                return
+            self.store.audio_transcribed(event_id, transcript.strip())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason, terminal = failure_reason(exc) if stage == "stt" else ("audio_download_failed", False)
+            if stage == 'download' and 'file is too big' in str(exc).lower():
+                reason, terminal = 'audio_too_large', True
+            self._failed(row, reason, terminal)

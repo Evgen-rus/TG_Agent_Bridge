@@ -9,6 +9,7 @@ import time
 from uuid import uuid4
 
 from agentbridge.telegram.formatter import split_owner_message
+from .communication import validate_profile_updates
 
 
 def encoded(value):
@@ -63,6 +64,14 @@ class SalesStore:
                     transcript TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
                     error_kind TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS communication_profile_revisions (
+                    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+                    contact_id TEXT NOT NULL, payload TEXT NOT NULL, event_ids TEXT NOT NULL,
+                    created_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS communication_profiles (
+                    chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, contact_id TEXT NOT NULL,
+                    revision_id INTEGER NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY(chat_id,topic_id,contact_id));
             """)
             columns = {row[1] for row in db.execute('PRAGMA table_info(deals)')}
             for name, definition in (('thread_id', 'TEXT'), ('thread_version', 'TEXT'),
@@ -140,6 +149,13 @@ class SalesStore:
                 chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending') ORDER BY id DESC LIMIT 200""", scope)]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE
                 chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 5""", scope)]
+            profiles = [json.loads(row[0]) for row in db.execute("""SELECT payload FROM communication_profiles
+                WHERE chat_id=? AND topic_id=? ORDER BY revision_id DESC LIMIT 8""", scope)]
+            self._speech_offsets(db, pending + history)
+            for profile in profiles:
+                invalidated = profile.get('invalidated_event_ids', [])
+                profile['omitted_invalidations'] = max(0, len(invalidated) - 50)
+                profile['invalidated_event_ids'] = invalidated[-50:]
         all_facts = facts
         terms = set(re.findall(r'\w{4,}', ' '.join(row['text'].lower() for row in pending)))
         terms -= {'клиент', 'ответить', 'нужно', 'сегодня', 'сделать', 'пожалуйста', 'сделка'}
@@ -159,6 +175,7 @@ class SalesStore:
         facts = sorted(chosen.values(), key=lambda f: f['id'])
         # Recent sources plus older sources for the current ledger; no other topic is queried.
         source_ids = {fact['event_id'] for fact in facts}
+        source_ids.update(item['event_id'] for profile in profiles for item in profile['evidence'])
         selected = history[:8] + [row for row in history[8:] if row['id'] in source_ids][:8]
         # Only historical excerpts are bounded; current documents are analyzed in full.
         for row in selected:
@@ -168,16 +185,18 @@ class SalesStore:
         for row in pending:
             row.update(truncated=False, original_length=len(row['text']))
         return dict(chat_id=chat_id, topic_id=topic_id, title=title, facts=facts, omitted_facts=len(all_facts) - len(facts), history=list(reversed(selected)),
-                    events=pending, previous_recommendations=[dict(id=r['id'], **json.loads(r['payload'])) for r in reversed(previous)])
+                    events=pending, communication_profiles=profiles,
+                    previous_recommendations=[dict(id=r['id'], **json.loads(r['payload'])) for r in reversed(previous)])
 
     def complete(self, chat_id, topic_id, events, result):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             ids = [row['id'] for row in events]
             marks = ','.join('?' for _ in ids)
-            pending = db.execute(f"SELECT count(*) FROM events WHERE id IN ({marks}) AND processed=0", ids).fetchone()[0]
+            pending = db.execute(f"SELECT count(*) FROM events WHERE id IN ({marks}) AND processed=0 AND chat_id=? AND topic_id=?", (*ids, chat_id, topic_id)).fetchone()[0]
             if pending != len(ids):
                 return False
+            self._complete_profiles(db, chat_id, topic_id, events, result.get('communication_profiles', []))
             for fact in result['facts']:
                 fact_id = db.execute("""INSERT INTO facts(chat_id,topic_id,field,text,kind,event_id,quote)
                     VALUES (?,?,?,?,?,?,?)""", (chat_id, topic_id, fact['field'], fact['text'],
@@ -192,6 +211,58 @@ class SalesStore:
             db.execute("UPDATE deals SET retry_at=0 WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
             db.execute('UPDATE deals SET thread_turns=thread_turns+1 WHERE chat_id=? AND topic_id=?', (chat_id, topic_id))
             return True
+
+    @staticmethod
+    def _speech_offsets(db, rows):
+        for row in rows:
+            if row['source'] != 'audio_transcript':
+                continue
+            job = db.execute('SELECT caption FROM audio_jobs WHERE event_id=?', (row['id'],)).fetchone()
+            caption = job['caption'] if job else ''
+            prefix = ('Комментарий менеджера:\n' + caption + '\n\n' if caption.strip() else '') + 'Распознанная речь:\n'
+            row['speech_offset'] = len(prefix) if job and row['text'].startswith(prefix) else len(row['text'])
+
+    @staticmethod
+    def _complete_profiles(db, chat_id, topic_id, events, updates):
+        if not updates:
+            return
+        scope = (chat_id, topic_id)
+        previous = {row['contact_id']: json.loads(row['payload']) for row in db.execute(
+            'SELECT contact_id,payload FROM communication_profiles WHERE chat_id=? AND topic_id=?', scope)}
+        # Re-check against persisted sources inside the same transaction as facts and delivery.
+        source_ids = {item['event_id'] for profile in updates for item in profile.get('evidence', [])}
+        history = []
+        if source_ids:
+            marks = ','.join('?' for _ in source_ids)
+            history = [dict(row) for row in db.execute(f'''SELECT * FROM events WHERE chat_id=?
+                AND topic_id=? AND processed IN (0,1) AND id IN ({marks})''', (*scope, *source_ids))]
+        ids = [row['id'] for row in events]
+        marks = ','.join('?' for _ in ids)
+        current = [dict(row) for row in db.execute(f'''SELECT * FROM events WHERE chat_id=?
+            AND topic_id=? AND processed=0 AND id IN ({marks})''', (*scope, *ids))]
+        SalesStore._speech_offsets(db, history + current)
+        validated = validate_profile_updates(updates, dict(events=current, history=history,
+                                                          communication_profiles=list(previous.values())))
+        for profile in validated:
+            contact = profile['contact_id']
+            invalidated = set(previous.get(contact, {}).get('invalidated_event_ids', []))
+            invalidated.update(profile['correction']['invalidated_event_ids'])
+            profile['invalidated_event_ids'] = sorted(invalidated)
+            payload = encoded(profile)
+            if previous.get(contact) == profile:
+                continue
+            revision = db.execute('''INSERT INTO communication_profile_revisions
+                (chat_id,topic_id,contact_id,payload,event_ids,created_at) VALUES (?,?,?,?,?,?)''',
+                (*scope, contact, payload, encoded(ids), time.time())).lastrowid
+            db.execute('''INSERT INTO communication_profiles VALUES (?,?,?,?,?)
+                ON CONFLICT(chat_id,topic_id,contact_id) DO UPDATE SET
+                revision_id=excluded.revision_id,payload=excluded.payload''', (*scope, contact, revision, payload))
+
+    def profile_history(self, chat_id, topic_id, contact_id):
+        with self.connect() as db:
+            return [dict(row, payload=json.loads(row['payload'])) for row in db.execute('''SELECT *
+                FROM communication_profile_revisions WHERE chat_id=? AND topic_id=? AND contact_id=?
+                ORDER BY id''', (chat_id, topic_id, contact_id))]
 
     def failed(self, chat_id, topic_id, first_event_id):
         with self.connect() as db:
