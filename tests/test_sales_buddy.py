@@ -86,6 +86,7 @@ async def test_model_error_and_invalid_patch_preserve_history_and_card(tmp_path,
     restarted = SalesStore(store.path)
     with restarted.connect() as db:
         db.execute('UPDATE deals SET retry_at=0')
+    restarted.op_set('codex_failure', None)
     await SalesService(restarted, Fake()).process(-100, 10)
     assert restarted.context(-100, 10)['facts']
     assert not restarted.pending_topics()
@@ -264,7 +265,7 @@ def test_settings_use_users_existing_names_and_isolated_paths(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_codex_tool_free_ephemeral_no_rick_context_or_credentials(tmp_path, monkeypatch):
+async def test_codex_tool_free_persistent_no_rick_context_or_credentials(tmp_path, monkeypatch):
     starts, configs, turns = [], [], []
     class Thread:
         id = 'sales-ephemeral'
@@ -285,10 +286,12 @@ async def test_codex_tool_free_ephemeral_no_rick_context_or_credentials(tmp_path
     def forbidden(*args, **kwargs):
         raise AssertionError('No commands allowed')
     monkeypatch.setattr('agentbridge.agents.codex.subprocess.run', forbidden)
+    store = SalesStore(tmp_path / 'sales.sqlite3')
+    ingest(store)
     provider = SalesCodexProvider(model='gpt-6-luna', reasoning_effort='medium', cwd=tmp_path,
-        codex_home=tmp_path / 'codex', knowledge='Один следующий шаг')
-    assert (await provider.analyze(dict(events=[])))['answer'] == 'Один вопрос?'
-    assert starts[0]['ephemeral'] is True
+        codex_home=tmp_path / 'codex', knowledge='Один следующий шаг', store=store)
+    assert (await provider.analyze(store.context(-100, 10)))['answer'] == 'Один вопрос?'
+    assert starts[0]['ephemeral'] is False
     assert starts[0]['sandbox'] == turns[0][1]['sandbox'] == Sandbox.read_only
     assert starts[0]['approval_mode'] == ApprovalMode.deny_all
     assert configs[0].env['TELEGRAM_BOT_TOKEN'] == configs[0].env['OPENAI_API_KEY'] == ''
@@ -303,7 +306,7 @@ async def test_codex_tool_free_ephemeral_no_rick_context_or_credentials(tmp_path
 def test_application_separate_token_handler_and_runtime(tmp_path):
     settings = SalesSettings('123456:fake-secret-for-test-only', -100, tmp_path, tmp_path / 'codex', 'model', 'medium')
     app = create_sales_application(settings, SalesService(SalesStore(tmp_path / 'sales.sqlite3'), Fake()))
-    assert len(app.handlers[0]) == 1
+    assert len(app.handlers[0]) == 2
     assert app.post_init and app.post_stop
     assert not (tmp_path / 'agentbridge.sqlite3').exists()
 
@@ -328,12 +331,12 @@ async def test_cancelled_analysis_is_recoverable(tmp_path):
     assert len(reopened.deliveries()) == 1
 
 
-def test_long_original_is_retained_with_explicit_excerpt_flag(tmp_path):
+def test_long_current_original_is_available_in_full(tmp_path):
     store = SalesStore(tmp_path / 'sales.sqlite3')
     text = 'А' * 20000
     ingest(store, text=text)
     event = store.context(-100, 10)['events'][0]
-    assert len(event['text']) == 16000 and event['truncated'] is True
+    assert len(event['text']) == 20000 and event['truncated'] is False
     assert event['original_length'] == 20000
     with store.connect() as db:
         assert db.execute('SELECT text FROM events').fetchone()[0] == text
@@ -371,7 +374,7 @@ async def test_membership_failure_persists_and_recovers_without_leaking_to_model
 async def test_attachment_caption_never_implies_read_contents(tmp_path):
     store = SalesStore(tmp_path / 'sales.sqlite3')
     adapter = SalesTelegram(-100, SalesService(store, Fake()))
-    await adapter.ingest(update(text='', caption='Вот КП, посмотри', document=NS(file_id='fake')), NS(bot=Bot()))
+    await adapter.ingest(update(text='', caption='Вот КП, посмотри', document=NS(file_id='fake', file_name='offer.pdf')), NS(bot=Bot()))
     row = store.context(-100, 10)['events'][0]
     assert row['source'] == 'unsupported_attachment'
     assert 'не разобрано' in row['text'] and 'Вот КП' in row['text']

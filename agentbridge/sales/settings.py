@@ -15,6 +15,7 @@ class SalesSettings:
     codex_home: Path
     model: str
     effort: str
+    system_topic_id: int = 0
 
     @classmethod
     def load(cls, root: Path, env_file: Path | None = None):
@@ -34,6 +35,9 @@ class SalesSettings:
             raise ValueError('Sales Buddy runtime overlaps Rick')
         if runtime.is_relative_to(root.resolve()) and not runtime.is_relative_to(root / 'runtime' / 'sales_buddy'):
             raise ValueError('In this checkout, sales runtime must be under runtime/sales_buddy')
+        system_topic_id = int(values.get('SALES_BUDDY_SYSTEM_TOPIC_ID') or '0')
+        if system_topic_id < 0:
+            raise ValueError('Sales system topic must be zero (General) or a positive topic ID')
         return cls(token, chat_id, runtime, codex_home,
                    str(values.get('OWNER_SALES_BADDY_CODEX_MODEL') or 'gpt-6-luna'),
-                   str(values.get('OWNER_SALES_BADDY_CODEX_REASONING_EFFORT') or 'xhigh'))
+                   str(values.get('OWNER_SALES_BADDY_CODEX_REASONING_EFFORT') or 'xhigh'), system_topic_id)

@@ -1,0 +1,1 @@
+rick ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart sales-buddy.service

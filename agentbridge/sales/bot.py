@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import json
+import time
 
-from telegram.ext import Application, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 from agentbridge.telegram.media import message_text
-from agentbridge.telegram.polling import HeartbeatHTTPXRequest, PollingHeartbeat
+from agentbridge.telegram.polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
+from .operations import restart_sales
 
 logger = logging.getLogger(__name__)
-HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию или текст разговора. В этой теме я помню вашу сделку. Аудио и документы пока не разбираю — вставьте текст.'
+HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора или файл .txt/.md в UTF-8 (до 2 МБ). В этой теме я помню вашу сделку. Аудио и другие документы пока не разбираю. Администратор может запросить /restart с подтверждением.'
+MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 
 
 def member_allowed(member):
@@ -18,9 +23,18 @@ def member_allowed(member):
 
 
 class SalesTelegram:
-    def __init__(self, chat_id, service):
+    def __init__(self, chat_id, service, system_topic_id=0, heartbeat=None):
         self.chat_id, self.service = chat_id, service
         self.tasks = []
+        self.system_topic_id = system_topic_id
+        self.heartbeat = heartbeat or PollingHeartbeat()
+        self.run_id = None
+        self.restart_tasks = set()
+        self.delivery_lock = asyncio.Lock()
+        self.stopping = False
+        self.restart_verify_seconds = 15
+        self.service.system_chat_id = chat_id
+        self.service.system_topic_id = system_topic_id
 
     async def ingest(self, update, context):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
@@ -29,8 +43,7 @@ class SalesTelegram:
                 or getattr(message, 'sender_chat', None)):
             return
         topic = getattr(message, 'message_thread_id', None)
-        if not topic or not getattr(message, 'is_topic_message', False):
-            return
+        topic = topic or 0
         # Membership is the user-authorized access policy; fail closed on API failures.
         authorization_pending = False
         try:
@@ -42,6 +55,18 @@ class SalesTelegram:
             if not member_allowed(member):
                 return
         text = message_text(message)
+        command = text.split()[0].partition('@') if text.startswith('/') else ('', '', '')
+        restart_requested = (command[0] == '/restart' and (not command[1] or
+            command[2].lower() == (context.bot.username or '').lower())) or bool(
+            re.fullmatch(r'(?i)\s*сали[,! ]+перезапустись[.! ]*', text))
+        if restart_requested:
+            if authorization_pending or member.status not in {'administrator', 'creator'}:
+                return
+            await asyncio.to_thread(self.service.store.request_restart,
+                self.chat_id, topic, user.id, update.update_id)
+            return
+        if not topic or not getattr(message, 'is_topic_message', False):
+            return
         title = getattr(getattr(message, 'forum_topic_created', None), 'name', '')
         if title:
             text = f'Название сделки: {title}'
@@ -57,8 +82,17 @@ class SalesTelegram:
                     text=text, source='command', respond=False, response_text=HELP,
                     authorization_pending=authorization_pending)
             return
-        if any(getattr(message, kind, None) for kind in ('document', 'voice', 'audio', 'photo', 'video')):
+        source = 'telegram_text'
+        document = getattr(message, 'document', None)
+        if document and (document.file_name or '').lower().endswith(('.txt', '.md')):
+            if await asyncio.to_thread(self.service.store.event_seen, update.update_id):
+                return
+            text = json.dumps({'file_id': document.file_id, 'size': document.file_size,
+                'caption': text, 'filename': document.file_name}, ensure_ascii=False)
+            source = 'text_document_pending'
+        elif any(getattr(message, kind, None) for kind in ('document', 'voice', 'audio', 'photo', 'video')):
             text = '[Вложение не разобрано. Содержимое неизвестно.]' + ('\n' + text if text else '')
+            source = 'unsupported_attachment'
         if not text:
             return
         reply = getattr(message, 'reply_to_message', None)
@@ -75,7 +109,94 @@ class SalesTelegram:
             author_id=user.id, author=user.full_name, date=message.date.isoformat(),
             text=text, reply_to=getattr(reply, 'message_id', None), respond=respond,
             authorization_pending=authorization_pending,
-            source='unsupported_attachment' if text.startswith('[Вложение') else 'telegram_text')
+            source=source)
+
+    async def hydrate_documents(self, bot):
+        for row in await asyncio.to_thread(self.service.store.awaiting_documents, self.chat_id):
+            retry_key = f"document-retry:{row['id']}"
+            if (await asyncio.to_thread(self.service.store.op_get, retry_key, 0) or 0) > time.time():
+                continue
+            document = {}
+            try:
+                document = json.loads(row['text'])
+                if not document['size'] or document['size'] > MAX_TEXT_FILE_BYTES:
+                    raise ValueError('size')
+                remote = await bot.get_file(document['file_id'])
+                if remote.file_size and remote.file_size > MAX_TEXT_FILE_BYTES:
+                    raise ValueError('size')
+                payload = await remote.download_as_bytearray()
+                if len(payload) > MAX_TEXT_FILE_BYTES:
+                    raise ValueError('size')
+                body = bytes(payload).decode('utf-8-sig')
+                if '\x00' in body or not body.strip():
+                    raise ValueError('encoding')
+            except (UnicodeError, ValueError):
+                text = '[Текстовый файл не прочитан: требуется UTF-8, непустой текст и размер до 2 МБ.]'
+                source = 'unsupported_attachment'
+            except Exception as exc:
+                logger.warning('event=sales_document_deferred error_type=%s', type(exc).__name__)
+                await asyncio.to_thread(self.service.store.op_set, retry_key, time.time() + 60)
+                continue
+            else:
+                text = (document['caption'] + '\n\n' if document['caption'] else '') + body
+                source = 'text_document'
+            await asyncio.to_thread(self.service.store.op_set, f"document-source:{row['id']}", document)
+            await asyncio.to_thread(self.service.store.hydrate_document, row['id'], text, source)
+            await asyncio.to_thread(self.service.store.op_set, retry_key, None)
+
+    async def callback(self, update, context):
+        query, user, chat = update.callback_query, update.effective_user, update.effective_chat
+        if not query or not user or user.is_bot or not chat or chat.id != self.chat_id:
+            return
+        try:
+            member = await context.bot.get_chat_member(self.chat_id, user.id)
+        except Exception:
+            await query.answer('Не удалось проверить права. Попробуйте позже.', show_alert=True)
+            return
+        if member.status not in {'administrator', 'creator'}:
+            await query.answer('Перезапуск доступен администраторам.', show_alert=True)
+            return
+        match = re.fullmatch(r'sales_restart:(\d+)', query.data or '')
+        if not match:
+            return
+        marker = int(match.group(1))
+        row = await asyncio.to_thread(self.service.store.get_restart, marker)
+        message = getattr(query, 'message', None)
+        if (not row or row['chat_id'] != self.chat_id or not message
+                or (getattr(message, 'message_thread_id', None) or 0) != row['topic_id']
+                or message.message_id != row.get('confirmation_message_id')):
+            await query.answer('Подтверждение недоступно.')
+            return
+        if not await asyncio.to_thread(self.service.store.claim_restart, marker, user.id):
+            await query.answer('Подтверждение уже использовано или недоступно.')
+            return
+        try:
+            await query.answer('Запускаю перезапуск Сали.')
+        except Exception as exc:
+            logger.warning('event=sales_restart_callback_answer_failed error_type=%s', type(exc).__name__)
+        await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
+            f'restart-start:{marker}', 'Запускаю подтверждённый перезапуск Сали.')
+        task = asyncio.create_task(self.launch_restart(marker, context.bot))
+        self.restart_tasks.add(task)
+        task.add_done_callback(self.restart_tasks.discard)
+
+    async def launch_restart(self, marker, bot=None):
+        try:
+            if bot:
+                await self.deliver_once(bot)
+            await asyncio.to_thread(self.service.store.finish_restart, marker, 'launched')
+            await asyncio.to_thread(restart_sales)
+        except Exception as exc:
+            logger.warning('event=sales_restart_failed error_type=%s', type(exc).__name__)
+            await asyncio.to_thread(self.service.store.finish_restart, marker, 'failed')
+            await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
+                f'restart-failed:{marker}', 'Перезапуск Сали не разрешён или не удался. Сервис продолжает работу; проверьте отдельное разрешение systemd.')
+            return
+        await asyncio.sleep(self.restart_verify_seconds)
+        if not self.stopping:
+            await asyncio.to_thread(self.service.store.finish_restart, marker, 'failed')
+            await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
+                f'restart-unconfirmed:{marker}', 'Запрос перезапуска Сали принят, но остановка процесса не подтверждена. Сервис продолжает работать; проверьте systemd.')
 
     async def authorize_pending(self, bot):
         permissions = {}
@@ -93,6 +214,9 @@ class SalesTelegram:
         while True:
             try:
                 await self.authorize_pending(app.bot)
+                await self.hydrate_documents(app.bot)
+                if not self.service.available():
+                    await self.service.probe()
                 topics = await asyncio.to_thread(self.service.store.pending_topics)
                 for chat_id, topic_id in topics:
                     if chat_id == self.chat_id:
@@ -106,22 +230,34 @@ class SalesTelegram:
     async def deliver_pending(self, app):
         while True:
             try:
-                blocked = set()
-                for row in await asyncio.to_thread(self.service.store.deliveries):
-                    if row['chat_id'] != self.chat_id or row['topic_id'] in blocked:
-                        continue
-                    try:
-                        result = await app.bot.send_message(chat_id=self.chat_id,
-                            message_thread_id=row['topic_id'], text=row['text'])
-                        await asyncio.to_thread(self.service.store.delivered, row['id'], result.message_id)
-                    except Exception as exc:
-                        blocked.add(row['topic_id'])
-                        logger.warning('event=sales_delivery_failed error_type=%s', type(exc).__name__)
+                await self.deliver_once(app.bot)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning('event=sales_delivery_failed error_type=%s', type(exc).__name__)
             await asyncio.sleep(3)
+
+    async def deliver_once(self, bot):
+        async with self.delivery_lock:
+            await self._deliver_once(bot)
+
+    async def _deliver_once(self, bot):
+        blocked = set()
+        for row in await asyncio.to_thread(self.service.store.deliveries):
+            if row['chat_id'] != self.chat_id or row['topic_id'] in blocked:
+                continue
+            try:
+                options = {}
+                if row['delivery_key'].startswith('restart-confirm:'):
+                    marker = row['delivery_key'].split(':')[1]
+                    options['reply_markup'] = InlineKeyboardMarkup([[InlineKeyboardButton(
+                        'Перезапустить', callback_data=f'sales_restart:{marker}')]])
+                result = await bot.send_message(chat_id=self.chat_id,
+                    message_thread_id=row['topic_id'] or None, text=row['text'], **options)
+                await asyncio.to_thread(self.service.store.delivered, row['id'], result.message_id)
+            except Exception as exc:
+                blocked.add(row['topic_id'])
+                logger.warning('event=sales_delivery_failed error_type=%s', type(exc).__name__)
 
     async def start(self, app):
         chat = await app.bot.get_chat(self.chat_id)
@@ -130,21 +266,53 @@ class SalesTelegram:
         member = await app.bot.get_chat_member(self.chat_id, app.bot.id)
         if member.status not in {'administrator', 'creator'}:
             raise ValueError('Sales Buddy must be a group administrator to receive natural messages')
+        self.run_id = await asyncio.to_thread(self.service.store.begin_run, self.chat_id, self.system_topic_id)
+        watchdog = PollingWatchdog(self.heartbeat, 10, 90, 20,
+            ['message', 'callback_query'], 0, fatal_state_key='sales_polling_fatal')
         self.tasks = [asyncio.create_task(self.analyze_pending(app)),
-                      asyncio.create_task(self.deliver_pending(app))]
+                      asyncio.create_task(self.deliver_pending(app)),
+                      asyncio.create_task(self.startup_probe(app)),
+                      asyncio.create_task(watchdog.run(app))]
+
+    async def startup_probe(self, app):
+        while not app.running or (getattr(app, 'updater', None) is not None and not app.updater.running):
+            await asyncio.sleep(.1)
+        if await asyncio.to_thread(self.service.store.op_get, f'startup-probed:{self.run_id}'):
+            return
+        await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
+            f'startup:{self.run_id}:telegram', 'Сали запущена. Telegram работает. Проверяю Codex.')
+        try:
+            ready = await self.service.probe()
+        except Exception:
+            ready = False
+        state = await asyncio.to_thread(self.service.store.op_get, 'codex_failure', {}) or {}
+        reason = {'codex_usage_limit': 'исчерпан лимит Codex', 'codex_auth': 'ошибка авторизации',
+            'codex_network': 'сетевая ошибка', 'codex_transport_closed': 'недоступен транспорт Codex',
+            'codex_sandbox_missing': 'недоступна песочница Codex',
+            'codex_turn_failed': 'ошибка модели или некорректный ответ'}.get(state.get('kind'), 'доступ не подтверждён')
+        text = ('Codex отвечает. Сали готова к работе.' if ready else
+                f'Сали запущена, Telegram работает, но Codex сейчас недоступен. Причина: {reason}. Данные сделок сохранены; анализ возобновится после проверки доступа.')
+        await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
+            f'startup:{self.run_id}:codex', text)
+        await asyncio.to_thread(self.service.store.op_set, f'startup-probed:{self.run_id}', True)
 
     async def stop(self, app):
+        self.stopping = True
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        if self.run_id and not app.bot_data.get('sales_polling_fatal'):
+            await asyncio.to_thread(self.service.store.end_run, self.run_id)
 
 
 def create_sales_application(settings, service):
-    adapter = SalesTelegram(settings.chat_id, service)
+    heartbeat = PollingHeartbeat()
+    adapter = SalesTelegram(settings.chat_id, service, settings.system_topic_id, heartbeat)
     app = (Application.builder().token(settings.token)
-        .get_updates_request(HeartbeatHTTPXRequest(PollingHeartbeat(), 30))
+        .get_updates_request(HeartbeatHTTPXRequest(heartbeat, 30))
         .post_init(adapter.start).post_stop(adapter.stop).build())
     app.add_handler(MessageHandler(filters.ALL, adapter.ingest))
+    app.add_handler(CallbackQueryHandler(adapter.callback, pattern=r'^sales_restart:'))
 
     async def error(update, context):
         logger.warning('event=sales_telegram_failed error_type=%s', type(context.error).__name__)

@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 import sqlite3
 import time
+from uuid import uuid4
 
 from agentbridge.telegram.formatter import split_owner_message
 
@@ -46,7 +47,22 @@ class SalesStore:
                     delivery_key TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
                     telegram_message_id INTEGER,
                     UNIQUE(delivery_key,part));
+                CREATE TABLE IF NOT EXISTS operations (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS document_chunks (
+                    event_id INTEGER NOT NULL, chunk INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(event_id,chunk,fingerprint));
+                CREATE TABLE IF NOT EXISTS turn_results (
+                    request_key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS restarts (
+                    id INTEGER PRIMARY KEY, update_id INTEGER UNIQUE NOT NULL,
+                    chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    created_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
             """)
+            columns = {row[1] for row in db.execute('PRAGMA table_info(deals)')}
+            for name, definition in (('thread_id', 'TEXT'), ('thread_version', 'TEXT'),
+                                     ('thread_turns', 'INTEGER NOT NULL DEFAULT 0')):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE deals ADD COLUMN {name} {definition}')
 
     @contextmanager
     def connect(self):
@@ -63,7 +79,7 @@ class SalesStore:
                respond=True, response_text=None, authorization_pending=False):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
+            if source != 'text_document_pending' and reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
                 AND telegram_message_id=? AND delivery_key LIKE 'recommendation:%'""",
                 (chat_id, topic_id, reply_to)).fetchone():
                 source = 'manager_feedback'
@@ -100,7 +116,7 @@ class SalesStore:
         with self.connect() as db:
             return [tuple(row) for row in db.execute("""SELECT d.chat_id,d.topic_id FROM deals d
                 WHERE d.retry_at<=? AND EXISTS (SELECT 1 FROM events e WHERE
-                e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0)
+                e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source!='text_document_pending')
                 ORDER BY d.retry_at,d.topic_id""", (time.time(),))]
 
     def context(self, chat_id, topic_id):
@@ -108,11 +124,11 @@ class SalesStore:
             scope = (chat_id, topic_id)
             title = db.execute("SELECT title FROM deals WHERE chat_id=? AND topic_id=?", scope).fetchone()[0]
             pending = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=0 ORDER BY id LIMIT 10""", scope)]
+                chat_id=? AND topic_id=? AND processed=0 AND source!='text_document_pending' ORDER BY id LIMIT 10""", scope)]
             facts = [dict(row) for row in db.execute("""SELECT * FROM facts WHERE
                 chat_id=? AND topic_id=? AND superseded_by IS NULL ORDER BY id""", scope)]
             history = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=1 ORDER BY id DESC LIMIT 200""", scope)]
+                chat_id=? AND topic_id=? AND processed=1 AND source!='text_document_pending' ORDER BY id DESC LIMIT 200""", scope)]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE
                 chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 5""", scope)]
         all_facts = facts
@@ -135,12 +151,14 @@ class SalesStore:
         # Recent sources plus older sources for the current ledger; no other topic is queried.
         source_ids = {fact['event_id'] for fact in facts}
         selected = history[:8] + [row for row in history[8:] if row['id'] in source_ids][:8]
-        # shortcut: bounded excerpts for long transcripts; original events remain in SQLite.
-        for row in pending + selected:
+        # Only historical excerpts are bounded; current documents are analyzed in full.
+        for row in selected:
             row['truncated'] = len(row['text']) > 16000
             row['original_length'] = len(row['text'])
             row['text'] = row['text'][:16000]
-        return dict(title=title, facts=facts, omitted_facts=len(all_facts) - len(facts), history=list(reversed(selected)),
+        for row in pending:
+            row.update(truncated=False, original_length=len(row['text']))
+        return dict(chat_id=chat_id, topic_id=topic_id, title=title, facts=facts, omitted_facts=len(all_facts) - len(facts), history=list(reversed(selected)),
                     events=pending, previous_recommendations=[dict(id=r['id'], **json.loads(r['payload'])) for r in reversed(previous)])
 
     def complete(self, chat_id, topic_id, events, result):
@@ -163,6 +181,7 @@ class SalesStore:
             self._queue(db, chat_id, topic_id, f'recommendation:{rec_id}', result['answer'])
             db.execute(f"UPDATE events SET processed=1 WHERE id IN ({marks})", ids)
             db.execute("UPDATE deals SET retry_at=0 WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
+            db.execute('UPDATE deals SET thread_turns=thread_turns+1 WHERE chat_id=? AND topic_id=?', (chat_id, topic_id))
             return True
 
     def failed(self, chat_id, topic_id, first_event_id):
@@ -185,3 +204,116 @@ class SalesStore:
     def delivered(self, row_id, message_id):
         with self.connect() as db:
             db.execute("UPDATE outbox SET telegram_message_id=? WHERE id=?", (message_id, row_id))
+
+    def thread(self, chat, topic):
+        with self.connect() as db:
+            row = db.execute('SELECT thread_id,thread_version,thread_turns FROM deals WHERE chat_id=? AND topic_id=?', (chat, topic)).fetchone()
+            return dict(row) if row else {}
+
+    def save_thread(self, chat, topic, thread_id, version, reason):
+        with self.connect() as db:
+            db.execute('UPDATE deals SET thread_id=?,thread_version=?,thread_turns=0 WHERE chat_id=? AND topic_id=?', (thread_id, version, chat, topic))
+            db.execute('INSERT OR REPLACE INTO operations VALUES (?,?)', (f'thread-reason:{chat}:{topic}', encoded(reason)))
+
+    def chunk_result(self, event_id, chunk, fingerprint, result=None):
+        with self.connect() as db:
+            if result is not None:
+                db.execute('INSERT OR REPLACE INTO document_chunks VALUES (?,?,?,?)', (event_id, chunk, fingerprint, encoded(result)))
+                return result
+            row = db.execute('SELECT payload FROM document_chunks WHERE event_id=? AND chunk=? AND fingerprint=?', (event_id, chunk, fingerprint)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def turn_result(self, key, result=None):
+        with self.connect() as db:
+            if result is not None:
+                db.execute('INSERT OR REPLACE INTO turn_results VALUES (?,?)', (key, encoded(result)))
+                return result
+            row = db.execute('SELECT payload FROM turn_results WHERE request_key=?', (key,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def op_get(self, key, default=None):
+        with self.connect() as db:
+            row = db.execute('SELECT value FROM operations WHERE key=?', (key,)).fetchone()
+            return json.loads(row[0]) if row else default
+
+    def op_set(self, key, value):
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO operations VALUES (?,?)', (key, encoded(value)))
+
+    def notice(self, chat, topic, key, text):
+        with self.connect() as db:
+            self._queue(db, chat, topic, key, text)
+
+    def codex_failed(self, state, chat, topic, text=None):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT OR REPLACE INTO operations VALUES (?,?)', ('codex_failure', encoded(state)))
+            if chat and text:
+                self._queue(db, chat, topic, f"unavailable:{state['episode']}:{state['kind']}", text)
+
+    def codex_recovered(self, chat, topic):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT value FROM operations WHERE key='codex_failure'").fetchone()
+            old = json.loads(row[0]) if row else None
+            if old:
+                db.execute("UPDATE operations SET value='null' WHERE key='codex_failure'")
+                db.execute('UPDATE deals SET retry_at=0')
+                if chat:
+                    self._queue(db, chat, topic, f"recovered:{old['episode']}", 'Codex снова доступен. Сали продолжает работу.')
+
+    def begin_run(self, chat, topic):
+        run_id = uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute("SELECT value FROM operations WHERE key='run'").fetchone()
+            if old:
+                previous = json.loads(old[0])
+                if not previous['clean']:
+                    self._queue(db, chat, topic, f"crash:{previous['id']}", 'Сали восстановилась после запуска без штатного завершения. Точная причина неизвестна; данные сделок сохранены.')
+            db.execute('INSERT OR REPLACE INTO operations VALUES (?,?)', ('run', encoded(dict(id=run_id, clean=False))))
+            db.execute("UPDATE restarts SET status='interrupted' WHERE status='claimed'")
+            db.execute("UPDATE restarts SET status='completed' WHERE status='launched'")
+        return run_id
+
+    def end_run(self, run_id):
+        with self.connect() as db:
+            db.execute('UPDATE operations SET value=? WHERE key=? AND value=?', (encoded(dict(id=run_id, clean=True)), 'run', encoded(dict(id=run_id, clean=False))))
+
+    def event_seen(self, update_id):
+        with self.connect() as db:
+            return bool(db.execute('SELECT 1 FROM events WHERE update_id=?', (update_id,)).fetchone())
+
+    def awaiting_documents(self, chat):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM events WHERE chat_id=? AND processed IN (0,1) AND source='text_document_pending' ORDER BY id LIMIT 10", (chat,))]
+
+    def hydrate_document(self, row_id, text, source='text_document'):
+        with self.connect() as db:
+            db.execute("UPDATE events SET text=?,source=? WHERE id=? AND processed IN (0,1) AND source='text_document_pending'", (text, source, row_id))
+
+    def request_restart(self, chat, topic, user, update):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT OR IGNORE INTO restarts(update_id,chat_id,topic_id,user_id,created_at) VALUES (?,?,?,?,?)', (update, chat, topic, user, time.time()))
+            row_id = db.execute('SELECT id FROM restarts WHERE update_id=?', (update,)).fetchone()[0]
+            self._queue(db, chat, topic, f'restart-confirm:{row_id}', 'Перезапустить Сали? Сделки сохранены. Подтвердите кнопкой; Рик продолжит работать.')
+            return row_id
+
+    def get_restart(self, row_id):
+        with self.connect() as db:
+            row = db.execute("""SELECT r.*, o.telegram_message_id AS confirmation_message_id FROM restarts r
+                LEFT JOIN outbox o ON o.delivery_key='restart-confirm:' || r.id AND o.part=0
+                WHERE r.id=?""", (row_id,)).fetchone()
+            return dict(row) if row else None
+
+    def claim_restart(self, row_id, user):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM restarts WHERE status IN ('claimed','launched')").fetchone():
+                return False
+            return bool(db.execute("UPDATE restarts SET status='claimed' WHERE id=? AND user_id=? AND status='pending' AND created_at>?", (row_id, user, time.time()-600)).rowcount)
+
+    def finish_restart(self, row_id, status):
+        with self.connect() as db:
+            db.execute("UPDATE restarts SET status=? WHERE id=? AND status IN ('claimed','launched')", (status, row_id))
