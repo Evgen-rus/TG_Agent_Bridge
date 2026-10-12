@@ -13,6 +13,12 @@ from .settings import SalesSettings
 from .storage import SalesStore
 
 
+def load_sales_knowledge(root: Path):
+    directory = root / 'knowledge' / 'sales_buddy'
+    return '\n\n'.join((directory / name).read_text(encoding='utf-8')
+                         for name in ('core.md', 'manager_tactics.md'))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Sales Buddy (Сали), separate from Rick')
     parser.add_argument('--env-file', type=Path)
@@ -29,7 +35,7 @@ def main():
     # Shared SDK runner can log transport error text; sales diagnostics contain only types.
     logging.getLogger('agentbridge.agents.codex').disabled = True
     logging.getLogger('openai_codex').setLevel(logging.CRITICAL)
-    knowledge = (root / 'knowledge' / 'sales_buddy' / 'core.md').read_text(encoding='utf-8')
+    knowledge = load_sales_knowledge(root)
     store = SalesStore(settings.runtime / 'sales.sqlite3')
     provider = SalesCodexProvider(model=settings.model, reasoning_effort=settings.effort,
                                  cwd=cwd, codex_home=settings.codex_home, knowledge=knowledge, store=store)

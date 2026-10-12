@@ -266,11 +266,11 @@ class SalesTelegram:
                 await self.hydrate_documents(app.bot)
                 if not self.service.available():
                     await self.service.probe()
-                topics = await asyncio.to_thread(self.service.store.pending_topics)
+                topics = await asyncio.to_thread(self.service.store.pending_topics, batched=True)
                 for chat_id, topic_id in topics:
                     if chat_id == self.chat_id:
                         await self.service.process(chat_id, topic_id,
-                            activity=lambda chat, topic: self.activity.scope(app.bot, chat, topic))
+                            activity=lambda chat, topic: self.activity.scope(app.bot, chat, topic), batch=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

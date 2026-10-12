@@ -7,6 +7,19 @@ code and tests are authoritative when they differ from this summary.
 
 ### Sales Buddy (Сали)
 
+Накопление Sales-only: events хранит received_at, deals — batch_cutoff_id.
+Runtime pending_topics(batched=True) атомарно фиксирует границу по 15 секундам
+тишины или 60 секундам накопления. process(batch=True) под lock заново проверяет
+границу и unresolved auth/audio/doc; context(batch=True) читает все текущие
+события до границы, без старого лимита 10, и не включает будущую историю.
+Новые сообщения принадлежат следующему окну; SQLite сохраняет окна после
+сбоев. 60 секунд ограничивают сбор ввода, не STT, модель или доставку.
+Обычный доступ context/pending_topics остаётся прежним для диагностики.
+Rick batching не менялся. Knowledge loader объединяет core.md и полную
+manager_tactics.md; hash инструкций/знаний обновляет тред штатно. Внутренний
+выбор тактики не расширяет output schema. Аудио без вопроса извлекает память
+и выдаёт подтверждение, без next_action/goal или готового клиентского текста.
+
 Спорная замена защищённого facts-поля без явного исправления менеджера теперь
 становится `fact_reviews` во внутреннем результате провайдера. SDK schema этого
 поля не предоставляет; код сначала проверяет field/kind/source/quote/replaces,

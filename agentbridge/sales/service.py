@@ -153,13 +153,13 @@ class SalesService:
             await self.recover()
             return True
 
-    async def process(self, chat_id, topic_id, *, activity=None):
+    async def process(self, chat_id, topic_id, *, activity=None, batch=False):
         async with self._lock:
             if not self.available():
                 return
             if await asyncio.to_thread(self.store.awaiting_fact_review, chat_id, topic_id):
                 return
-            context = await asyncio.to_thread(self.store.context, chat_id, topic_id)
+            context = await asyncio.to_thread(self.store.context, chat_id, topic_id, batch=batch)
             if not context['events']:
                 return
             model_task = None

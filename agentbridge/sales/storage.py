@@ -37,7 +37,7 @@ class SalesStore:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS deals (
                     chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, title TEXT NOT NULL,
-                    retry_at REAL NOT NULL DEFAULT 0, PRIMARY KEY(chat_id,topic_id));
+                    retry_at REAL NOT NULL DEFAULT 0, batch_cutoff_id INTEGER, PRIMARY KEY(chat_id,topic_id));
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY, update_id INTEGER NOT NULL UNIQUE,
                     chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
@@ -97,9 +97,14 @@ class SalesStore:
             """)
             columns = {row[1] for row in db.execute('PRAGMA table_info(deals)')}
             for name, definition in (('thread_id', 'TEXT'), ('thread_version', 'TEXT'),
-                                     ('thread_turns', 'INTEGER NOT NULL DEFAULT 0')):
+                                     ('thread_turns', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('batch_cutoff_id', 'INTEGER')):
                 if name not in columns:
                     db.execute(f'ALTER TABLE deals ADD COLUMN {name} {definition}')
+            event_columns = {row[1] for row in db.execute('PRAGMA table_info(events)')}
+            if 'received_at' not in event_columns:
+                # Legacy pending events are catch-up; receipt time is no longer recoverable.
+                db.execute('ALTER TABLE events ADD COLUMN received_at REAL NOT NULL DEFAULT 0')
 
     @contextmanager
     def connect(self):
@@ -116,24 +121,46 @@ class SalesStore:
                respond=True, response_text=None, authorization_pending=False, audio=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
+                       (chat_id, topic_id, title))
+            self._freeze_batch_if_due(db, chat_id, topic_id, time.time())
             if source not in {'text_document_pending', 'audio_pending'} and reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
                 AND telegram_message_id=? AND delivery_key LIKE 'recommendation:%'""",
                 (chat_id, topic_id, reply_to)).fetchone():
                 source = 'manager_feedback'
             inserted = db.execute("""INSERT OR IGNORE INTO events
-                (update_id,chat_id,topic_id,message_id,author_id,author,date,text,source,reply_to,processed)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (update_id, chat_id, topic_id, message_id,
+                (update_id,chat_id,topic_id,message_id,author_id,author,date,text,source,reply_to,processed,received_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (update_id, chat_id, topic_id, message_id,
                 author_id, author, date, text, source, reply_to,
-                (-1 if respond else -2) if authorization_pending else int(not respond))).rowcount
+                (-1 if respond else -2) if authorization_pending else int(not respond), time.time())).rowcount
             if inserted:
+                event_id = db.execute('SELECT id FROM events WHERE update_id=?', (update_id,)).fetchone()[0]
                 if audio:
-                    event_id = db.execute('SELECT id FROM events WHERE update_id=?', (update_id,)).fetchone()[0]
                     db.execute('INSERT INTO audio_jobs(event_id,metadata,caption) VALUES (?,?,?)', (event_id, encoded(audio), text))
-                db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
-                           (chat_id, topic_id, title))
                 if response_text and not authorization_pending:
                     self._queue(db, chat_id, topic_id, f'help:{update_id}', response_text)
             return bool(inserted)
+
+    @staticmethod
+    def _freeze_batch_if_due(db, chat_id, topic_id, now):
+        deal = db.execute('SELECT batch_cutoff_id FROM deals WHERE chat_id=? AND topic_id=?',
+                          (chat_id, topic_id)).fetchone()
+        if not deal or deal['batch_cutoff_id'] is not None:
+            return
+        first = db.execute("""SELECT id,received_at FROM events WHERE chat_id=? AND topic_id=?
+            AND processed IN (-1,0) ORDER BY id LIMIT 1""", (chat_id, topic_id)).fetchone()
+        if not first:
+            return
+        started = last = first['received_at']
+        cutoff = first['id']
+        for row in db.execute("""SELECT id,received_at FROM events WHERE chat_id=? AND topic_id=?
+            AND id>? AND processed!=2 ORDER BY id""", (chat_id, topic_id, cutoff)):
+            if row['received_at'] >= min(last + 15, started + 60):
+                break
+            last, cutoff = row['received_at'], row['id']
+        if now >= min(last + 15, started + 60):
+            db.execute('UPDATE deals SET batch_cutoff_id=? WHERE chat_id=? AND topic_id=?',
+                       (cutoff, chat_id, topic_id))
 
     def awaiting_authorization(self, chat_id):
         with self.connect() as db:
@@ -152,8 +179,42 @@ class SalesStore:
             if allowed and row['source'] == 'command':
                 self._queue(db, row['chat_id'], row['topic_id'], f"help:{row['update_id']}", help_text)
 
-    def pending_topics(self):
+    def pending_topics(self, *, batched=False):
         with self.connect() as db:
+            if batched:
+                db.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                ready = []
+                for deal in db.execute("SELECT chat_id,topic_id,retry_at FROM deals ORDER BY retry_at,topic_id").fetchall():
+                    chat, topic = deal['chat_id'], deal['topic_id']
+                    self._freeze_batch_if_due(db, chat, topic, now)
+                    if deal['retry_at'] > now:
+                        continue
+                    cutoff = db.execute("SELECT batch_cutoff_id FROM deals WHERE chat_id=? AND topic_id=?",
+                                        (chat, topic)).fetchone()[0]
+                    if cutoff is not None and not db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=?
+                        AND id<=? AND processed IN (-2,-1,0)""",
+                        (chat, topic, cutoff)).fetchone():
+                        db.execute("UPDATE deals SET batch_cutoff_id=NULL WHERE chat_id=? AND topic_id=?",
+                                   (chat, topic))
+                        cutoff = None
+                    if cutoff is None:
+                        self._freeze_batch_if_due(db, chat, topic, now)
+                        cutoff = db.execute("SELECT batch_cutoff_id FROM deals WHERE chat_id=? AND topic_id=?",
+                                            (chat, topic)).fetchone()[0]
+                    if cutoff is None:
+                        continue
+                    if db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND id<=?
+                        AND (processed<0 OR (processed IN (0,1) AND source IN
+                        ('text_document_pending','audio_pending'))) LIMIT 1""", (chat, topic, cutoff)).fetchone():
+                        continue
+                    if db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND id<=?
+                        AND processed=0 AND source NOT IN ('text_document_pending','audio_pending') LIMIT 1""",
+                        (chat, topic, cutoff)).fetchone():
+                        if not db.execute("""SELECT 1 FROM review_episodes WHERE chat_id=? AND topic_id=?
+                            AND state='pending'""", (chat, topic)).fetchone():
+                            ready.append((chat, topic))
+                return ready
             return [tuple(row) for row in db.execute("""SELECT d.chat_id,d.topic_id FROM deals d
                 WHERE d.retry_at<=? AND EXISTS (SELECT 1 FROM events e WHERE
                 e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source NOT IN ('text_document_pending','audio_pending'))
@@ -161,16 +222,33 @@ class SalesStore:
                     AND r.topic_id=d.topic_id AND r.state='pending')
                 ORDER BY d.retry_at,d.topic_id""", (time.time(),))]
 
-    def context(self, chat_id, topic_id):
+    def context(self, chat_id, topic_id, *, batch=False):
         with self.connect() as db:
+            if batch:
+                db.execute("BEGIN IMMEDIATE")
+                self._freeze_batch_if_due(db, chat_id, topic_id, time.time())
+                deal = db.execute("SELECT batch_cutoff_id,retry_at FROM deals WHERE chat_id=? AND topic_id=?",
+                                  (chat_id, topic_id)).fetchone()
+                cutoff = deal['batch_cutoff_id'] if deal else None
+                if cutoff is None or deal['retry_at'] > time.time() or db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND id<=?
+                    AND (processed<0 OR (processed IN (0,1) AND source IN
+                    ('text_document_pending','audio_pending'))) LIMIT 1""",
+                    (chat_id, topic_id, cutoff)).fetchone():
+                    return dict(events=[], history=[], facts=[], title='', chat_id=chat_id,
+                                topic_id=topic_id, omitted_facts=0, communication_profiles=[],
+                                previous_recommendations=[])
             scope = (chat_id, topic_id)
             title = db.execute("SELECT title FROM deals WHERE chat_id=? AND topic_id=?", scope).fetchone()[0]
             pending = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=0 AND source NOT IN ('text_document_pending','audio_pending') ORDER BY id LIMIT 10""", scope)]
+                chat_id=? AND topic_id=? AND processed=0 AND source NOT IN ('text_document_pending','audio_pending')
+                AND (?=0 OR id<=?) ORDER BY id""" + ("" if batch else " LIMIT 10"),
+                (*scope, cutoff if batch else 0, cutoff if batch else 0))]
             facts = [dict(row) for row in db.execute("""SELECT * FROM facts WHERE
                 chat_id=? AND topic_id=? AND superseded_by IS NULL ORDER BY id""", scope)]
             history = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending') ORDER BY id DESC LIMIT 200""", scope)]
+            chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending')
+            AND (?=0 OR id<=?) ORDER BY id DESC LIMIT 200""",
+                (*scope, cutoff if batch else 0, cutoff if batch else 0))]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE
                 chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 5""", scope)]
             profiles = [json.loads(row[0]) for row in db.execute("""SELECT payload FROM communication_profiles
@@ -244,6 +322,9 @@ class SalesStore:
         marks = ','.join('?' for _ in ids)
         db.execute(f'UPDATE events SET processed=1 WHERE id IN ({marks})', ids)
         db.execute('UPDATE deals SET retry_at=0,thread_turns=thread_turns+1 WHERE chat_id=? AND topic_id=?', (chat, topic))
+        db.execute('''UPDATE deals SET batch_cutoff_id=NULL WHERE chat_id=? AND topic_id=?
+            AND NOT EXISTS (SELECT 1 FROM events WHERE chat_id=? AND topic_id=?
+                AND id<=deals.batch_cutoff_id AND processed IN (-2,-1,0))''', (chat, topic, chat, topic))
 
     @classmethod
     def _stage_reviews(cls, db, chat, topic, events, result):
