@@ -162,6 +162,10 @@ class SalesTelegram:
             await asyncio.to_thread(self.service.store.op_set, retry_key, None)
 
     async def callback(self, update, context):
+        query = update.callback_query
+        if query and (query.data or '').startswith('sales_fact:'):
+            await self.fact_review_callback(update, context)
+            return
         query, user, chat = update.callback_query, update.effective_user, update.effective_chat
         if not query or not user or user.is_bot or not chat or chat.id != self.chat_id:
             return
@@ -214,6 +218,34 @@ class SalesTelegram:
             await asyncio.to_thread(self.service.store.finish_restart, marker, 'failed')
             await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
                 f'restart-unconfirmed:{marker}', 'Запрос перезапуска Сали принят, но остановка процесса не подтверждена. Сервис продолжает работать; проверьте systemd.')
+
+    async def fact_review_callback(self, update, context):
+        query, user, chat = update.callback_query, update.effective_user, update.effective_chat
+        message = getattr(query, 'message', None)
+        match = re.fullmatch(r'sales_fact:(accept|reject):(\d+)', query.data or '')
+        if (not match or not user or user.is_bot or not chat or chat.id != self.chat_id or not message
+                or getattr(message, 'sender_chat', None)):
+            await query.answer('Подтверждение недоступно.', show_alert=True)
+            return
+        try:
+            allowed = member_allowed(await context.bot.get_chat_member(self.chat_id, user.id))
+        except Exception:
+            await query.answer('Не удалось проверить права. Попробуйте позже.', show_alert=True)
+            return
+        if not allowed:
+            await query.answer('Решение доступно участникам группы.', show_alert=True)
+            return
+        status = await asyncio.to_thread(self.service.store.decide_fact_review,
+            int(match[2]), self.chat_id, getattr(message, 'message_thread_id', None) or 0,
+            message.message_id, user.id, match[1] == 'accept')
+        await query.answer({'accepted': 'Подтверждено.', 'rejected': 'Отклонено.',
+            'stale': 'Запись изменилась; подтверждение устарело.',
+            'already': 'Решение уже принято.', 'denied': 'Подтверждение недоступно.'}[status])
+        if status != 'denied':
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as exc:
+                logger.warning('event=sales_review_markup_failed error_type=%s', type(exc).__name__)
 
     async def authorize_pending(self, bot):
         permissions = {}
@@ -277,6 +309,11 @@ class SalesTelegram:
                 continue
             try:
                 options = {}
+                if row['delivery_key'].startswith('fact-review:'):
+                    marker = row['delivery_key'].split(':')[1]
+                    options['reply_markup'] = InlineKeyboardMarkup([[
+                        InlineKeyboardButton('Подтвердить', callback_data=f'sales_fact:accept:{marker}'),
+                        InlineKeyboardButton('Отклонить', callback_data=f'sales_fact:reject:{marker}')]])
                 if row['delivery_key'].startswith('restart-confirm:'):
                     marker = row['delivery_key'].split(':')[1]
                     options['reply_markup'] = InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -313,7 +350,9 @@ class SalesTelegram:
         await asyncio.to_thread(self.service.store.notice, self.chat_id, self.system_topic_id,
             f'startup:{self.run_id}:telegram', 'Сали запущена. Telegram работает. Проверяю Codex.')
         try:
-            ready = await self.service.probe()
+            prior = await asyncio.to_thread(self.service.store.op_get, 'codex_failure', {}) or {}
+            ready = (await self.service.probe(force=True) if prior.get('kind') == 'codex_turn_failed'
+                     else await self.service.probe())
         except Exception:
             ready = False
         state = await asyncio.to_thread(self.service.store.op_get, 'codex_failure', {}) or {}
@@ -345,7 +384,7 @@ def create_sales_application(settings, service):
         .get_updates_request(HeartbeatHTTPXRequest(heartbeat, 30))
         .post_init(adapter.start).post_stop(adapter.stop).build())
     app.add_handler(MessageHandler(filters.ALL, adapter.ingest))
-    app.add_handler(CallbackQueryHandler(adapter.callback, pattern=r'^sales_restart:'))
+    app.add_handler(CallbackQueryHandler(adapter.callback, pattern=r'^(?:sales_restart:|sales_fact:)'))
 
     async def error(update, context):
         logger.warning('event=sales_telegram_failed error_type=%s', type(context.error).__name__)

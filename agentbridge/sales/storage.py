@@ -83,6 +83,17 @@ class SalesStore:
                     chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, contact_id TEXT NOT NULL,
                     revision_id INTEGER NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(chat_id,topic_id,contact_id));
+                CREATE TABLE IF NOT EXISTS review_episodes (
+                    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+                    event_ids TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    UNIQUE(chat_id,topic_id,event_ids));
+                CREATE UNIQUE INDEX IF NOT EXISTS review_episode_pending ON review_episodes(chat_id,topic_id)
+                    WHERE state='pending';
+                CREATE TABLE IF NOT EXISTS fact_reviews (
+                    id INTEGER PRIMARY KEY, episode_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, old_fact_id INTEGER NOT NULL,
+                    patch TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    decided_by INTEGER, decided_at REAL);
             """)
             columns = {row[1] for row in db.execute('PRAGMA table_info(deals)')}
             for name, definition in (('thread_id', 'TEXT'), ('thread_version', 'TEXT'),
@@ -146,6 +157,8 @@ class SalesStore:
             return [tuple(row) for row in db.execute("""SELECT d.chat_id,d.topic_id FROM deals d
                 WHERE d.retry_at<=? AND EXISTS (SELECT 1 FROM events e WHERE
                 e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source NOT IN ('text_document_pending','audio_pending'))
+                AND NOT EXISTS (SELECT 1 FROM review_episodes r WHERE r.chat_id=d.chat_id
+                    AND r.topic_id=d.topic_id AND r.state='pending')
                 ORDER BY d.retry_at,d.topic_id""", (time.time(),))]
 
     def context(self, chat_id, topic_id):
@@ -207,21 +220,124 @@ class SalesStore:
             pending = db.execute(f"SELECT count(*) FROM events WHERE id IN ({marks}) AND processed=0 AND chat_id=? AND topic_id=?", (*ids, chat_id, topic_id)).fetchone()[0]
             if pending != len(ids):
                 return False
-            self._complete_profiles(db, chat_id, topic_id, events, result.get('communication_profiles', []))
-            for fact in result['facts']:
-                fact_id = db.execute("""INSERT INTO facts(chat_id,topic_id,field,text,kind,event_id,quote)
-                    VALUES (?,?,?,?,?,?,?)""", (chat_id, topic_id, fact['field'], fact['text'],
-                    fact['kind'], fact['event_id'], fact['quote'])).lastrowid
-                if fact['replaces']:
-                    db.execute("UPDATE facts SET superseded_by=? WHERE id=? AND chat_id=? AND topic_id=?",
-                               (fact_id, fact['replaces'], chat_id, topic_id))
-            rec_id = db.execute("""INSERT INTO recommendations(chat_id,topic_id,event_ids,payload)
-                VALUES (?,?,?,?)""", (chat_id, topic_id, encoded(ids), encoded(result))).lastrowid
-            self._queue(db, chat_id, topic_id, f'recommendation:{rec_id}', result['answer'])
-            db.execute(f"UPDATE events SET processed=1 WHERE id IN ({marks})", ids)
-            db.execute("UPDATE deals SET retry_at=0 WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
-            db.execute('UPDATE deals SET thread_turns=thread_turns+1 WHERE chat_id=? AND topic_id=?', (chat_id, topic_id))
+            if db.execute("SELECT 1 FROM review_episodes WHERE chat_id=? AND topic_id=? AND state='pending'", (chat_id, topic_id)).fetchone():
+                return False
+            if result.get('fact_reviews'):
+                return self._stage_reviews(db, chat_id, topic_id, events, result)
+            self._apply_result(db, chat_id, topic_id, events, result)
             return True
+
+    @classmethod
+    def _apply_result(cls, db, chat, topic, events, result):
+        ids = [row['id'] for row in events]
+        cls._complete_profiles(db, chat, topic, events, result.get('communication_profiles', []))
+        for fact in result['facts']:
+            fact_id = db.execute('''INSERT INTO facts(chat_id,topic_id,field,text,kind,event_id,quote)
+                VALUES (?,?,?,?,?,?,?)''', (chat, topic, fact['field'], fact['text'],
+                fact['kind'], fact['event_id'], fact['quote'])).lastrowid
+            if fact['replaces']:
+                db.execute('UPDATE facts SET superseded_by=? WHERE id=? AND chat_id=? AND topic_id=?',
+                           (fact_id, fact['replaces'], chat, topic))
+        rec_id = db.execute('''INSERT INTO recommendations(chat_id,topic_id,event_ids,payload)
+            VALUES (?,?,?,?)''', (chat, topic, encoded(ids), encoded(result))).lastrowid
+        cls._queue(db, chat, topic, f'recommendation:{rec_id}', result['answer'])
+        marks = ','.join('?' for _ in ids)
+        db.execute(f'UPDATE events SET processed=1 WHERE id IN ({marks})', ids)
+        db.execute('UPDATE deals SET retry_at=0,thread_turns=thread_turns+1 WHERE chat_id=? AND topic_id=?', (chat, topic))
+
+    @classmethod
+    def _stage_reviews(cls, db, chat, topic, events, result):
+        from .service import validate_result
+        ids = [e['id'] for e in events]
+        marks = ','.join('?' for _ in ids)
+        sources = [dict(row) for row in db.execute(f'''SELECT * FROM events
+            WHERE chat_id=? AND topic_id=? AND processed=0 AND id IN ({marks})''', (chat, topic, *ids))]
+        old = [dict(row) for row in db.execute('SELECT * FROM facts WHERE chat_id=? AND topic_id=? AND superseded_by IS NULL', (chat, topic))]
+        # Re-check every fact against durable sources before creating owner-visible cards.
+        patches = validate_result(dict(answer='review', next_action='', goal='', basis=[],
+            facts=result['facts'], fact_reviews=result['fact_reviews']),
+            dict(events=sources, history=[], facts=old), max_facts=2000, allow_fact_reviews=True)
+        if not patches.get('fact_reviews'):
+            raise ValueError('Invalid fact review')
+        existing = db.execute("SELECT id FROM review_episodes WHERE chat_id=? AND topic_id=? AND (event_ids=? OR state='pending')",
+                              (chat, topic, encoded(ids))).fetchone()
+        if existing:
+            return False
+        result = {**result, 'facts': patches['facts'], 'fact_reviews': patches['fact_reviews']}
+        episode = db.execute('INSERT INTO review_episodes(chat_id,topic_id,event_ids,payload) VALUES (?,?,?,?)',
+                             (chat, topic, encoded(ids), encoded(result))).lastrowid
+        old = {row['id']: row for row in old}
+        for patch in patches['fact_reviews']:
+            review = db.execute('''INSERT INTO fact_reviews(episode_id,chat_id,topic_id,old_fact_id,patch)
+                VALUES (?,?,?,?,?)''', (episode, chat, topic, patch['replaces'], encoded(patch))).lastrowid
+            cls._queue(db, chat, topic, f'fact-review:{review}',
+                'Подтвердите изменение памяти сделки.\n\n'
+                f"Сейчас: {old[patch['replaces']]['text']}\n\n"
+                f"Предложение модели: {patch['text']}\n\nОснование: {patch['quote']}\n\n"
+                'Без подтверждения прежняя запись сохранится. Ответ и обновление памяти ждут решения по всем изменениям этого запроса.')
+        return True
+
+    def awaiting_fact_review(self, chat, topic):
+        with self.connect() as db:
+            return bool(db.execute("SELECT 1 FROM review_episodes WHERE chat_id=? AND topic_id=? AND state='pending'", (chat, topic)).fetchone())
+
+    def decide_fact_review(self, review_id, chat_id, topic_id, message_id, user_id, accept):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('''SELECT r.* FROM fact_reviews r JOIN outbox o
+                ON o.delivery_key='fact-review:'||r.id WHERE r.id=? AND r.chat_id=?
+                AND r.topic_id=? AND o.chat_id=? AND o.topic_id=? AND o.telegram_message_id=?''',
+                (review_id, chat_id, topic_id, chat_id, topic_id, message_id)).fetchone()
+            if not row:
+                return 'denied'
+            episode = db.execute('SELECT * FROM review_episodes WHERE id=?', (row['episode_id'],)).fetchone()
+            if row['state'] != 'pending' or episode['state'] != 'pending':
+                return 'already'
+            all_reviews = list(db.execute('SELECT * FROM fact_reviews WHERE episode_id=?', (episode['id'],)))
+            stale = any(not db.execute('''SELECT 1 FROM facts WHERE id=? AND chat_id=?
+                AND topic_id=? AND superseded_by IS NULL''', (r['old_fact_id'], chat_id, topic_id)).fetchone() for r in all_reviews)
+            status = 'stale' if stale else ('accepted' if accept else 'rejected')
+            db.execute('UPDATE fact_reviews SET state=?,decided_by=?,decided_at=? WHERE id=?',
+                       (status, user_id, time.time(), review_id))
+            if status == 'accepted' and db.execute("SELECT 1 FROM fact_reviews WHERE episode_id=? AND state='pending'", (episode['id'],)).fetchone():
+                return status
+            ids = json.loads(episode['event_ids'])
+            marks = ','.join('?' for _ in ids)
+            events = [dict(r) for r in db.execute(f'''SELECT * FROM events WHERE chat_id=? AND topic_id=?
+                AND processed=0 AND id IN ({marks})''', (chat_id, topic_id, *ids))]
+            if len(events) != len(ids):
+                status = 'stale'
+                db.execute("UPDATE fact_reviews SET state='stale' WHERE id=?", (review_id,))
+            result = json.loads(episode['payload'])
+            reviews = result.pop('fact_reviews')
+            if status == 'accepted':
+                if any(not db.execute('''SELECT 1 FROM facts WHERE id=? AND chat_id=? AND topic_id=?
+                        AND superseded_by IS NULL AND field=?''', (f['replaces'], chat_id, topic_id, f['field'])).fetchone()
+                        for f in result['facts'] + reviews if f['replaces']):
+                    status = 'stale'
+                    db.execute("UPDATE fact_reviews SET state='stale' WHERE id=?", (review_id,))
+            if status == 'accepted':
+                result['facts'] += reviews
+            else:
+                result.update(answer=('Запись памяти уже изменилась; подтверждение устарело.' if status == 'stale' else
+                    'Изменение отклонено. Прежние записи памяти сохранены.') +
+                    ' Ответ модели, опиравшийся на спорное изменение, не отправлен. Уточните данные или повторите вопрос.',
+                    facts=[], communication_profiles=[], goal='', next_action='', basis=[], client_draft=False)
+                db.execute("UPDATE fact_reviews SET state='cancelled' WHERE episode_id=? AND state='pending'", (episode['id'],))
+            db.execute('UPDATE review_episodes SET state=? WHERE id=?', (status, episode['id']))
+            if events:
+                self._apply_result(db, chat_id, topic_id, events, result)
+            else:
+                self._queue(db, chat_id, topic_id, f'review-stale:{episode["id"]}', result['answer'])
+            return status
+
+    def invalid_result(self, chat, topic, events):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for event in events:
+                db.execute('UPDATE events SET processed=3 WHERE id=? AND chat_id=? AND topic_id=? AND processed=0', (event['id'], chat, topic))
+            self._queue(db, chat, topic, f'validation:{events[0]["id"]}',
+                'Ответ модели не прошёл проверку. Исходные материалы сохранены; автоматические повторы этого запроса остановлены. Уточните данные или повторите вопрос.')
 
     @staticmethod
     def _speech_offsets(db, rows):

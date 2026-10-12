@@ -20,11 +20,12 @@ class SalesProvider(Protocol):
     async def analyze(self, context: dict) -> dict: ...
 
 
-def validate_result(result, context, *, max_facts=25):
+def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
     if (not isinstance(result, dict) or
             not {'answer', 'facts', 'next_action', 'goal', 'basis'} <= set(result) or
             set(result) - {'answer', 'facts', 'next_action', 'goal', 'basis',
-                          'client_draft', 'communication_profiles', 'editing_failure'}):
+                          'client_draft', 'communication_profiles', 'editing_failure'} -
+            ({'fact_reviews'} if allow_fact_reviews else set())):
         raise ValueError('Invalid sales result')
     if 'client_draft' in result and type(result['client_draft']) is not bool:
         raise ValueError('Invalid draft classification')
@@ -46,11 +47,13 @@ def validate_result(result, context, *, max_facts=25):
         raise ValueError('Invalid recommendation source')
     if result['next_action'].strip() and not result['basis']:
         raise ValueError('Action without source')
-    if not isinstance(result['facts'], list) or len(result['facts']) > max_facts:
+    pending_reviews = result.get('fact_reviews', [])
+    if (not isinstance(result['facts'], list) or not isinstance(pending_reviews, list) or
+            len(result['facts']) + len(pending_reviews) > max_facts):
         raise ValueError('Invalid card patch')
     replaced = set()
-    clean = []
-    for fact in result['facts']:
+    clean, reviews = [], []
+    for fact in result['facts'] + pending_reviews:
         if not isinstance(fact, dict) or set(fact) != {'field', 'text', 'kind', 'event_id', 'quote', 'replaces'}:
             raise ValueError('Invalid fact')
         if fact['field'] not in FIELDS or fact['kind'] not in KINDS:
@@ -72,9 +75,15 @@ def validate_result(result, context, *, max_facts=25):
             old = existing.get(old_id)
             if old is None or old_id in replaced or old['field'] != fact['field']:
                 raise ValueError('Cross-deal or repeated replacement')
+            if all(old[key] == fact[key] for key in ('field', 'text', 'kind')):
+                continue
             # Facts are immutable unless the manager explicitly corrects or changes them.
             correction = re.search(r'(?i)исправ|уточн|ошиб|неверн|вместо|теперь|отмен|передум|измен|не .+ а ', sources[fact['event_id']])
             if old['kind'] not in {'unknown', 'assumption'} and not correction:
+                if allow_fact_reviews and fact['kind'] not in {'unknown', 'assumption'}:
+                    replaced.add(old_id)
+                    reviews.append(fact)
+                    continue
                 raise ValueError('Unsupported fact replacement')
             if old['kind'] not in {'unknown', 'assumption'} and fact['kind'] in {'unknown', 'assumption'}:
                 raise ValueError('Unsupported downgrade')
@@ -83,6 +92,9 @@ def validate_result(result, context, *, max_facts=25):
             continue
         clean.append(fact)
     validated = {**result, 'facts': clean}
+    validated.pop('fact_reviews', None)
+    if reviews:
+        validated['fact_reviews'] = reviews
     if 'communication_profiles' in result:
         validated['communication_profiles'] = validate_profile_updates(result['communication_profiles'], context)
     return validated
@@ -128,10 +140,10 @@ class SalesService:
     async def recover(self):
         self.store.codex_recovered(self.system_chat_id, self.system_topic_id)
 
-    async def probe(self):
+    async def probe(self, *, force=False):
         async with self._lock:
             state = self.store.op_get('codex_failure')
-            if state and state['retry_at'] > time.time():
+            if state and state['retry_at'] > time.time() and not force:
                 return False
             try:
                 await self.provider.probe()
@@ -145,6 +157,8 @@ class SalesService:
         async with self._lock:
             if not self.available():
                 return
+            if await asyncio.to_thread(self.store.awaiting_fact_review, chat_id, topic_id):
+                return
             context = await asyncio.to_thread(self.store.context, chat_id, topic_id)
             if not context['events']:
                 return
@@ -152,7 +166,7 @@ class SalesService:
             try:
                 async with activity(chat_id, topic_id) if activity else nullcontext():
                     model_task = asyncio.create_task(self.provider.analyze(context))
-                    result = validate_result(await asyncio.shield(model_task), context, max_facts=2000)
+                    result = validate_result(await asyncio.shield(model_task), context, max_facts=2000, allow_fact_reviews=True)
                     await asyncio.to_thread(self.store.complete, chat_id, topic_id, context['events'], result)
                 if result.get('editing_failure'):
                     error = RuntimeError('sales_editor_failed')
@@ -167,6 +181,13 @@ class SalesService:
             except Exception as exc:
                 # Never log prompts, model output or transport exception contents.
                 logger.warning('event=sales_analysis_failed error_type=%s', type(exc).__name__)
+                if isinstance(exc, ValueError) or getattr(exc, 'kind', '') == 'codex_turn_failed':
+                    reason = {'Fact has no current source': 'invalid_fact_source',
+                              'Unsupported downgrade': 'unsupported_downgrade',
+                              'Cross-deal or repeated replacement': 'invalid_replacement'}.get(str(exc), 'invalid_result')
+                    logger.warning('event=sales_validation_failed reason=%s', reason)
+                    await asyncio.to_thread(self.store.invalid_result, chat_id, topic_id, context['events'])
+                    return
                 await self.record_failure(exc)
                 await asyncio.to_thread(self.store.failed, chat_id, topic_id, context['events'][0]['id'])
                 if getattr(exc, 'kind', '') == 'document_too_large':

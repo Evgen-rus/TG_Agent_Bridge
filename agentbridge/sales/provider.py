@@ -96,6 +96,10 @@ replaces=0 при дополнении. Чтобы заменить сущест
 новое событие явно исправляет или меняет прежнее утверждение (исправление/уточнение/
 теперь/отмена). Без основания сохраняй прежнее и обозначай противоречие в answer.
 Нельзя заменять факт предположением. Поля unknowns имеют kind=unknown.
+Не предлагай replaces для простого пересказа уже известного факта. Если текущий
+запрос не содержит новых сведений, facts=[]. Спорная замена подтверждённой записи
+без явного исправления менеджером требует отдельного Telegram-подтверждения;
+до него запись и весь ответ остаются предложением, не согласованным результатом.
 История рекомендаций и ответы менеджера на них помогают выбрать следующий ход;
 не считай совет выполненным без сообщения менеджера, результат — без реакции клиента.
 Если truncated=true, ты видишь только начало материала. Скажи об этом коротко
@@ -188,7 +192,7 @@ class SalesCodexProvider(CodexProvider):
         request_key = hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         cached = self.store.turn_result(request_key)
         if cached is not None:
-            return validate_result(cached, context, max_facts=2000)
+            return validate_result(cached, context, max_facts=2000, allow_fact_reviews=True)
         chat, topic = context['chat_id'], context['topic_id']
         saved = self.store.thread(chat, topic)
         with Codex(config=self._config()) as codex:
@@ -220,7 +224,7 @@ class SalesCodexProvider(CodexProvider):
             if len(json.dumps(model_context, ensure_ascii=False)) > 180000:
                 raise SalesFailure('document_too_large')
             raw = self._run(thread, model_context)
-            payload = validate_result(raw, context)
+            payload = validate_result(raw, context, allow_fact_reviews=True)
             if raw.get('communication_profiles', []) != payload.get('communication_profiles', []):
                 # A neutralized profile must not survive as an unsupported claim in prose.
                 corrected_context = {**model_context,
@@ -228,15 +232,15 @@ class SalesCodexProvider(CodexProvider):
                     'profile_guard': 'Предыдущая DISC-гипотеза не прошла проверку точных клиентских источников или уверенности. Пересоставь ответ и клиентский текст, учитывая ТОЛЬКО validated_profile_updates и сохранённые profiles. Не повторяй отклонённые наблюдения. При insufficient_evidence нейтральный тон. Не утверждай невалидированный стиль. communication_profiles=[]: приложение сохранит уже проверенные обновления.'}
                 revised = self._run(thread, corrected_context)
                 if revised.get('communication_profiles'):
-                    raise SalesFailure('codex_turn_failed')
-                payload = validate_result(revised, context)
-                payload['communication_profiles'] = validate_result(raw, context).get('communication_profiles', [])
+                    raise ValueError('Invalid communication profile repair')
+                payload = validate_result(revised, context, allow_fact_reviews=True)
+                payload['communication_profiles'] = validate_result(raw, context, allow_fact_reviews=True).get('communication_profiles', [])
             if extracted:
                 merged = []
                 for fact in extracted + payload['facts']:
                     if fact not in merged:
                         merged.append(fact)
-                payload = validate_result({**payload, 'facts': merged}, context, max_facts=2000)
+                payload = validate_result({**payload, 'facts': merged}, context, max_facts=2000, allow_fact_reviews=True)
             if payload.get('client_draft'):
                 payload = self._edit(codex, payload)
             self.store.turn_result(request_key, payload)
@@ -257,7 +261,8 @@ class SalesCodexProvider(CodexProvider):
         except Exception as exc:
             logger.warning('event=sales_edit_failed error_type=%s', type(exc).__name__)
             # The finished analysis remains usable; provider backoff applies to future work.
-            return {**payload, 'editing_failure': getattr(exc, 'kind', None) or codex_failure_hint(exc)[0]}
+            kind = getattr(exc, 'kind', None) or codex_failure_hint(exc)[0]
+            return payload if kind == 'codex_turn_failed' else {**payload, 'editing_failure': kind}
 
     def _documents(self, codex, context):
         if sum(sum(1 for _ in split_transcript(e['text'])) for e in context['events'] if len(e['text']) > 16000) > 64:
@@ -284,7 +289,7 @@ class SalesCodexProvider(CodexProvider):
                 payload = self.store.chunk_result(event['id'], index, fingerprint)
                 if payload is None:
                     raw = self._run(self._start(codex, ephemeral=True), partial)
-                    payload = validate_result({**raw, 'communication_profiles': []}, partial)
+                    payload = validate_result({**raw, 'communication_profiles': []}, partial, allow_fact_reviews=True)
                     # Role context may straddle a boundary; anchor it in the full saved source.
                     observations = [profile for profile in raw.get('communication_profiles', [])
                         if all(item['event_id'] == event['id'] and item['quote'] in text
@@ -294,7 +299,7 @@ class SalesCodexProvider(CodexProvider):
                     if payload['answer'].startswith('OVERFLOW'):
                         raise SalesFailure('document_too_large')
                     self.store.chunk_result(event['id'], index, fingerprint, payload)
-                extracted.extend(payload['facts'])
+                extracted.extend(payload['facts'] + payload.get('fact_reviews', []))
                 summary = dict(part=index, offset=offset, length=len(text), summary=payload['answer'], facts=payload['facts'],
                     communication_observations=payload.get('communication_profiles', []))
                 summary_chars += len(json.dumps(summary, ensure_ascii=False))
