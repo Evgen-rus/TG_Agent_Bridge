@@ -225,6 +225,8 @@ class SalesCodexProvider(CodexProvider):
             return payload
 
     def _documents(self, codex, context):
+        if sum(sum(1 for _ in split_transcript(e['text'])) for e in context['events'] if len(e['text']) > 16000) > 64:
+            raise SalesFailure('document_too_large')
         model_context = {**context, 'events': []}
         extracted, summary_chars, chunk_count = [], 0, 0
         for event in context['events']:

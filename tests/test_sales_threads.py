@@ -208,6 +208,7 @@ async def test_oversized_document_is_explicitly_incomplete_without_partial_recom
         assert db.execute('SELECT count(*) FROM recommendations').fetchone()[0] == 0
     assert any('полный анализ не завершён' in r['text'] for r in store.deliveries())
     assert not store.pending_topics()
+    assert SDK.turns == []  # Reject known oversize before spending model calls.
 
 
 @pytest.mark.asyncio
