@@ -356,7 +356,7 @@ async def test_saved_card_retries_delivery_after_restart(tmp_path, chat_registry
         async def set_my_commands(self, *args, **kwargs): pass
         async def send_message(self, **kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
+            if 'reply_markup' in kwargs and sum('reply_markup' in call for call in calls) == 1:
                 raise RuntimeError('fake Telegram failure')
             return SimpleNamespace(message_id=len(calls))
     for _ in range(2):

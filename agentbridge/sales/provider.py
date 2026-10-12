@@ -14,7 +14,7 @@ from agentbridge.agents.codex import (CodexProvider, validate_structured_output_
     _thread_is_unavailable, codex_failure_hint, limit_reset_hint)
 from .service import FIELDS, KINDS, validate_result
 from .editing import MANAGER_STYLE, EDITOR_INSTRUCTIONS, EDITOR_SCHEMA, REPLACEMENTS, apply_edits
-from .communication import PROFILE_UPDATES_SCHEMA, DISC_INSTRUCTIONS
+from .communication import PROFILE_UPDATES_SCHEMA, DISC_INSTRUCTIONS, validate_profile_updates
 
 logger = logging.getLogger(__name__)
 _sales_turn = ContextVar('sales_diagnostic_turn', default=False)
@@ -119,7 +119,7 @@ class SalesCodexProvider(CodexProvider):
         super().__init__(model=model, reasoning_effort=reasoning_effort, cwd=cwd)
         self.codex_home, self.knowledge = codex_home, knowledge
         self.store = store
-        self.version = hashlib.sha256(('sales-v4\n' + INSTRUCTIONS + knowledge + model).encode()).hexdigest()
+        self.version = hashlib.sha256(('sales-v4-context-roles\n' + INSTRUCTIONS + knowledge + model).encode()).hexdigest()
         self._last_failure = None
         validate_structured_output_schema(SCHEMA)
         validate_structured_output_schema(EDITOR_SCHEMA)
@@ -283,7 +283,14 @@ class SalesCodexProvider(CodexProvider):
                     partial['events'][0]['speech_offset'] = max(0, event['speech_offset'] - offset)
                 payload = self.store.chunk_result(event['id'], index, fingerprint)
                 if payload is None:
-                    payload = validate_result(self._run(self._start(codex, ephemeral=True), partial), partial)
+                    raw = self._run(self._start(codex, ephemeral=True), partial)
+                    payload = validate_result({**raw, 'communication_profiles': []}, partial)
+                    # Role context may straddle a boundary; anchor it in the full saved source.
+                    observations = [profile for profile in raw.get('communication_profiles', [])
+                        if all(item['event_id'] == event['id'] and item['quote'] in text
+                               for item in profile.get('evidence', []))]
+                    payload['communication_profiles'] = validate_profile_updates(observations,
+                        {**context, 'history': [], 'events': [event]})
                     if payload['answer'].startswith('OVERFLOW'):
                         raise SalesFailure('document_too_large')
                     self.store.chunk_result(event['id'], index, fingerprint, payload)
