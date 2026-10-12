@@ -37,7 +37,10 @@ def test_topic_scopes_repeat_and_deduplicate(monkeypatch):
                 assert activity.tasks[(-100, 10)] == [task, 2]
                 async with activity.scope(bot, -100, 20):
                     assert len(activity.tasks) == 2
-                    await asyncio.sleep(.035)
+                    async with asyncio.timeout(1):
+                        while any(sum(a['message_thread_id'] == topic for a in bot.actions) < 3
+                                  for topic in (10, 20)):
+                            await asyncio.sleep(.005)
                 assert len(activity.tasks) == 1
             assert activity.tasks[(-100, 10)] == [task, 1]
         assert not activity.tasks
