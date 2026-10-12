@@ -16,6 +16,8 @@ class SalesSettings:
     model: str
     effort: str
     system_topic_id: int = 0
+    openai_api_key: str = field(default='', repr=False)
+    transcription_model: str = 'gpt-4o-mini-transcribe'
 
     @classmethod
     def load(cls, root: Path, env_file: Path | None = None):
@@ -40,4 +42,6 @@ class SalesSettings:
             raise ValueError('Sales system topic must be zero (General) or a positive topic ID')
         return cls(token, chat_id, runtime, codex_home,
                    str(values.get('OWNER_SALES_BADDY_CODEX_MODEL') or 'gpt-6-luna'),
-                   str(values.get('OWNER_SALES_BADDY_CODEX_REASONING_EFFORT') or 'xhigh'), system_topic_id)
+                   str(values.get('OWNER_SALES_BADDY_CODEX_REASONING_EFFORT') or 'xhigh'), system_topic_id,
+                   str(values.get('OPENAI_API_KEY') or '').strip(),
+                   str(values.get('TRANSCRIPTION_MODEL') or 'gpt-4o-mini-transcribe').strip())

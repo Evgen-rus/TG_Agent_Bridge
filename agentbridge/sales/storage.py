@@ -57,6 +57,12 @@ class SalesStore:
                     id INTEGER PRIMARY KEY, update_id INTEGER UNIQUE NOT NULL,
                     chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
                     created_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+                CREATE TABLE IF NOT EXISTS audio_jobs (
+                    event_id INTEGER PRIMARY KEY, metadata TEXT NOT NULL,
+                    caption TEXT NOT NULL, path TEXT NOT NULL DEFAULT '',
+                    transcript TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
+                    error_kind TEXT NOT NULL DEFAULT '');
             """)
             columns = {row[1] for row in db.execute('PRAGMA table_info(deals)')}
             for name, definition in (('thread_id', 'TEXT'), ('thread_version', 'TEXT'),
@@ -76,10 +82,10 @@ class SalesStore:
 
     def ingest(self, *, update_id, chat_id, topic_id, title, message_id,
                author_id, author, date, text, source="telegram_text", reply_to=None,
-               respond=True, response_text=None, authorization_pending=False):
+               respond=True, response_text=None, authorization_pending=False, audio=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if source != 'text_document_pending' and reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
+            if source not in {'text_document_pending', 'audio_pending'} and reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
                 AND telegram_message_id=? AND delivery_key LIKE 'recommendation:%'""",
                 (chat_id, topic_id, reply_to)).fetchone():
                 source = 'manager_feedback'
@@ -89,6 +95,9 @@ class SalesStore:
                 author_id, author, date, text, source, reply_to,
                 (-1 if respond else -2) if authorization_pending else int(not respond))).rowcount
             if inserted:
+                if audio:
+                    event_id = db.execute('SELECT id FROM events WHERE update_id=?', (update_id,)).fetchone()[0]
+                    db.execute('INSERT INTO audio_jobs(event_id,metadata,caption) VALUES (?,?,?)', (event_id, encoded(audio), text))
                 db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
                            (chat_id, topic_id, title))
                 if response_text and not authorization_pending:
@@ -116,7 +125,7 @@ class SalesStore:
         with self.connect() as db:
             return [tuple(row) for row in db.execute("""SELECT d.chat_id,d.topic_id FROM deals d
                 WHERE d.retry_at<=? AND EXISTS (SELECT 1 FROM events e WHERE
-                e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source!='text_document_pending')
+                e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source NOT IN ('text_document_pending','audio_pending'))
                 ORDER BY d.retry_at,d.topic_id""", (time.time(),))]
 
     def context(self, chat_id, topic_id):
@@ -124,11 +133,11 @@ class SalesStore:
             scope = (chat_id, topic_id)
             title = db.execute("SELECT title FROM deals WHERE chat_id=? AND topic_id=?", scope).fetchone()[0]
             pending = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=0 AND source!='text_document_pending' ORDER BY id LIMIT 10""", scope)]
+                chat_id=? AND topic_id=? AND processed=0 AND source NOT IN ('text_document_pending','audio_pending') ORDER BY id LIMIT 10""", scope)]
             facts = [dict(row) for row in db.execute("""SELECT * FROM facts WHERE
                 chat_id=? AND topic_id=? AND superseded_by IS NULL ORDER BY id""", scope)]
             history = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=1 AND source!='text_document_pending' ORDER BY id DESC LIMIT 200""", scope)]
+                chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending') ORDER BY id DESC LIMIT 200""", scope)]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE
                 chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 5""", scope)]
         all_facts = facts
@@ -291,6 +300,63 @@ class SalesStore:
     def hydrate_document(self, row_id, text, source='text_document'):
         with self.connect() as db:
             db.execute("UPDATE events SET text=?,source=? WHERE id=? AND processed IN (0,1) AND source='text_document_pending'", (text, source, row_id))
+
+    def awaiting_audio(self, chat):
+        with self.connect() as db:
+            rows = db.execute("""SELECT a.*,e.chat_id,e.topic_id,e.message_id FROM audio_jobs a
+                JOIN events e ON e.id=a.event_id WHERE e.chat_id=? AND e.processed IN (0,1)
+                AND a.state IN ('pending','downloaded') AND a.retry_at<=? ORDER BY a.event_id LIMIT 10""", (chat, time.time()))
+            return [dict(dict(row), **json.loads(row['metadata'])) for row in rows]
+
+    def audio_downloaded(self, row_id, path):
+        with self.connect() as db:
+            db.execute("UPDATE audio_jobs SET path=?,state='downloaded' WHERE event_id=? AND state IN ('pending','downloaded')", (str(path), row_id))
+
+    def audio_transcribed(self, row_id, transcript):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT * FROM audio_jobs WHERE event_id=? AND state IN ('pending','downloaded')", (row_id,)).fetchone()
+            if not row or not transcript.strip():
+                return False
+            text = ('Комментарий менеджера:\n' + row['caption'] + '\n\n' if row['caption'].strip() else '') + 'Распознанная речь:\n' + transcript
+            db.execute("UPDATE audio_jobs SET transcript=?,state='transcribed',error_kind='',retry_at=0 WHERE event_id=?", (transcript, row_id))
+            db.execute("UPDATE events SET text=?,source='audio_transcript' WHERE id=? AND source='audio_pending' AND processed IN (0,1)", (text, row_id))
+            return True
+
+    def audio_failed(self, row_id, reason, terminal=False):
+        safe = {
+            'audio_too_large': 'Аудиофайл слишком большой для текущего способа загрузки. Лимит — 20 МБ. Пришлите сжатую запись или готовую транскрибацию.',
+            'audio_invalid': 'Не удалось прочитать формат аудио. Пришлите OGG/OPUS, MP3, M4A, WAV, WEBM или готовую транскрибацию.',
+            'audio_empty': 'Аудиофайл пуст. Пришлите другую запись или готовую транскрибацию.',
+            'audio_auth': 'Распознавание недоступно: проверьте настройку ключа OpenAI API Сали. Запись сохранена в очереди без анализа; после исправления пришлите её повторно.',
+            'audio_quota': 'Распознавание недоступно: исчерпана API-квота OpenAI. Запись не анализировалась; после восстановления API пришлите её повторно.',
+            'audio_request': 'API не смог принять эту запись или модель. Пришлите другую запись или готовую транскрибацию.',
+            'audio_transcription_empty': 'Не удалось распознать речь. Содержание звонка не анализировалось; пришлите другую запись или готовую транскрибацию.',
+        }
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("""SELECT a.*,e.chat_id,e.topic_id FROM audio_jobs a JOIN events e ON e.id=a.event_id
+                WHERE a.event_id=? AND a.state IN ('pending','downloaded')""", (row_id,)).fetchone()
+            if not row:
+                return
+            attempts = row['attempts'] + 1
+            terminal = terminal or attempts >= 5
+            state = 'failed' if terminal else row['state']
+            db.execute('UPDATE audio_jobs SET state=?,attempts=?,retry_at=?,error_kind=? WHERE event_id=?',
+                       (state, attempts, time.time() + min(3600, 60 * 2 ** min(attempts-1, 6)), reason if reason in set(safe) | {'audio_download_failed','audio_transcription_failed'} else 'audio_transcription_failed', row_id))
+            if terminal:
+                db.execute('UPDATE events SET processed=3 WHERE id=? AND processed IN (0,1)', (row_id,))
+            text = safe.get(reason, 'Не удалось разобрать аудио после ограниченных попыток. Содержание звонка не анализировалось. Пришлите запись повторно или готовую транскрибацию.' if terminal else 'Аудио сохранено в очереди. Распознавание временно недоступно; повторю позже. Коммерческий анализ ещё не выполнен.')
+            self._queue(db, row['chat_id'], row['topic_id'], f"audio-error:{row_id}:{'terminal' if terminal else 'retry'}", text)
+
+    def audio_cleanup(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("""SELECT a.event_id,a.path FROM audio_jobs a JOIN events e ON e.id=a.event_id
+                WHERE a.path!='' AND (a.state='failed' OR (a.state='transcribed' AND e.processed=1))""")]
+
+    def audio_cleaned(self, row_id):
+        with self.connect() as db:
+            db.execute("UPDATE audio_jobs SET path='' WHERE event_id=?", (row_id,))
 
     def request_restart(self, chat, topic, user, update):
         with self.connect() as db:

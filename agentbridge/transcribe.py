@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ async def transcribe_audio_bytes(
 async def transcribe_audio_file(path, *, api_key: str, model: str) -> str:
     """Читает уже скачанный файл с диска и транскрибирует его содержимое."""
     data = await asyncio.to_thread(_read_bytes, path)
-    return await transcribe_audio_bytes(data, api_key=api_key, model=model)
+    return await transcribe_audio_bytes(data, api_key=api_key, model=model, filename=Path(path).name)
 
 
 def _read_bytes(path) -> bytes:

@@ -11,9 +11,10 @@ from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filt
 from agentbridge.telegram.media import message_text
 from agentbridge.telegram.polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
 from .operations import restart_sales
+from .audio import AudioWorker, AUDIO_EXTENSIONS
 
 logger = logging.getLogger(__name__)
-HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора или файл .txt/.md в UTF-8 (до 2 МБ). В этой теме я помню вашу сделку. Аудио и другие документы пока не разбираю. Администратор может запросить /restart с подтверждением.'
+HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 
 
@@ -23,7 +24,7 @@ def member_allowed(member):
 
 
 class SalesTelegram:
-    def __init__(self, chat_id, service, system_topic_id=0, heartbeat=None):
+    def __init__(self, chat_id, service, system_topic_id=0, heartbeat=None, audio_worker=None):
         self.chat_id, self.service = chat_id, service
         self.tasks = []
         self.system_topic_id = system_topic_id
@@ -35,6 +36,7 @@ class SalesTelegram:
         self.restart_verify_seconds = 15
         self.service.system_chat_id = chat_id
         self.service.system_topic_id = system_topic_id
+        self.audio_worker = audio_worker
 
     async def ingest(self, update, context):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
@@ -84,7 +86,18 @@ class SalesTelegram:
             return
         source = 'telegram_text'
         document = getattr(message, 'document', None)
-        if document and (document.file_name or '').lower().endswith(('.txt', '.md')):
+        audio = getattr(message, 'voice', None) or getattr(message, 'audio', None)
+        if not audio and document and any((getattr(document, 'file_name', '') or '').lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
+            audio = document
+        metadata = None
+        if audio:
+            metadata = dict(file_id=audio.file_id, file_size=getattr(audio, 'file_size', None),
+                filename=getattr(audio, 'file_name', None) or ('voice.ogg' if getattr(message, 'voice', None) else 'audio'),
+                mime=getattr(audio, 'mime_type', '') or '',
+                kind='voice' if getattr(message, 'voice', None) else 'audio',
+                duration=getattr(audio, 'duration', None))
+            source = 'audio_pending'
+        elif document and (document.file_name or '').lower().endswith(('.txt', '.md')):
             if await asyncio.to_thread(self.service.store.event_seen, update.update_id):
                 return
             text = json.dumps({'file_id': document.file_id, 'size': document.file_size,
@@ -93,7 +106,7 @@ class SalesTelegram:
         elif any(getattr(message, kind, None) for kind in ('document', 'voice', 'audio', 'photo', 'video')):
             text = '[Вложение не разобрано. Содержимое неизвестно.]' + ('\n' + text if text else '')
             source = 'unsupported_attachment'
-        if not text:
+        if not text and not metadata:
             return
         reply = getattr(message, 'reply_to_message', None)
         addressed_elsewhere = bool(reply and getattr(reply, 'from_user', None)
@@ -109,7 +122,7 @@ class SalesTelegram:
             author_id=user.id, author=user.full_name, date=message.date.isoformat(),
             text=text, reply_to=getattr(reply, 'message_id', None), respond=respond,
             authorization_pending=authorization_pending,
-            source=source)
+            source=source, audio=metadata)
 
     async def hydrate_documents(self, bot):
         for row in await asyncio.to_thread(self.service.store.awaiting_documents, self.chat_id):
@@ -227,6 +240,16 @@ class SalesTelegram:
                 logger.warning('event=sales_worker_failed error_type=%s', type(exc).__name__)
             await asyncio.sleep(2)
 
+    async def transcribe_pending(self, app):
+        while True:
+            try:
+                await self.audio_worker.run_once(app.bot, self.chat_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('event=sales_audio_worker_failed error_type=%s', type(exc).__name__)
+            await asyncio.sleep(2)
+
     async def deliver_pending(self, app):
         while True:
             try:
@@ -273,6 +296,8 @@ class SalesTelegram:
                       asyncio.create_task(self.deliver_pending(app)),
                       asyncio.create_task(self.startup_probe(app)),
                       asyncio.create_task(watchdog.run(app))]
+        if self.audio_worker:
+            self.tasks.append(asyncio.create_task(self.transcribe_pending(app)))
 
     async def startup_probe(self, app):
         while not app.running or (getattr(app, 'updater', None) is not None and not app.updater.running):
@@ -307,7 +332,8 @@ class SalesTelegram:
 
 def create_sales_application(settings, service):
     heartbeat = PollingHeartbeat()
-    adapter = SalesTelegram(settings.chat_id, service, settings.system_topic_id, heartbeat)
+    audio_worker = AudioWorker(service.store, settings.runtime / 'audio', settings.openai_api_key, settings.transcription_model)
+    adapter = SalesTelegram(settings.chat_id, service, settings.system_topic_id, heartbeat, audio_worker)
     app = (Application.builder().token(settings.token)
         .get_updates_request(HeartbeatHTTPXRequest(heartbeat, 30))
         .post_init(adapter.start).post_stop(adapter.stop).build())

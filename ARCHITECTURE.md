@@ -53,7 +53,26 @@ send/DB-ack crash gap: сообщение может повториться по
 подтверждения сохраняются как контекст, но не вызывают модель сами по себе.
 UTF-8 txt/md до 2 МБ сначала сохраняют метаданные в durable inbox, затем фоновой
 загрузкой полный текст. Авторизация/временная ошибка скачивания оставляет запись
-ожидающей; file IDs не попадают модели. Аудио/PDF/DOCX явно непрочитаны.
+ожидающей; file IDs не попадают модели. PDF/DOCX явно непрочитаны.
+Voice/audio/audio-document сохраняются атомарно с inbox в audio_jobs: metadata,
+caption, путь к временному файлу, transcript, state, attempts, retry_at/error_kind.
+audio_pending исключён из facts/history/model processing, включая held ingress.
+Отдельный AudioWorker переиспользует download_telegram_file/media_destination,
+MAX_DOWNLOAD_BYTES=20МБ и общий transcribe_audio_file. Проверяет Telegram size до
+скачивания, реальный размер после и magic контейнера; для API нормализует suffix.
+Поддержка контейнеров сверена с OpenAI Audio API (ссылка в README). Файл .part
+атомарно переименовывается и путь сохраняется до STT. STT success атомарно сохраняет
+транскрипт и заменяет audio_pending на audio_transcript, разделяя подпись и речь.
+Прежние Codex threads/версии инструкций сохраняются: аудио поступает туда как
+обычный текст, длинный — через существующий document pipeline. После успешного
+анализа worker удаляет аудио, сохраняя metadata/file ID/transcript в SQLite.
+До пяти логических попыток с backoff; permanent API auth/quota/request, oversized,
+unknown container или empty transcript -> failed/processed=3 и безопасный outbox
+notice, без Codex/фактов/фиктивного processed=1. После окончательного отказа нужна
+повторная отправка. Окно STT success/DB checkpoint допускает повторный расход API.
+Отдельный env Сали содержит OPENAI_API_KEY/TRANSCRIPTION_MODEL; ключ repr=False,
+не попадает в Codex child env. Rick settings/модель не меняются; общий file helper
+передаёт basename вместо постоянного voice.ogg (bytes API/language contract прежний).
 Текущие события передаются полностью. Материалы длиннее 16000 символов
 последовательно разбираются ephemeral внутренними turn; document_chunks хранит
 извлечения/цитаты по event ID/части/версии и восстановление не перечитывает готовые
