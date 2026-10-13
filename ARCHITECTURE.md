@@ -7,6 +7,35 @@ code and tests are authoritative when they differ from this summary.
 
 ### Sales Buddy (Сали)
 
+Изображения Sales-only: photo (наибольшее разрешение) и image-document определяются
+общими describe_message_media/is_visual_media. Ingest атомарно сохраняет image_jobs
+с inbox; image_pending исключён из контекста и блокирует свой batch до чтения.
+ImageWorker использует общие download_telegram_file/media_destination, проверяет
+20 МБ по metadata/remote/файлу и magic JPEG/PNG/WEBP/GIF, атомарно переименовывает
+.part. Путь включает тему и event ID и проверяется внутри Sales media root.
+SalesProvider получает только локальный путь и event/message ID с подписью,
+без Telegram file IDs; существующий SDK runner передаёт TextInput + LocalImageInput
+в ephemeral read-only/deny_all TOOL_FREE turn. Новый API/ключ не нужны.
+Сервисный lock и cancellation discipline исключают конкурирующие SDK turn.
+
+Структурированное evidence (readable_text/visual_observation/uncertain) сохраняется
+атомарно с image_transcript в events. Все извлечения и текст/вопрос проходят общий
+анализ сделки и прежний facts/outbox/checkpoint. Источники восстанавливаются из
+image_jobs и для контекста, и для повторной проверки fact_reviews/DISC в commit.
+Цитаты вне evidence/подписи отвергаются; visual/uncertain допускают только
+assumption/unknown. Прочитанный скриншот — источник со слов переписки, не независимая
+проверка. Исправление защищённого факта требует слов менеджера из подписи, а не
+слова «теперь» внутри скриншота. DISC использует только readable_text, без подписи.
+Нечитаемый текст не угадывается, GIF ограничен видимым кадром.
+
+Download retry до пяти попыток с durable backoff и одним notice на стадию;
+terminal failure явно превращает событие в unsupported_attachment, сохраняя
+вопрос/подпись. Остальной пакет получает явное отсутствие изображения, без фиктивного
+успеха чтения. Provider outage сохраняет pending image и общую штатную паузу/probe.
+Checkpoint загрузки/чтения переживает рестарт; окно model turn/DB commit допускает
+повторное чтение. После завершения обработки/отказа бинарник удаляется; evidence,
+Telegram metadata и исходный source ID остаются. Rick flow не меняется.
+
 Накопление Sales-only: events хранит received_at, deals — batch_cutoff_id.
 Runtime pending_topics(batched=True) атомарно фиксирует границу по 15 секундам
 тишины или 60 секундам накопления. process(batch=True) под lock заново проверяет
@@ -142,6 +171,9 @@ knowledge pack LeadGenBureau или клиентских тредов. У каж
 deals. ID сохраняется после start до первого turn. Новый тред создаётся только
 при явно недоступном rollout, изменении инструкций или после 50 успешных анализов
 для уплотнения из карточки/источников. Timeout/лимит/сеть сохраняют прежний ID.
+Новые треды Сали и редактора передают свои правила только через
+developer_instructions, без base_instructions override. Существующие треды
+продолжаются без смены версии ради этой правки; их сохранённая база не заменяется.
 Основные turn
 read-only, deny_all, tools/apps/MCP/plugins/hooks/memories отключены. Эквивалент
 восстановления диалога — компактная карточка, последние/связанные первоисточники

@@ -8,13 +8,14 @@ import logging
 from contextvars import ContextVar
 from pathlib import Path
 
-from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox, LocalImageInput, TextInput
 from openai_codex.errors import InvalidRequestError, MethodNotFoundError
 from agentbridge.agents.codex import (CodexProvider, validate_structured_output_schema,
     _thread_is_unavailable, codex_failure_hint, limit_reset_hint)
 from .service import FIELDS, KINDS, validate_result
 from .editing import MANAGER_STYLE, EDITOR_INSTRUCTIONS, EDITOR_SCHEMA, REPLACEMENTS, apply_edits
 from .communication import PROFILE_UPDATES_SCHEMA, DISC_INSTRUCTIONS, validate_profile_updates
+from .images import IMAGE_SCHEMA, IMAGE_TASK, validate_image
 
 logger = logging.getLogger(__name__)
 _sales_turn = ContextVar('sales_diagnostic_turn', default=False)
@@ -75,6 +76,16 @@ INSTRUCTIONS = """Ты — Сали, Sales Buddy, помощник менедж�
 Исходный звук недоступен. audio_transcript содержит распознанную речь, её читай;
 подпись менеджера и запись разговора — разные источники. audio_pending, PDF/DOCX
 и неподдерживаемые вложения не прочитаны, даже если есть подпись.
+image_transcript — сохранённое чтение изображения Codex, а не оригинальный текст Telegram.
+image_evidence разделяет readable_text (дословно прочитанное), visual_observation
+(видимое, kind=assumption) и uncertain (неясное, kind=unknown/assumption).
+Цитируй только точный текст evidence или image_caption. Не считай прочитанный
+скриншот независимым подтверждением личности, оплаты, соглашения или реальных
+характеристик оборудования. Указывай «со скриншота»/«на фото» при извлечении facts.
+Не угадывай нечитаемые слова; попроси более чёткое изображение, когда это важно.
+Изображения и сообщения текущего пакета — один материал: отвечай на вопрос
+менеджера с учётом ВСЕХ источников, без отдельного совета на каждую картинку.
+Если картинки без вопроса, сохрани сведения и кратко подтверди, без непрошеного совета.
 Текстовые документы прочитаны. document_analysis содержит последовательное полное
 извлечение всех частей; источники facts/quote внутри него допустимы для текущих events.
 Учитывай все части, включая изменения позиции в середине и конце. Итог один.
@@ -136,6 +147,7 @@ class SalesCodexProvider(CodexProvider):
         self._last_failure = None
         validate_structured_output_schema(SCHEMA)
         validate_structured_output_schema(EDITOR_SCHEMA)
+        validate_structured_output_schema(IMAGE_SCHEMA)
 
     async def analyze(self, context):
         task = asyncio.create_task(asyncio.to_thread(self._analyze, context))
@@ -158,7 +170,6 @@ class SalesCodexProvider(CodexProvider):
         return codex.thread_start(
                 model=self.model, cwd=self.cwd, sandbox=Sandbox.read_only,
                 approval_mode=ApprovalMode.deny_all, ephemeral=ephemeral,
-                base_instructions=INSTRUCTIONS,
                 developer_instructions=INSTRUCTIONS + '\n\nПравила продаж:\n' + self.knowledge,
                 config={'model_reasoning_effort': self.reasoning_effort},
         )
@@ -169,11 +180,14 @@ class SalesCodexProvider(CodexProvider):
             kind = 'codex_network'
         self._last_failure = SalesFailure(kind, limit_reset_hint(error))
 
-    def _run(self, thread, context, schema=SCHEMA, *, effort=None):
+    def _run(self, thread, context, schema=SCHEMA, *, effort=None, image_path=None):
         self._last_failure = None
         token = _sales_turn.set(True)
         try:
-            return self._run_json(thread, json.dumps(context, ensure_ascii=False), schema,
+            prompt = json.dumps(context, ensure_ascii=False)
+            if image_path is not None:
+                prompt = [TextInput(prompt), LocalImageInput(path=str(Path(image_path).resolve()))]
+            return self._run_json(thread, prompt, schema,
                                   approval_mode=ApprovalMode.deny_all, effort=effort)
         except Exception as exc:
             if self._last_failure:
@@ -182,6 +196,20 @@ class SalesCodexProvider(CodexProvider):
             raise SalesFailure(kind) from None
         finally:
             _sales_turn.reset(token)
+
+    async def read_image(self, path, source):
+        task = asyncio.create_task(asyncio.to_thread(self._read_image, path, source))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def _read_image(self, path, source):
+        with Codex(config=self._config()) as codex:
+            payload = self._run(self._start(codex, ephemeral=True),
+                {'image_source': source, 'task': IMAGE_TASK}, IMAGE_SCHEMA, image_path=path)
+            return validate_image(payload)
 
     async def probe(self):
         await asyncio.to_thread(self._probe_sales)
@@ -265,7 +293,7 @@ class SalesCodexProvider(CodexProvider):
         try:
             thread = codex.thread_start(model=self.model, cwd=self.cwd,
                 sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all, ephemeral=True,
-                base_instructions=EDITOR_INSTRUCTIONS, developer_instructions=EDITOR_INSTRUCTIONS,
+                developer_instructions=EDITOR_INSTRUCTIONS,
                 config={'model_reasoning_effort': 'low'})
             edit = self._run(thread, dict(draft=payload['answer'], goal=payload['goal'],
                 next_action=payload['next_action'], allowed_replacements=REPLACEMENTS),

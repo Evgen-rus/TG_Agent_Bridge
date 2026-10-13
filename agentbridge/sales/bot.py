@@ -5,18 +5,21 @@ import logging
 import re
 import json
 import time
+from dataclasses import replace
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
-from agentbridge.telegram.media import message_text
+from agentbridge.telegram.media import message_text, describe_message_media
+from agentbridge.media import is_visual_media
 from agentbridge.telegram.polling import HeartbeatHTTPXRequest, PollingHeartbeat, PollingWatchdog
 from .operations import restart_sales
 from .audio import AudioWorker, AUDIO_EXTENSIONS
+from .images import ImageWorker
 from .activity import SalesActivity
 from .storage import SALI_NAME, should_respond
 
 logger = logging.getLogger(__name__)
-HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
+HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 
 
@@ -26,7 +29,7 @@ def member_allowed(member):
 
 
 class SalesTelegram:
-    def __init__(self, chat_id, service, system_topic_id=0, heartbeat=None, audio_worker=None):
+    def __init__(self, chat_id, service, system_topic_id=0, heartbeat=None, audio_worker=None, image_worker=None):
         self.chat_id, self.service = chat_id, service
         self.tasks = []
         self.system_topic_id = system_topic_id
@@ -39,6 +42,7 @@ class SalesTelegram:
         self.service.system_chat_id = chat_id
         self.service.system_topic_id = system_topic_id
         self.audio_worker = audio_worker
+        self.image_worker = image_worker
         self.activity = SalesActivity()
 
     async def ingest(self, update, context):
@@ -93,6 +97,12 @@ class SalesTelegram:
         if not audio and document and any((getattr(document, 'file_name', '') or '').lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
             audio = document
         metadata = None
+        image = None
+        ref = describe_message_media(message)
+        photos = getattr(message, 'photo', None) or ()
+        if photos and ref:
+            best = max(photos, key=lambda item: (getattr(item, 'width', 0) * getattr(item, 'height', 0), getattr(item, 'file_size', 0) or 0))
+            ref = replace(ref, file_id=best.file_id, file_size=getattr(best, 'file_size', None))
         if audio:
             metadata = dict(file_id=audio.file_id, file_size=getattr(audio, 'file_size', None),
                 filename=getattr(audio, 'file_name', None) or ('voice.ogg' if getattr(message, 'voice', None) else 'audio'),
@@ -100,6 +110,10 @@ class SalesTelegram:
                 kind='voice' if getattr(message, 'voice', None) else 'audio',
                 duration=getattr(audio, 'duration', None))
             source = 'audio_pending'
+        elif ref and is_visual_media(ref.kind, ref.mime, ref.filename):
+            image = dict(file_id=ref.file_id, file_size=ref.file_size,
+                filename=ref.filename, mime=ref.mime, media_group_id=ref.media_group_id, caption=text)
+            source = 'image_pending'
         elif document and (document.file_name or '').lower().endswith(('.txt', '.md')):
             if await asyncio.to_thread(self.service.store.event_seen, update.update_id):
                 return
@@ -109,7 +123,7 @@ class SalesTelegram:
         elif any(getattr(message, kind, None) for kind in ('document', 'voice', 'audio', 'photo', 'video')):
             text = '[Вложение не разобрано. Содержимое неизвестно.]' + ('\n' + text if text else '')
             source = 'unsupported_attachment'
-        if not text and not metadata:
+        if not text and not metadata and not image:
             return
         reply = getattr(message, 'reply_to_message', None)
         addressed_elsewhere = bool(reply and getattr(reply, 'from_user', None)
@@ -126,7 +140,7 @@ class SalesTelegram:
             author_id=user.id, author=user.full_name, date=message.date.isoformat(),
             text=text, reply_to=getattr(reply, 'message_id', None), respond=respond,
             authorization_pending=authorization_pending,
-            source=source, audio=metadata)
+            source=source, audio=metadata, image=image)
 
     async def hydrate_documents(self, bot):
         for row in await asyncio.to_thread(self.service.store.awaiting_documents, self.chat_id):
@@ -288,6 +302,17 @@ class SalesTelegram:
                 logger.warning('event=sales_audio_worker_failed error_type=%s', type(exc).__name__)
             await asyncio.sleep(2)
 
+    async def read_images_pending(self, app):
+        while True:
+            try:
+                await self.image_worker.run_once(app.bot, self.chat_id,
+                    activity=lambda chat, topic: self.activity.scope(app.bot, chat, topic))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('event=sales_image_worker_failed error_type=%s', type(exc).__name__)
+            await asyncio.sleep(2)
+
     async def deliver_pending(self, app):
         while True:
             try:
@@ -341,6 +366,8 @@ class SalesTelegram:
                       asyncio.create_task(watchdog.run(app))]
         if self.audio_worker:
             self.tasks.append(asyncio.create_task(self.transcribe_pending(app)))
+        if self.image_worker:
+            self.tasks.append(asyncio.create_task(self.read_images_pending(app)))
 
     async def startup_probe(self, app):
         while not app.running or (getattr(app, 'updater', None) is not None and not app.updater.running):
@@ -379,7 +406,8 @@ class SalesTelegram:
 def create_sales_application(settings, service):
     heartbeat = PollingHeartbeat()
     audio_worker = AudioWorker(service.store, settings.runtime / 'audio', settings.openai_api_key, settings.transcription_model)
-    adapter = SalesTelegram(settings.chat_id, service, settings.system_topic_id, heartbeat, audio_worker)
+    image_worker = ImageWorker(service, settings.runtime / 'images')
+    adapter = SalesTelegram(settings.chat_id, service, settings.system_topic_id, heartbeat, audio_worker, image_worker)
     app = (Application.builder().token(settings.token)
         .get_updates_request(HeartbeatHTTPXRequest(heartbeat, 30))
         .post_init(adapter.start).post_stop(adapter.stop).build())

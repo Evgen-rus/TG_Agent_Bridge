@@ -222,7 +222,9 @@ def validate_profile_updates(value, context):
                 # Offset comes from durable audio metadata, never from a caption delimiter.
                 offset = source.get('speech_offset')
                 text = text[offset:] if type(offset) is int and offset >= 0 else ''
-            if source and source.get('source') not in ('telegram_text', 'manager_feedback', 'text_document', 'audio_transcript'):
+            if source and source.get('source') == 'image_transcript':
+                text = '\n\n'.join(item['text'] for item in source.get('image_evidence', []) if item['kind'] == 'readable_text')
+            if source and source.get('source') not in ('telegram_text', 'manager_feedback', 'text_document', 'audio_transcript', 'image_transcript'):
                 text = ''
             body = _attributed_body(item, text, contact) if contact else None
             key = ' '.join(item['quote'].casefold().split())

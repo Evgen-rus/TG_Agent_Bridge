@@ -5,7 +5,7 @@ from types import SimpleNamespace as NS
 import pytest
 from openai_codex.errors import InvalidRequestError
 
-from agentbridge.sales.provider import SalesCodexProvider, SalesFailure, split_transcript
+from agentbridge.sales.provider import INSTRUCTIONS, SalesCodexProvider, SalesFailure, split_transcript
 from agentbridge.sales.service import SalesService
 from agentbridge.sales.storage import SalesStore
 from test_sales_buddy import ingest
@@ -83,6 +83,19 @@ async def test_persistent_threads_resume_restart_and_topic_isolation(setup):
     assert SDK.turns[-1][1]['history'] == []
     assert 'Птицефабрика выбирает' not in json.dumps(SDK.turns[-1][1], ensure_ascii=False)
     assert all(not s['ephemeral'] for s in SDK.starts)
+
+
+@pytest.mark.parametrize('ephemeral', [False, True])
+def test_start_preserves_codex_base_and_sales_developer_rules(setup, ephemeral):
+    _, factory = setup
+    provider = factory()
+    provider._start(SDK(provider._config()), ephemeral=ephemeral)
+    started = SDK.starts[-1]
+    assert 'base_instructions' not in started
+    assert started['developer_instructions'] == INSTRUCTIONS + '\n\nПравила продаж:\nrules'
+    assert started['ephemeral'] is ephemeral
+    assert started['sandbox'].value == 'read-only'
+    assert started['approval_mode'].value == 'deny_all'
 
 
 @pytest.mark.asyncio

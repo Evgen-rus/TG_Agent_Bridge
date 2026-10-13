@@ -126,6 +126,7 @@ async def test_ordinary_answer_single_turn_and_draft_isolated_low_editor(setup):
     editor = SDK.starts[-1]
     assert editor['ephemeral'] and editor['approval_mode'].value == 'deny_all'
     assert editor['sandbox'].value == 'read-only'
+    assert 'base_instructions' not in editor
     assert editor['developer_instructions'] == EDITOR_INSTRUCTIONS
     assert editor['config']['model_reasoning_effort'] == 'low'
     assert SDK.runs[-1][1]['effort'] == 'low'

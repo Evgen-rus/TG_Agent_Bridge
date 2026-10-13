@@ -75,6 +75,11 @@ class SalesStore:
                     transcript TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
                     error_kind TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS image_jobs (
+                    event_id INTEGER PRIMARY KEY, metadata TEXT NOT NULL,
+                    path TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                    retry_at REAL NOT NULL DEFAULT 0, error_kind TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS communication_profile_revisions (
                     id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
                     contact_id TEXT NOT NULL, payload TEXT NOT NULL, event_ids TEXT NOT NULL,
@@ -118,13 +123,13 @@ class SalesStore:
 
     def ingest(self, *, update_id, chat_id, topic_id, title, message_id,
                author_id, author, date, text, source="telegram_text", reply_to=None,
-               respond=True, response_text=None, authorization_pending=False, audio=None):
+               respond=True, response_text=None, authorization_pending=False, audio=None, image=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
                        (chat_id, topic_id, title))
             self._freeze_batch_if_due(db, chat_id, topic_id, time.time())
-            if source not in {'text_document_pending', 'audio_pending'} and reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
+            if source not in {'text_document_pending', 'audio_pending', 'image_pending'} and reply_to and db.execute("""SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=?
                 AND telegram_message_id=? AND delivery_key LIKE 'recommendation:%'""",
                 (chat_id, topic_id, reply_to)).fetchone():
                 source = 'manager_feedback'
@@ -137,6 +142,8 @@ class SalesStore:
                 event_id = db.execute('SELECT id FROM events WHERE update_id=?', (update_id,)).fetchone()[0]
                 if audio:
                     db.execute('INSERT INTO audio_jobs(event_id,metadata,caption) VALUES (?,?,?)', (event_id, encoded(audio), text))
+                if image:
+                    db.execute('INSERT INTO image_jobs(event_id,metadata) VALUES (?,?)', (event_id, encoded(image)))
                 if response_text and not authorization_pending:
                     self._queue(db, chat_id, topic_id, f'help:{update_id}', response_text)
             return bool(inserted)
@@ -206,10 +213,10 @@ class SalesStore:
                         continue
                     if db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND id<=?
                         AND (processed<0 OR (processed IN (0,1) AND source IN
-                        ('text_document_pending','audio_pending'))) LIMIT 1""", (chat, topic, cutoff)).fetchone():
+                        ('text_document_pending','audio_pending','image_pending'))) LIMIT 1""", (chat, topic, cutoff)).fetchone():
                         continue
                     if db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND id<=?
-                        AND processed=0 AND source NOT IN ('text_document_pending','audio_pending') LIMIT 1""",
+                        AND processed=0 AND source NOT IN ('text_document_pending','audio_pending','image_pending') LIMIT 1""",
                         (chat, topic, cutoff)).fetchone():
                         if not db.execute("""SELECT 1 FROM review_episodes WHERE chat_id=? AND topic_id=?
                             AND state='pending'""", (chat, topic)).fetchone():
@@ -217,7 +224,7 @@ class SalesStore:
                 return ready
             return [tuple(row) for row in db.execute("""SELECT d.chat_id,d.topic_id FROM deals d
                 WHERE d.retry_at<=? AND EXISTS (SELECT 1 FROM events e WHERE
-                e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source NOT IN ('text_document_pending','audio_pending'))
+                e.chat_id=d.chat_id AND e.topic_id=d.topic_id AND e.processed=0 AND e.source NOT IN ('text_document_pending','audio_pending','image_pending'))
                 AND NOT EXISTS (SELECT 1 FROM review_episodes r WHERE r.chat_id=d.chat_id
                     AND r.topic_id=d.topic_id AND r.state='pending')
                 ORDER BY d.retry_at,d.topic_id""", (time.time(),))]
@@ -232,7 +239,7 @@ class SalesStore:
                 cutoff = deal['batch_cutoff_id'] if deal else None
                 if cutoff is None or deal['retry_at'] > time.time() or db.execute("""SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND id<=?
                     AND (processed<0 OR (processed IN (0,1) AND source IN
-                    ('text_document_pending','audio_pending'))) LIMIT 1""",
+                    ('text_document_pending','audio_pending','image_pending'))) LIMIT 1""",
                     (chat_id, topic_id, cutoff)).fetchone():
                     return dict(events=[], history=[], facts=[], title='', chat_id=chat_id,
                                 topic_id=topic_id, omitted_facts=0, communication_profiles=[],
@@ -240,20 +247,20 @@ class SalesStore:
             scope = (chat_id, topic_id)
             title = db.execute("SELECT title FROM deals WHERE chat_id=? AND topic_id=?", scope).fetchone()[0]
             pending = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-                chat_id=? AND topic_id=? AND processed=0 AND source NOT IN ('text_document_pending','audio_pending')
+                chat_id=? AND topic_id=? AND processed=0 AND source NOT IN ('text_document_pending','audio_pending','image_pending')
                 AND (?=0 OR id<=?) ORDER BY id""" + ("" if batch else " LIMIT 10"),
                 (*scope, cutoff if batch else 0, cutoff if batch else 0))]
             facts = [dict(row) for row in db.execute("""SELECT * FROM facts WHERE
                 chat_id=? AND topic_id=? AND superseded_by IS NULL ORDER BY id""", scope)]
             history = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-            chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending')
+            chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending','image_pending')
             AND (?=0 OR id<=?) ORDER BY id DESC LIMIT 200""",
                 (*scope, cutoff if batch else 0, cutoff if batch else 0))]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE
                 chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 5""", scope)]
             profiles = [json.loads(row[0]) for row in db.execute("""SELECT payload FROM communication_profiles
                 WHERE chat_id=? AND topic_id=? ORDER BY revision_id DESC LIMIT 8""", scope)]
-            self._speech_offsets(db, pending + history)
+            self._source_metadata(db, pending + history)
             for profile in profiles:
                 invalidated = profile.get('invalidated_event_ids', [])
                 profile['omitted_invalidations'] = max(0, len(invalidated) - 50)
@@ -333,6 +340,7 @@ class SalesStore:
         marks = ','.join('?' for _ in ids)
         sources = [dict(row) for row in db.execute(f'''SELECT * FROM events
             WHERE chat_id=? AND topic_id=? AND processed=0 AND id IN ({marks})''', (chat, topic, *ids))]
+        cls._source_metadata(db, sources)
         old = [dict(row) for row in db.execute('SELECT * FROM facts WHERE chat_id=? AND topic_id=? AND superseded_by IS NULL', (chat, topic))]
         # Re-check every fact against durable sources before creating owner-visible cards.
         patches = validate_result(dict(answer='review', next_action='', goal='', basis=[],
@@ -421,8 +429,12 @@ class SalesStore:
                 'Ответ модели не прошёл проверку. Исходные материалы сохранены; автоматические повторы этого запроса остановлены. Уточните данные или повторите вопрос.')
 
     @staticmethod
-    def _speech_offsets(db, rows):
+    def _source_metadata(db, rows):
         for row in rows:
+            if row['source'] == 'image_transcript':
+                job = db.execute('SELECT payload,metadata FROM image_jobs WHERE event_id=?', (row['id'],)).fetchone()
+                row['image_evidence'] = json.loads(job['payload']) if job and job['payload'] else []
+                row['image_caption'] = json.loads(job['metadata']).get('caption', '') if job else ''
             if row['source'] != 'audio_transcript':
                 continue
             job = db.execute('SELECT caption FROM audio_jobs WHERE event_id=?', (row['id'],)).fetchone()
@@ -448,7 +460,7 @@ class SalesStore:
         marks = ','.join('?' for _ in ids)
         current = [dict(row) for row in db.execute(f'''SELECT * FROM events WHERE chat_id=?
             AND topic_id=? AND processed=0 AND id IN ({marks})''', (*scope, *ids))]
-        SalesStore._speech_offsets(db, history + current)
+        SalesStore._source_metadata(db, history + current)
         validated = validate_profile_updates(updates, dict(events=current, history=history,
                                                           communication_profiles=list(previous.values())))
         for profile in validated:
@@ -586,6 +598,72 @@ class SalesStore:
                 JOIN events e ON e.id=a.event_id WHERE e.chat_id=? AND e.processed IN (0,1)
                 AND a.state IN ('pending','downloaded') AND a.retry_at<=? ORDER BY a.event_id LIMIT 10""", (chat, time.time()))
             return [dict(dict(row), **json.loads(row['metadata'])) for row in rows]
+
+    def awaiting_images(self, chat):
+        with self.connect() as db:
+            rows = db.execute("""SELECT i.*,e.chat_id,e.topic_id,e.message_id,e.text AS caption
+                FROM image_jobs i JOIN events e ON e.id=i.event_id
+                WHERE e.chat_id=? AND e.processed IN (0,1) AND i.state='pending'
+                AND i.retry_at<=? ORDER BY i.event_id LIMIT 10""", (chat, time.time()))
+            return [dict(dict(row), **json.loads(row['metadata'])) for row in rows]
+
+    def image_downloaded(self, event_id, path):
+        with self.connect() as db:
+            db.execute("UPDATE image_jobs SET path=? WHERE event_id=? AND state='pending'", (path, event_id))
+
+    def image_read(self, event_id, evidence):
+        from .images import validate_image
+        evidence = validate_image({'evidence': evidence})
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("""SELECT e.* FROM events e JOIN image_jobs i ON i.event_id=e.id
+                WHERE e.id=? AND e.source='image_pending' AND e.processed IN (0,1)
+                AND i.state='pending'""", (event_id,)).fetchone()
+            if not row:
+                return False
+            labels = {'readable_text': 'Читаемый текст', 'visual_observation': 'Визуальное наблюдение (не подтверждение)',
+                      'uncertain': 'Неясно / не подтверждено'}
+            text = ('Комментарий менеджера:\n' + row['text'] + '\n\n' if row['text'] else '')
+            text += f"Изображение из сообщения {row['message_id']} (event_id={event_id}):\n"
+            text += '\n\n'.join(labels[item['kind']] + ':\n' + item['text'] for item in evidence)
+            db.execute("UPDATE image_jobs SET payload=?,state='read',error_kind='',retry_at=0 WHERE event_id=?", (encoded(evidence), event_id))
+            db.execute("UPDATE events SET text=?,source='image_transcript' WHERE id=?", (text, event_id))
+            return True
+
+    def image_failed(self, event_id, reason, terminal=False):
+        safe = {
+            'image_too_large': 'Изображение не прочитано: лимит загрузки Telegram — 20 МБ. Пришлите уменьшенную копию или разделите длинный скриншот, сохранив читаемость.',
+            'image_invalid': 'Изображение не прочитано: файл повреждён, формат не поддерживается или Codex не смог вернуть надёжное извлечение. Пришлите JPEG/PNG/WEBP/GIF или текст.',
+            'image_download_failed': 'Изображение сохранено в очереди, но загрузка временно недоступна. Повторю позже; содержимое ещё не анализировалось.',
+        }
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("""SELECT i.*,e.chat_id,e.topic_id,e.text FROM image_jobs i
+                JOIN events e ON e.id=i.event_id WHERE i.event_id=? AND i.state='pending'""", (event_id,)).fetchone()
+            if not row:
+                return
+            attempts = row['attempts'] + 1
+            terminal = terminal or attempts >= 5
+            reason = reason if reason in safe else 'image_invalid'
+            db.execute('UPDATE image_jobs SET state=?,attempts=?,retry_at=?,error_kind=? WHERE event_id=?',
+                ('failed' if terminal else 'pending', attempts, time.time() + min(3600, 60 * 2 ** min(attempts-1, 6)), reason, event_id))
+            text = (safe[reason] if not terminal or reason != 'image_download_failed' else
+                'Не удалось загрузить изображение после пяти попыток. Содержимое не анализировалось; пришлите его повторно.')
+            if terminal:
+                # Keep captions/questions available, but never claim the missing image was read.
+                db.execute("UPDATE events SET source='unsupported_attachment',text=? WHERE id=? AND source='image_pending'",
+                    ('[Изображение не прочитано. Содержимое неизвестно.]\n' + row['text'], event_id))
+            self._queue(db, row['chat_id'], row['topic_id'], f"image-error:{event_id}:{'terminal' if terminal else 'retry'}", text)
+
+    def image_cleanup(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("""SELECT i.event_id,i.path FROM image_jobs i
+                JOIN events e ON e.id=i.event_id WHERE i.path!='' AND
+                (i.state='failed' OR (i.state='read' AND e.processed IN (1,2,3)))""")]
+
+    def image_cleaned(self, event_id):
+        with self.connect() as db:
+            db.execute("UPDATE image_jobs SET path='' WHERE event_id=?", (event_id,))
 
     def audio_downloaded(self, row_id, path):
         with self.connect() as db:

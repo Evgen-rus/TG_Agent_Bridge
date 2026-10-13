@@ -38,6 +38,7 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
     if not result['answer'].strip():
         raise ValueError('Empty answer')
     sources = {r['id']: r['text'] for r in context['history'] + context['events']}
+    events = {r['id']: r for r in context['events']}
     current_ids = {row['id'] for row in context['events']}
     existing = {row['id']: row for row in context['facts']}
     available_sources = set(sources) | {row['event_id'] for row in context['facts']}
@@ -62,6 +63,15 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
             raise ValueError('Invalid fact text')
         if type(fact['event_id']) is not int or fact['event_id'] not in current_ids or fact['quote'] not in sources[fact['event_id']]:
             raise ValueError('Fact has no current source')
+        event = events[fact['event_id']]
+        if event.get('source') == 'image_transcript':
+            evidence = event.get('image_evidence', [])
+            matches = [item for item in evidence if fact['quote'] in item['text']]
+            caption_quote = fact['quote'] in event.get('image_caption', '')
+            if not matches and not caption_quote:
+                raise ValueError('Fact has no current source')
+            if not caption_quote and not any(item['kind'] == 'readable_text' for item in matches) and fact['kind'] not in {'unknown', 'assumption'}:
+                raise ValueError('Uncertain image evidence cannot become a fact')
         if fact['field'] == 'unknowns' and fact['kind'] != 'unknown':
             raise ValueError('Unknown cannot be confirmed')
         if fact['kind'] in {'fact', 'agreement'} and re.search(
@@ -78,7 +88,8 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
             if all(old[key] == fact[key] for key in ('field', 'text', 'kind')):
                 continue
             # Facts are immutable unless the manager explicitly corrects or changes them.
-            correction = re.search(r'(?i)исправ|уточн|ошиб|неверн|вместо|теперь|отмен|передум|измен|не .+ а ', sources[fact['event_id']])
+            correction_text = event.get('image_caption', '') if event.get('source') == 'image_transcript' else sources[fact['event_id']]
+            correction = re.search(r'(?i)исправ|уточн|ошиб|неверн|вместо|теперь|отмен|передум|измен|не .+ а ', correction_text)
             if old['kind'] not in {'unknown', 'assumption'} and not correction:
                 if allow_fact_reviews and fact['kind'] not in {'unknown', 'assumption'}:
                     replaced.add(old_id)
@@ -197,3 +208,10 @@ class SalesService:
                             db.execute('UPDATE events SET processed=3 WHERE id=? AND processed=0', (event['id'],))
                     self.store.notice(chat_id, topic_id, f"document-bound:{context['events'][0]['id']}",
                         'Материал сохранён целиком, но полный анализ не завершён: превышен безопасный объём (64 части, 120000 символов извлечения или 180000 символов итогового контекста). Разделите материал на отдельные сообщения. Частичную рекомендацию не выдаю.')
+
+    async def read_image(self, path, row):
+        async with self._lock:
+            if not self.available():
+                return None
+            return await self.provider.read_image(path, dict(event_id=row['event_id'],
+                message_id=row['message_id'], caption=row['caption']))
