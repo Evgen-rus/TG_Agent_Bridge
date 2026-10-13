@@ -219,7 +219,7 @@ async def test_native_image_input_tool_free_ephemeral_and_no_secrets(tmp_path, m
     path.write_bytes(png())
     assert await provider.read_image(path, {'event_id': 1, 'caption': 'Вопрос'}) == EVIDENCE
     assert calls[0][1].env['TELEGRAM_BOT_TOKEN'] == ''
-    assert tuple(calls[0][1].config_overrides) == TOOL_FREE
+    assert tuple(calls[0][1].config_overrides) == (*TOOL_FREE, 'model_auto_compact_token_limit=150000')
     assert calls[1][1]['ephemeral'] and calls[1][1]['sandbox'] == Sandbox.read_only
     assert calls[1][1]['approval_mode'] == ApprovalMode.deny_all
     prompt = calls[2][1]

@@ -19,7 +19,9 @@ class SDK:
     lost = False
     chunk_failure = None
 
-    def __init__(self, config): pass
+    configs = []
+
+    def __init__(self, config): self.configs.append(config)
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def thread_start(self, **kwargs):
@@ -57,6 +59,7 @@ class Thread:
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     SDK.starts, SDK.resumes, SDK.turns = [], [], []
+    SDK.configs = []
     SDK.failure, SDK.chunk_failure, SDK.lost = None, None, False
     monkeypatch.setattr('agentbridge.sales.provider.Codex', SDK)
     store = SalesStore(tmp_path / 'sales.sqlite3')
@@ -83,6 +86,9 @@ async def test_persistent_threads_resume_restart_and_topic_isolation(setup):
     assert SDK.turns[-1][1]['history'] == []
     assert 'Птицефабрика выбирает' not in json.dumps(SDK.turns[-1][1], ensure_ascii=False)
     assert all(not s['ephemeral'] for s in SDK.starts)
+    assert all('model_auto_compact_token_limit=150000' in c.config_overrides for c in SDK.configs)
+    assert all(not any(o.startswith('model_context_window=') for o in c.config_overrides)
+               for c in SDK.configs)
 
 
 @pytest.mark.parametrize('ephemeral', [False, True])
@@ -188,16 +194,18 @@ async def test_crash_after_turn_reuses_checkpoint_and_no_duplicate_commit(setup)
 
 
 @pytest.mark.asyncio
-async def test_compaction_recreates_from_ledger_not_full_history(setup):
+@pytest.mark.parametrize('turns', [50, 99, 100])
+async def test_compaction_recreates_from_ledger_not_full_history(setup, turns):
     store, factory = setup
     ingest(store, text='НАЧАЛО')
     await SalesService(store, factory()).process(-100, 10)
     with store.connect() as db:
-        db.execute('UPDATE deals SET thread_turns=50')
+        db.execute('UPDATE deals SET thread_turns=?', (turns,))
     ingest(store, 2)
     await SalesService(store, factory()).process(-100, 10)
-    assert len(SDK.starts) == 2
-    assert store.op_get('thread-reason:-100:10') == 'context_compaction'
+    assert len(SDK.starts) == (2 if turns == 100 else 1)
+    assert len(SDK.resumes) == (0 if turns == 100 else 1)
+    assert store.op_get('thread-reason:-100:10') == ('context_compaction' if turns == 100 else 'first_turn')
     assert SDK.turns[-1][1]['facts'][0]['text'] == 'НАЧАЛО'
 
 

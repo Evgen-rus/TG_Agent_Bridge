@@ -164,7 +164,8 @@ class SalesCodexProvider(CodexProvider):
                      'APPDATA', 'LOCALAPPDATA', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR'}
         child_env = {key: value if key.upper() in safe_keys else '' for key, value in os.environ.items()}
         child_env['CODEX_HOME'] = str(self.codex_home)
-        return CodexConfig(config_overrides=TOOL_FREE, cwd=self.cwd, env=child_env)
+        return CodexConfig(config_overrides=(*TOOL_FREE, 'model_auto_compact_token_limit=150000'),
+                           cwd=self.cwd, env=child_env)
 
     def _start(self, codex, *, ephemeral=False):
         return codex.thread_start(
@@ -237,7 +238,7 @@ class SalesCodexProvider(CodexProvider):
             if extracted:
                 model_context['document_fact_rule'] = 'facts inside document_analysis are already validated and will be saved atomically by the application. Do not repeat them in output facts. Output facts only for new short events, but base the final answer on ALL document parts and their chronological changes.'
             thread, reason = None, 'first_turn'
-            if saved.get('thread_id') and saved.get('thread_version') == self.version and saved.get('thread_turns', 0) < 50:
+            if saved.get('thread_id') and saved.get('thread_version') == self.version and saved.get('thread_turns', 0) < 100:
                 try:
                     thread = codex.thread_resume(saved['thread_id'], model=self.model, cwd=self.cwd,
                         sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all, include_turns=False,
