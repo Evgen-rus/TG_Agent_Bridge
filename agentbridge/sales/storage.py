@@ -110,6 +110,8 @@ class SalesStore:
             if 'received_at' not in event_columns:
                 # Legacy pending events are catch-up; receipt time is no longer recoverable.
                 db.execute('ALTER TABLE events ADD COLUMN received_at REAL NOT NULL DEFAULT 0')
+            from .commitments import DDL
+            db.executescript(DDL)
 
     @contextmanager
     def connect(self):
@@ -326,6 +328,9 @@ class SalesStore:
         rec_id = db.execute('''INSERT INTO recommendations(chat_id,topic_id,event_ids,payload)
             VALUES (?,?,?,?)''', (chat, topic, encoded(ids), encoded(result))).lastrowid
         cls._queue(db, chat, topic, f'recommendation:{rec_id}', result['answer'])
+        if result.get('_commitment_check'):
+            from .commitments import attach_context_check
+            attach_context_check(db, chat, topic, rec_id, result['_commitment_check'])
         marks = ','.join('?' for _ in ids)
         db.execute(f'UPDATE events SET processed=1 WHERE id IN ({marks})', ids)
         db.execute('UPDATE deals SET retry_at=0,thread_turns=thread_turns+1 WHERE chat_id=? AND topic_id=?', (chat, topic))
@@ -503,7 +508,10 @@ class SalesStore:
 
     def delivered(self, row_id, message_id):
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             db.execute("UPDATE outbox SET telegram_message_id=? WHERE id=?", (message_id, row_id))
+            from .commitments import acknowledge
+            acknowledge(db, row_id, time.time())
 
     def thread(self, chat, topic):
         with self.connect() as db:

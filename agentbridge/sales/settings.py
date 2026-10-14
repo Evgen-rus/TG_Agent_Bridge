@@ -18,6 +18,7 @@ class SalesSettings:
     system_topic_id: int = 0
     openai_api_key: str = field(default='', repr=False)
     transcription_model: str = 'gpt-4o-mini-transcribe'
+    commitments_enabled: bool = True
 
     @classmethod
     def load(cls, root: Path, env_file: Path | None = None):
@@ -44,4 +45,5 @@ class SalesSettings:
                    str(values.get('OWNER_SALES_BADDY_CODEX_MODEL') or 'gpt-6-luna'),
                    str(values.get('OWNER_SALES_BADDY_CODEX_REASONING_EFFORT') or 'xhigh'), system_topic_id,
                    str(values.get('OPENAI_API_KEY') or '').strip(),
-                   str(values.get('TRANSCRIPTION_MODEL') or 'gpt-4o-mini-transcribe').strip())
+                   str(values.get('TRANSCRIPTION_MODEL') or 'gpt-4o-mini-transcribe').strip(),
+                   str(values.get('SALES_BUDDY_COMMITMENTS_ENABLED') or 'true').strip().lower() in {'1', 'true', 'yes', 'on'})

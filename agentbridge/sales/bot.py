@@ -17,6 +17,7 @@ from .audio import AudioWorker, AUDIO_EXTENSIONS
 from .images import ImageWorker
 from .activity import SalesActivity
 from .storage import SALI_NAME, should_respond
+from .commitments import Commitments, delivery_allowed, disable
 
 logger = logging.getLogger(__name__)
 HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
@@ -323,6 +324,16 @@ class SalesTelegram:
                 logger.warning('event=sales_delivery_failed error_type=%s', type(exc).__name__)
             await asyncio.sleep(3)
 
+    async def monitor_commitments(self):
+        while True:
+            try:
+                await self.service.commitments.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('event=sales_commitments_worker_failed error_type=%s', type(exc).__name__)
+            await asyncio.sleep(60)
+
     async def deliver_once(self, bot):
         async with self.delivery_lock:
             await self._deliver_once(bot)
@@ -333,6 +344,8 @@ class SalesTelegram:
             if row['chat_id'] != self.chat_id or row['topic_id'] in blocked:
                 continue
             try:
+                if not await asyncio.to_thread(delivery_allowed, self.service.store, row, self.service.commitments is not None):
+                    continue
                 options = {}
                 if row['delivery_key'].startswith('fact-review:'):
                     marker = row['delivery_key'].split(':')[1]
@@ -368,6 +381,8 @@ class SalesTelegram:
             self.tasks.append(asyncio.create_task(self.transcribe_pending(app)))
         if self.image_worker:
             self.tasks.append(asyncio.create_task(self.read_images_pending(app)))
+        if self.service.commitments:
+            self.tasks.append(asyncio.create_task(self.monitor_commitments()))
 
     async def startup_probe(self, app):
         while not app.running or (getattr(app, 'updater', None) is not None and not app.updater.running):
@@ -404,6 +419,11 @@ class SalesTelegram:
 
 
 def create_sales_application(settings, service):
+    if settings.commitments_enabled:
+        service.commitments = Commitments(service, settings.chat_id)
+    else:
+        service.commitments = None
+        disable(service.store)
     heartbeat = PollingHeartbeat()
     audio_worker = AudioWorker(service.store, settings.runtime / 'audio', settings.openai_api_key, settings.transcription_model)
     image_worker = ImageWorker(service, settings.runtime / 'images')

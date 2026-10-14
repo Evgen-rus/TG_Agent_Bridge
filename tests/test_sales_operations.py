@@ -52,7 +52,7 @@ class Bot:
 def adapter(tmp_path, bot=None):
     store = SalesStore(tmp_path / 'sales.sqlite3')
     service = NS(store=store, probe=AsyncMock(return_value=True), record_failure=AsyncMock(),
-        available=lambda: True, process=AsyncMock())
+        available=lambda: True, process=AsyncMock(), commitments=None)
     return SalesTelegram(-100, service), bot or Bot()
 
 

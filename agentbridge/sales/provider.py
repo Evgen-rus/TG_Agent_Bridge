@@ -16,6 +16,7 @@ from .service import FIELDS, KINDS, validate_result
 from .editing import MANAGER_STYLE, EDITOR_INSTRUCTIONS, EDITOR_SCHEMA, REPLACEMENTS, apply_edits
 from .communication import PROFILE_UPDATES_SCHEMA, DISC_INSTRUCTIONS, validate_profile_updates
 from .images import IMAGE_SCHEMA, IMAGE_TASK, validate_image
+from .commitments import SCHEMA as COMMITMENTS_SCHEMA
 
 logger = logging.getLogger(__name__)
 _sales_turn = ContextVar('sales_diagnostic_turn', default=False)
@@ -157,6 +158,7 @@ class SalesCodexProvider(CodexProvider):
         validate_structured_output_schema(SCHEMA)
         validate_structured_output_schema(EDITOR_SCHEMA)
         validate_structured_output_schema(IMAGE_SCHEMA)
+        validate_structured_output_schema(COMMITMENTS_SCHEMA)
 
     async def analyze(self, context):
         task = asyncio.create_task(asyncio.to_thread(self._analyze, context))
@@ -223,6 +225,26 @@ class SalesCodexProvider(CodexProvider):
 
     async def probe(self):
         await asyncio.to_thread(self._probe_sales)
+
+    async def analyze_commitments(self, context):
+        task = asyncio.create_task(asyncio.to_thread(self._commitments, context))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def _commitments(self, context):
+        with Codex(config=self._config()) as codex:
+            model_context, _ = self._documents(codex, {**context, 'facts': [],
+                'communication_profiles': [], 'previous_recommendations': []})
+            if len(json.dumps(model_context, ensure_ascii=False)) > 180000:
+                raise SalesFailure('document_too_large')
+            thread = codex.thread_start(model=self.model, cwd=self.cwd,
+                sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all, ephemeral=True,
+                developer_instructions=context['task'],
+                config={'model_reasoning_effort': self.reasoning_effort})
+            return self._run(thread, {k: v for k, v in model_context.items() if k != 'task'}, COMMITMENTS_SCHEMA)
 
     def _probe_sales(self):
         schema = {'type': 'object', 'additionalProperties': False,
