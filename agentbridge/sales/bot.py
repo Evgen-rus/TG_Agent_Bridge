@@ -69,6 +69,9 @@ class SalesTelegram:
         restart_requested = (command[0] == '/restart' and (not command[1] or
             command[2].lower() == (context.bot.username or '').lower())) or bool(
             re.fullmatch(rf'(?i)\s*{SALI_NAME}[,! ]+перезапустись[.! ]*', text))
+        is_edit = getattr(update, "edited_message", None) is not None
+        if is_edit and (restart_requested or text.startswith("/")):
+            return
         if restart_requested:
             if authorization_pending or member.status not in {'administrator', 'creator'}:
                 return
@@ -138,10 +141,11 @@ class SalesTelegram:
         await asyncio.to_thread(self.service.store.ingest,
             update_id=update.update_id, chat_id=self.chat_id, topic_id=topic,
             title=title or f'Тема {topic}', message_id=message.message_id,
-            author_id=user.id, author=user.full_name, date=message.date.isoformat(),
+            author_id=user.id, author=user.full_name,
+            date=((getattr(message, "edit_date", None) or message.date) if is_edit else message.date).isoformat(),
             text=text, reply_to=getattr(reply, 'message_id', None), respond=respond,
             authorization_pending=authorization_pending,
-            source=source, audio=metadata, image=image)
+            source=source, audio=metadata, image=image, is_edit=is_edit)
 
     async def hydrate_documents(self, bot):
         for row in await asyncio.to_thread(self.service.store.awaiting_documents, self.chat_id):
@@ -372,7 +376,7 @@ class SalesTelegram:
             raise ValueError('Sales Buddy must be a group administrator to receive natural messages')
         self.run_id = await asyncio.to_thread(self.service.store.begin_run, self.chat_id, self.system_topic_id)
         watchdog = PollingWatchdog(self.heartbeat, 10, 90, 20,
-            ['message', 'callback_query'], 0, fatal_state_key='sales_polling_fatal')
+            ['message', 'edited_message', 'callback_query'], 0, fatal_state_key='sales_polling_fatal')
         self.tasks = [asyncio.create_task(self.analyze_pending(app)),
                       asyncio.create_task(self.deliver_pending(app)),
                       asyncio.create_task(self.startup_probe(app)),

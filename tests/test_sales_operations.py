@@ -189,7 +189,7 @@ async def test_start_stop_reuses_polling_watchdog_and_clean_marker(tmp_path, mon
     await bridge.stop(app)
     args, kwargs = watchdogs[0]
     assert args[0] is bridge.heartbeat
-    assert args[4] == ['message', 'callback_query']
+    assert args[4] == ['message', 'edited_message', 'callback_query']
     assert kwargs['fatal_state_key'] == 'sales_polling_fatal'
     assert bridge.service.store.op_get('run')['clean'] is True
     count = len(bridge.service.store.deliveries())

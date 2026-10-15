@@ -42,7 +42,7 @@ def main():
     service = SalesService(store, provider,
                            system_chat_id=settings.chat_id, system_topic_id=settings.system_topic_id)
     app = create_sales_application(settings, service)
-    app.run_polling(drop_pending_updates=False, allowed_updates=['message', 'callback_query'])
+    app.run_polling(drop_pending_updates=False, allowed_updates=['message', 'edited_message', 'callback_query'])
     if app.bot_data.get('sales_polling_fatal'):
         raise RuntimeError('Sales polling recovery failed')
 

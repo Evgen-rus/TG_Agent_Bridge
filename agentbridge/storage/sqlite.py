@@ -10,6 +10,8 @@ import json
 import logging
 import sqlite3
 
+from .revisions import allow_message_edits
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHAT_STATE = {
@@ -286,6 +288,7 @@ class StoredMessage:
     forward_origin: str = ""
     download_status: str = ""
     download_error: str = ""
+    is_edit: bool = False
 
 
 @dataclass(frozen=True)
@@ -1162,6 +1165,7 @@ class ChatThreadStore:
                 """
             )
             self._upgrade_schema(connection)
+            allow_message_edits(connection, "telegram_messages")
             connection.execute(
                 "UPDATE telegram_messages SET processing_status='pending' WHERE processing_status='processing'"
             )
@@ -1853,6 +1857,7 @@ class ChatThreadStore:
         media_group_id: str = "",
         media_file_unique_id: str = "",
         forward_origin: str = "",
+        is_edit: bool = False,
     ) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -1860,13 +1865,14 @@ class ChatThreadStore:
                     update_id, chat_id, message_id, sender_id, sender_name, telegram_date,
                     text, reply_to_message_id, role, processing_status, created_at,
                     media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id,
-                    media_file_unique_id, forward_origin, download_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    media_file_unique_id, forward_origin, download_status, edit_update_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     update_id, chat_id, message_id, sender_id, sender_name, telegram_date,
                     text, reply_to_message_id, role, processing_status, _now(),
                     media_kind, media_path, telegram_file_id, media_mime, media_filename, media_group_id,
                     media_file_unique_id, forward_origin, "available" if media_path else "pending" if telegram_file_id else "",
+                    update_id if is_edit else 0,
                 ),
             )
             return cursor.rowcount == 1
@@ -2028,6 +2034,7 @@ class ChatThreadStore:
             sender_id=row["sender_id"], sender_name=row["sender_name"], telegram_date=row["telegram_date"],
             text=row["text"], reply_to_message_id=row["reply_to_message_id"], role=row["role"],
             processing_status=row["processing_status"],
+            is_edit=bool(row["edit_update_id"]),
             media_kind=str(row["media_kind"] or "") if "media_kind" in keys else "",
             media_path=str(row["media_path"] or "") if "media_path" in keys else "",
             telegram_file_id=str(row["telegram_file_id"] or "") if "telegram_file_id" in keys else "",

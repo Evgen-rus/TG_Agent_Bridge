@@ -112,7 +112,8 @@ async def transcribe_pending_voice_messages(
         path: Path | None = None
         if media_dir is not None and downloader is not None and path_saver is not None:
             ref = MediaRef(kind="voice", file_id=row.telegram_file_id, filename="voice.ogg", mime="audio/ogg")
-            path = await materialize_media_ref(bot, ref, media_dir, row.chat_id, row.message_id)
+            path = await materialize_media_ref(bot, ref, media_dir, row.chat_id,
+                -row.update_id if getattr(row, "is_edit", False) else row.message_id)
             if path is not None:
                 path_saver(row.id, str(path))
         if path is None:
@@ -413,7 +414,7 @@ def create_telegram_application(
         check_interval_seconds=polling_watchdog_seconds,
         stall_seconds=polling_stall_seconds,
         restart_timeout_seconds=polling_restart_timeout_seconds,
-        allowed_updates=("message", "callback_query", "my_chat_member"),
+        allowed_updates=("message", "edited_message", "callback_query", "my_chat_member"),
         bootstrap_retries=polling_bootstrap_retries,
     )
     pending_batches: dict[int, _PendingBatch] = {}
@@ -984,7 +985,8 @@ def create_telegram_application(
             update_id=update.update_id,
             message_id=getattr(message, "message_id", None),
             sender_id=getattr(sender, "id", None),
-            telegram_date=_telegram_date(message),
+            telegram_date=(message.edit_date.isoformat() if getattr(update, "edited_message", None) is not None
+                           and getattr(message, "edit_date", None) else _telegram_date(message)),
             reply_to_message_id=getattr(reply, "message_id", None),
             media_kind=media.kind if media is not None else "",
             telegram_file_id=media.file_id if media is not None else "",
@@ -993,6 +995,7 @@ def create_telegram_application(
             media_group_id=media.media_group_id if media is not None else "",
             media_file_unique_id=str(getattr(document, "file_unique_id", "") or ""),
             forward_origin=forward_origin,
+            is_edit=getattr(update, "edited_message", None) is not None,
         )
         ingest = getattr(message_service, "ingest_telegram_message", None)
         if ingest is not None and message is not None:
@@ -1013,6 +1016,7 @@ def create_telegram_application(
                 media_group_id=item.media_group_id,
                 media_file_unique_id=item.media_file_unique_id,
                 forward_origin=item.forward_origin,
+                is_edit=item.is_edit,
             )
             if inserted:
                 logger.info("event=telegram_update_persisted component=telegram chat_id=%s update_id=%s", chat_id, update.update_id)
@@ -1032,7 +1036,8 @@ def create_telegram_application(
                 mime=row.media_mime,
                 media_group_id=row.media_group_id,
             )
-            path = await materialize_media_ref(bot, ref, media_dir, row.chat_id, row.message_id)
+            path = await materialize_media_ref(bot, ref, media_dir, row.chat_id,
+                -row.update_id if getattr(row, "is_edit", False) else row.message_id)
             if path is not None:
                 saver(row.id, str(path))
             else:
@@ -1048,7 +1053,8 @@ def create_telegram_application(
             if media_file_ready(row.media_path) or not row.telegram_file_id:
                 continue
             ref = MediaRef(kind="document", file_id=row.telegram_file_id, filename=row.media_filename, mime=row.media_mime)
-            path = await materialize_media_ref(application.bot, ref, media_dir, row.chat_id, row.message_id)
+            path = await materialize_media_ref(application.bot, ref, media_dir, row.chat_id,
+                -row.update_id if getattr(row, "is_edit", False) else row.message_id)
             if path is None:
                 listing.set_media_download_failure(row.id, "telegram_download_failed_or_size_limit")
             else:
@@ -1818,9 +1824,9 @@ def create_telegram_application(
         pattern=r"^audit:(?:accepted|rejected|later):\d+$|^(?:(?:learn|onboard):(?:yes|no)|memory:(?:yes|no|global|chat)):\d+$|^general:(?:confirm|refine|cancel):\d+$|^portfolio:(?:all|multi|single|general|done|reset|cancel):\d+$|^portfolio:choose:\d+:\d+$|^portfolio:item(?:_add|_remove)?:\d+:\d+$",
     ))
     application.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    application.add_handler(CommandHandler("rules", rules_command))
-    application.add_handler(CommandHandler("undo", undo_command))
-    application.add_handler(CommandHandler("remind", remind_command))
-    application.add_handler(CommandHandler("reminders", reminders_command))
-    application.add_handler(CommandHandler("dev", dev_command))
+    application.add_handler(CommandHandler("rules", rules_command, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("undo", undo_command, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("remind", remind_command, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("reminders", reminders_command, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("dev", dev_command, filters=filters.UpdateType.MESSAGE))
     return application

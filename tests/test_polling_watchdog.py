@@ -47,7 +47,7 @@ def _watchdog(heartbeat: PollingHeartbeat) -> PollingWatchdog:
         check_interval_seconds=0.005,
         stall_seconds=0.02,
         restart_timeout_seconds=0.1,
-        allowed_updates=("message", "callback_query", "my_chat_member"),
+        allowed_updates=("message", "edited_message", "callback_query", "my_chat_member"),
         bootstrap_retries=5,
     )
 
@@ -85,7 +85,7 @@ async def test_watchdog_restarts_stalled_polling_without_dropping_backlog() -> N
 
     assert updater.stop_calls == 1
     assert updater.start_calls == [{
-        "allowed_updates": ("message", "callback_query", "my_chat_member"),
+        "allowed_updates": ("message", "edited_message", "callback_query", "my_chat_member"),
         "drop_pending_updates": False,
         "bootstrap_retries": 5,
     }]

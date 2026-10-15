@@ -109,12 +109,15 @@ manager_tactics.md; hash инструкций/знаний обновляет т
 выбор тактики не расширяет output schema. Аудио без вопроса извлекает память
 и выдаёт подтверждение, без next_action/goal или готового клиентского текста.
 
-Спорная замена защищённого facts-поля без явного исправления менеджера теперь
-становится `fact_reviews` во внутреннем результате провайдера. SDK schema этого
-поля не предоставляет; код сначала проверяет field/kind/source/quote/replaces,
-точные совпадения прежнего текста пропускает, неизвестные/чужие IDs и downgrade
-не превращает в предложения. Строгий validate_result остаётся default; runtime
-явно включает review mode. Две additive SQLite таблицы review_episodes/fact_reviews
+Обычный Sales-анализ, document parts и checkpoints используют validate_result
+с check_semantics=False. Проверяются формат/размеры, event_id текущей сделки и
+принадлежность заменяемого facts ID её карточке. Дословность quote, смысловые
+regex неопределённости/исправления, kind=unknown, наличие/доступность basis и
+запрет downgrade не блокируют ответ; классификация остаётся за моделью.
+Замены фактов своей карточки применяются без нового Telegram-подтверждения.
+Strict mode сохранён для ранее созданных fact_reviews, чтобы завершить их
+прежний контракт. Проверки DISC, редактора и отдельного реестра договорённостей
+не меняются. Две additive SQLite таблицы review_episodes/fact_reviews
 сохраняют весь валидированный результат, исходные events, решения/участника/время.
 В каждой теме не более одного ожидающего episode. До всех решений не меняются
 ни facts, ни profiles, не доставляется ответ, который мог опираться на спорную
@@ -132,7 +135,9 @@ membership, chat/topic и точный доставленный message ID. Вс
 
 ValueError валидации или некорректный результат codex_turn_failed останавливает
 конкретный episode с processed=3 и одним безопасным сообщением, без глобального
-codex_failure и без бесконечных retry. Исходные материалы остаются в SQLite.
+codex_failure и без бесконечных retry. Исходные материалы остаются в SQLite;
+processed=3 включается в history своей сделки вместе с processed=1, но не
+запускает самостоятельный автоматический повтор. Неготовые media исключены.
 Авторизация/лимит/сеть/транспорт сохраняют прежний backoff/probe. Непрошедшая
 редактура использует исходный draft; лишь реальный provider outage ставит общую
 паузу. Логи содержат фиксированный reason, никогда данные спорного факта.
@@ -776,3 +781,18 @@ failure leaves the inbox row pending.
 ## LeadRecord owner analytics
 
 The owner planner can return leadrecord_analytics inputs. Trusted leadrecord.py resolves configured groups through restricted SSH lkctl commands, refreshes snapshots and polls existing backend jobs after the ordinary task confirmation. It preserves the inclusive envelope plus up to 64 ordered periods (within a maximum 366-day envelope); confirmation, resumed runs and results must match the same period list in the same order. A single legacy start/end range is normalized to one period. XLSX is fetched below an isolated `runtime/media/owner_generated/leadrecord-task-<id>/` directory, using the validated `download_filename` supplied by LeadRecord, and delivered as media_kind=document through the existing durable owner delivery queue. Period metrics are reported separately when the requested periods overlap; they are never summed. run_id is persisted in owner_general_tasks.payload_json and restored only if group scope and the exact ordered periods still match. No client chat sends or unrestricted model shell are added.
+
+## Редактирование Telegram-сообщений
+
+Рик и Сали получают `edited_message` при обычном polling и восстановлении
+watchdog. Правка сохраняется отдельной неизменяемой версией в существующем
+inbox с исходным `message_id` и `edit_update_id=update_id`; повтор одного update
+не создаёт новую запись. Старые версии, факты и ссылки на источники сохраняются.
+Модели передаётся явная метка замены прежнего текста; исправление учитывается
+в обычном окне своей беседы/темы, в том числе после сбоя или рестарта.
+Подписи и заменённые вложения проходят прежние media workers. Правка во время
+анализа остаётся отдельным pending-событием следующего пакета. Рик по-прежнему
+доставляет ответы только владельцу; owner mention/reply и ограничения Сали
+сохраняются. Редактирование команды не запускает команду/рестарт Сали.
+При первом запуске миграция сохраняет все строки, ID, индексы и расширяет
+уникальность сообщения до `(chat_id,message_id,edit_update_id)`.

@@ -21,7 +21,7 @@ class SalesProvider(Protocol):
     async def analyze_commitments(self, context: dict) -> dict: ...
 
 
-def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
+def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False, check_semantics=True):
     if (not isinstance(result, dict) or
             not {'answer', 'facts', 'next_action', 'goal', 'basis'} <= set(result) or
             set(result) - {'answer', 'facts', 'next_action', 'goal', 'basis',
@@ -44,10 +44,10 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
     existing = {row['id']: row for row in context['facts']}
     available_sources = set(sources) | {row['event_id'] for row in context['facts']}
     if not isinstance(result['basis'], list) or len(result['basis']) > 20 or any(
-        type(i) is not int or i not in available_sources for i in result['basis']
+        type(i) is not int or (check_semantics and i not in available_sources) for i in result['basis']
     ):
         raise ValueError('Invalid recommendation source')
-    if result['next_action'].strip() and not result['basis']:
+    if check_semantics and result['next_action'].strip() and not result['basis']:
         raise ValueError('Action without source')
     pending_reviews = result.get('fact_reviews', [])
     if (not isinstance(result['facts'], list) or not isinstance(pending_reviews, list) or
@@ -62,10 +62,10 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
             raise ValueError('Invalid classification')
         if any(not isinstance(fact[key], str) or not fact[key].strip() or len(fact[key]) > 1000 for key in ('text', 'quote')):
             raise ValueError('Invalid fact text')
-        if type(fact['event_id']) is not int or fact['event_id'] not in current_ids or fact['quote'] not in sources[fact['event_id']]:
+        if type(fact['event_id']) is not int or fact['event_id'] not in current_ids or (check_semantics and fact['quote'] not in sources[fact['event_id']]):
             raise ValueError('Fact has no current source')
         event = events[fact['event_id']]
-        if event.get('source') == 'image_transcript':
+        if check_semantics and event.get('source') == 'image_transcript':
             evidence = event.get('image_evidence', [])
             matches = [item for item in evidence if fact['quote'] in item['text']]
             caption_quote = fact['quote'] in event.get('image_caption', '')
@@ -73,9 +73,9 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
                 raise ValueError('Fact has no current source')
             if not caption_quote and not any(item['kind'] == 'readable_text' for item in matches) and fact['kind'] not in {'unknown', 'assumption'}:
                 raise ValueError('Uncertain image evidence cannot become a fact')
-        if fact['field'] == 'unknowns' and fact['kind'] != 'unknown':
+        if check_semantics and fact['field'] == 'unknowns' and fact['kind'] != 'unknown':
             raise ValueError('Unknown cannot be confirmed')
-        if fact['kind'] in {'fact', 'agreement'} and re.search(
+        if check_semantics and fact['kind'] in {'fact', 'agreement'} and re.search(
             r'(?i)не зна[ею]|неизвестн|неясн|нет данных|не определ[её]н|не подтвержд[её]н', fact['quote']
         ):
             raise ValueError('Explicit uncertainty cannot become a fact')
@@ -87,6 +87,10 @@ def validate_result(result, context, *, max_facts=25, allow_fact_reviews=False):
             if old is None or old_id in replaced or old['field'] != fact['field']:
                 raise ValueError('Cross-deal or repeated replacement')
             if all(old[key] == fact[key] for key in ('field', 'text', 'kind')):
+                continue
+            if not check_semantics and fact not in pending_reviews:
+                replaced.add(old_id)
+                clean.append(fact)
                 continue
             # Facts are immutable unless the manager explicitly corrects or changes them.
             correction_text = event.get('image_caption', '') if event.get('source') == 'image_transcript' else sources[fact['event_id']]
@@ -185,7 +189,7 @@ class SalesService:
             try:
                 async with activity(chat_id, topic_id) if activity else nullcontext():
                     model_task = asyncio.create_task(self.provider.analyze(context))
-                    result = validate_result(await asyncio.shield(model_task), context, max_facts=2000, allow_fact_reviews=True)
+                    result = validate_result(await asyncio.shield(model_task), context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)
                     if self.commitments:
                         try:
                             await self.commitments.observe(topic_id)

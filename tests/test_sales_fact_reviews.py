@@ -10,7 +10,7 @@ from agentbridge.sales.service import SalesService, validate_result
 from agentbridge.sales.storage import SalesStore
 
 
-def test_profile_repair_cannot_silently_remove_fact_confirmation(tmp_path, monkeypatch):
+def test_profile_repair_does_not_create_fact_confirmation(tmp_path, monkeypatch):
     from agentbridge.sales.provider import SalesCodexProvider
     from test_sales_threads import SDK
     from test_sales_communication import profile
@@ -24,9 +24,9 @@ def test_profile_repair_cannot_silently_remove_fact_confirmation(tmp_path, monke
         return {**result, 'communication_profiles': [profile(event_id=2)]}
     monkeypatch.setattr(provider, '_run', run)
     validated = provider._analyze(context)
-    assert validated['facts'] == [] and len(validated['fact_reviews']) == 1
+    assert validated['facts'] == [] and not validated.get('fact_reviews')
     store.complete(-100, 10, context['events'], validated)
-    assert store.awaiting_fact_review(-100, 10)
+    assert not store.awaiting_fact_review(-100, 10)
     assert active_facts(store)[0]['text'] == old['text']
 
 
@@ -267,14 +267,14 @@ async def test_review_delivery_buttons_in_source_topic(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_service_disputed_fact_does_not_pause_codex_or_repeat_provider(tmp_path, caplog):
+async def test_service_fact_replacement_does_not_require_confirmation(tmp_path, caplog):
     store, context, result, old = seeded(tmp_path)
     provider = NS(analyze=AsyncMock(return_value=result))
     service = SalesService(store, provider)
     await service.process(-100, 10)
-    assert store.awaiting_fact_review(-100, 10)
+    assert not store.awaiting_fact_review(-100, 10)
     assert not store.op_get('codex_failure')
-    assert active_facts(store)[0]['text'] == old['text']
+    assert active_facts(store)[0]['text'] == result['facts'][0]['text']
     await service.process(-100, 10)
     assert provider.analyze.await_count == 1
     assert result['answer'] not in caplog.text
@@ -285,6 +285,7 @@ async def test_service_disputed_fact_does_not_pause_codex_or_repeat_provider(tmp
 async def test_invalid_source_stops_only_episode_without_global_outage(tmp_path, caplog):
     store, context, result, old = seeded(tmp_path)
     result['facts'][0]['quote'] = 'SECRET nonexistent source'
+    result['facts'][0]['event_id'] = 999
     provider = NS(analyze=AsyncMock(return_value=result))
     service = SalesService(store, provider)
     await service.process(-100, 10)

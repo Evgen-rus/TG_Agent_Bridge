@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from agentbridge.telegram.formatter import split_owner_message
 from .communication import validate_profile_updates
+from agentbridge.storage.revisions import allow_message_edits
 
 
 def encoded(value):
@@ -110,6 +111,7 @@ class SalesStore:
             if 'received_at' not in event_columns:
                 # Legacy pending events are catch-up; receipt time is no longer recoverable.
                 db.execute('ALTER TABLE events ADD COLUMN received_at REAL NOT NULL DEFAULT 0')
+            allow_message_edits(db, "events")
             from .commitments import DDL
             db.executescript(DDL)
 
@@ -125,7 +127,7 @@ class SalesStore:
 
     def ingest(self, *, update_id, chat_id, topic_id, title, message_id,
                author_id, author, date, text, source="telegram_text", reply_to=None,
-               respond=True, response_text=None, authorization_pending=False, audio=None, image=None):
+               respond=True, response_text=None, authorization_pending=False, audio=None, image=None, is_edit=False):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
@@ -136,10 +138,10 @@ class SalesStore:
                 (chat_id, topic_id, reply_to)).fetchone():
                 source = 'manager_feedback'
             inserted = db.execute("""INSERT OR IGNORE INTO events
-                (update_id,chat_id,topic_id,message_id,author_id,author,date,text,source,reply_to,processed,received_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (update_id, chat_id, topic_id, message_id,
+                (update_id,chat_id,topic_id,message_id,author_id,author,date,text,source,reply_to,processed,received_at,edit_update_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (update_id, chat_id, topic_id, message_id,
                 author_id, author, date, text, source, reply_to,
-                (-1 if respond else -2) if authorization_pending else int(not respond), time.time())).rowcount
+                (-1 if respond else -2) if authorization_pending else int(not respond), time.time(), update_id if is_edit else 0)).rowcount
             if inserted:
                 event_id = db.execute('SELECT id FROM events WHERE update_id=?', (update_id,)).fetchone()[0]
                 if audio:
@@ -255,7 +257,7 @@ class SalesStore:
             facts = [dict(row) for row in db.execute("""SELECT * FROM facts WHERE
                 chat_id=? AND topic_id=? AND superseded_by IS NULL ORDER BY id""", scope)]
             history = [dict(row) for row in db.execute("""SELECT * FROM events WHERE
-            chat_id=? AND topic_id=? AND processed=1 AND source NOT IN ('text_document_pending','audio_pending','image_pending')
+            chat_id=? AND topic_id=? AND processed IN (1,3) AND source NOT IN ('text_document_pending','audio_pending','image_pending')
             AND (?=0 OR id<=?) ORDER BY id DESC LIMIT 200""",
                 (*scope, cutoff if batch else 0, cutoff if batch else 0))]
             previous = [dict(row) for row in db.execute("""SELECT * FROM recommendations WHERE

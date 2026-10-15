@@ -194,7 +194,7 @@ def main() -> None:
         logging.warning("event=self_restart_abandoned component=application count=%d", abandoned)
     try:
         telegram_application.run_polling(
-            allowed_updates=["message", "callback_query", "my_chat_member"],
+            allowed_updates=["message", "edited_message", "callback_query", "my_chat_member"],
             drop_pending_updates=False,
             bootstrap_retries=settings.telegram_bootstrap_retries,
         )

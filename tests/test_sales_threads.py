@@ -218,6 +218,46 @@ def test_lossless_speaker_boundaries():
 
 
 @pytest.mark.asyncio
+async def test_normal_analysis_accepts_uncertainty_quote_and_old_basis(setup, monkeypatch):
+    store, factory = setup
+    ingest(store, text='Не знаю условия, уточню')
+    with store.connect() as db:
+        db.execute('UPDATE events SET processed=3')
+    ingest(store, 2, text='Сали, что дальше?')
+    provider = factory()
+
+    def run(thread, context, schema=None, **kwargs):
+        assert [row['id'] for row in context['events']] == [2]
+        return dict(answer='Уточните условия.', next_action='Уточнить', goal='Получить ответ',
+            basis=[1, 2], facts=[dict(field='manager_promises', kind='agreement',
+                text='Не знаю условия, уточню', event_id=2, quote='Не знаю, но уточню', replaces=0)])
+
+    monkeypatch.setattr(provider, '_run', run)
+    await SalesService(store, provider).process(-100, 10)
+    assert store.context(-100, 10)['facts'][0]['kind'] == 'agreement'
+    assert not store.pending_topics()
+    assert any(row['text'] == 'Уточните условия.' for row in store.deliveries())
+    assert [row['id'] for row in store.context(-100, 10)['history']] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_normal_analysis_still_rejects_fact_from_another_topic(setup, monkeypatch):
+    store, factory = setup
+    ingest(store, topic=20)
+    ingest(store, 2)
+    provider = factory()
+    monkeypatch.setattr(provider, '_run', lambda *args, **kwargs:
+        dict(answer='Ответ', next_action='', goal='', basis=[], facts=[
+            dict(field='confirmed', kind='fact', text='Чужая запись', event_id=1,
+                 quote='Любая цитата', replaces=0)]))
+    await SalesService(store, provider).process(-100, 10)
+    assert not store.context(-100, 10)['facts']
+    with store.connect() as db:
+        assert db.execute('SELECT processed FROM events WHERE id=2').fetchone()[0] == 3
+        assert db.execute('SELECT processed FROM events WHERE id=1').fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_oversized_document_is_explicitly_incomplete_without_partial_recommendation(setup):
     store, factory = setup
     text = 'a' * (65 * 16000)

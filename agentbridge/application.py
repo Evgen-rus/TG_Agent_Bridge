@@ -94,6 +94,7 @@ class IncomingMessage:
     media_group_id: str = ""
     media_file_unique_id: str = ""
     forward_origin: str = ""
+    is_edit: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,7 @@ class AgentBridgeApplication:
         media_group_id: str = "",
         media_file_unique_id: str = "",
         forward_origin: str = "",
+        is_edit: bool = False,
     ) -> bool:
         if is_owner_chat:
             role = "owner"
@@ -271,6 +273,7 @@ class AgentBridgeApplication:
             media_group_id=media_group_id,
             media_file_unique_id=media_file_unique_id,
             forward_origin=forward_origin,
+            is_edit=is_edit,
         )
 
     def pending_media_downloads(self, telegram_chat_id: int) -> list[StoredMessage]:
@@ -435,6 +438,7 @@ class AgentBridgeApplication:
             media_group_id=item.media_group_id,
             media_file_unique_id=item.media_file_unique_id,
             forward_origin=item.forward_origin,
+            is_edit=item.is_edit,
         )
 
     def _claim_incoming(self, telegram_chat_id: int, messages: list[IncomingMessage]) -> list[StoredMessage]:
@@ -652,7 +656,7 @@ class AgentBridgeApplication:
         parts.append("Текущее состояние чата:\n" + json.dumps(state, ensure_ascii=False, indent=2))
         if recent:
             history = "\n".join(
-                f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}{_forward_label(item.forward_origin)}: {display_message_text(item.text, item.media_kind, item.media_filename)}"
+                f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}{_forward_label(item.forward_origin)}: {_edit_label(item)}{display_message_text(item.text, item.media_kind, item.media_filename)}"
                 for item in recent
             )
             if time_from_utc is not None or time_to_utc is not None:
@@ -1776,7 +1780,7 @@ class AgentBridgeApplication:
             chat.telegram_chat_id, time_from_utc=scope.time_from_utc, time_to_utc=scope.time_to_utc, limit=200,
         )
         state = self.store.get_chat_state(chat.telegram_chat_id)
-        history = "\n".join(f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}{_forward_label(item.forward_origin)}: {display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
+        history = "\n".join(f"{item.telegram_date} [{self._stored_role(item)}] {item.sender_name}{_forward_label(item.forward_origin)}: {_edit_label(item)}{display_message_text(item.text, item.media_kind, item.media_filename)}" for item in messages)
         parts = [f"Клиент: {chat.name}", f"Период: {scope.time_label}", f"Wiki:\n{chat.wiki or '(пусто)'}"]
         shared = self._shared_knowledge(chat)
         if shared:
@@ -2296,11 +2300,12 @@ def _from_stored(item: StoredMessage) -> IncomingMessage:
         media_group_id=item.media_group_id,
         media_file_unique_id=item.media_file_unique_id,
         forward_origin=item.forward_origin,
+        is_edit=item.is_edit,
     )
 
 
 def _episode_text(item: IncomingMessage) -> str:
-    body = (item.text or "").strip()
+    body = _edit_label(item) + (item.text or "").strip()
     unavailable = bool(item.telegram_file_id or item.media_kind) and not media_file_ready(item.media_path)
     if item.media_kind or item.media_filename:
         label = media_label(item.media_kind, item.media_filename, unavailable=unavailable)
@@ -2308,6 +2313,11 @@ def _episode_text(item: IncomingMessage) -> str:
             return f"{label} {body}"
         return body or label
     return body
+
+
+def _edit_label(item: IncomingMessage | StoredMessage) -> str:
+    return (f"[Изменено сообщение #{item.message_id}; эта версия заменяет прежний текст] "
+            if item.is_edit else "")
 
 
 def _forward_label(origin: str) -> str:

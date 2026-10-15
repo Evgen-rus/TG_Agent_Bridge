@@ -220,6 +220,11 @@ checkpoint может повторить чтение. Для новых пра�
 
 SQLite сохраняет первоисточники и рекомендации. Явные исправления («Исправление:
 нужно 12 весов вместо 10») обновляют карточку без удаления прежних источников.
+Обычный анализ проверяет формат ответа и принадлежность записей своей сделке;
+дословность цитат, классификация неопределённости и ссылки basis больше не
+блокируют ответ. Замены фактов своей карточки не требуют нового подтверждения.
+Сообщения с неудачным анализом остаются в истории последующих запросов.
+Проверки DISC, редактора и отдельного реестра договорённостей сохраняются.
 Ответ на сообщение Сали сохраняется как feedback. После ошибки модели материал
 остаётся в очереди. Сбои Codex приостанавливают анализ, сохраняя новые сообщения;
 фоновые проверки доступа используют паузу от 5 минут (лимит: от часа) до 6 часов.
@@ -538,3 +543,18 @@ git diff --check                                     # пробелы в diff
 Set LEADRECORD_SSH_TARGET and LEADRECORD_SSH_IDENTITY for the restricted lkctl SSH entry point. Owner requests name the client, configured analytics group and inclusive period. A request may include an ordered set of up to 64 periods inside a 366-day envelope; Rick lists every period in the confirmation card and requires an exact match when resuming. Discovery is shown before the existing confirmation card; new projects/statuses require explicit owner input. The existing owner delivery queue sends the XLSX as a document only to OWNER_CHAT_ID, using the safe filename returned by LeadRecord.
 
 Example owner request: «Рик, сделай аналитику LeadRecord: клиент CLIENT, проект PROJECT, с YYYY-MM-DD по YYYY-MM-DD». Explicit LeadRecord / «аналитика ЛК» requests enter the analytics confirmation flow directly.
+
+## Редактирование Telegram-сообщений
+
+Рик и Сали получают `edited_message` при обычном polling и восстановлении
+watchdog. Правка сохраняется отдельной неизменяемой версией в существующем
+inbox с исходным `message_id` и `edit_update_id=update_id`; повтор одного update
+не создаёт новую запись. Старые версии, факты и ссылки на источники сохраняются.
+Модели передаётся явная метка замены прежнего текста; исправление учитывается
+в обычном окне своей беседы/темы, в том числе после сбоя или рестарта.
+Подписи и заменённые вложения проходят прежние media workers. Правка во время
+анализа остаётся отдельным pending-событием следующего пакета. Рик по-прежнему
+доставляет ответы только владельцу; owner mention/reply и ограничения Сали
+сохраняются. Редактирование команды не запускает команду/рестарт Сали.
+При первом запуске миграция сохраняет все строки, ID, индексы и расширяет
+уникальность сообщения до `(chat_id,message_id,edit_update_id)`.

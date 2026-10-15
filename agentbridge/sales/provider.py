@@ -92,6 +92,9 @@ image_evidence разделяет readable_text (дословно прочита
 Учитывай все части, включая изменения позиции в середине и конце. Итог один.
 Напоминания, задачи и обучение пока недоступны; не обещай выполнить их автоматически.
 Служебные сообщения и технические проверки не являются фактами реальной сделки.
+edit_update_id>0 означает новую редакцию того же Telegram message_id, а не новое
+обещание или ещё одно сообщение. Последняя редакция заменяет прежний текст;
+учитывай её при исправлении фактов и реестра, не дублируй прежние обязательства.
 SQLite — память. Не считай свой прежний совет фактом, обещанием или реакцией клиента.
 Отправка письма/попытка звонка — действие менеджера, не результат клиента.
 Возвращай только JSON. answer: кратко по-русски; при просьбе написать клиенту сразу
@@ -261,7 +264,7 @@ class SalesCodexProvider(CodexProvider):
         request_key = hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         cached = self.store.turn_result(request_key)
         if cached is not None:
-            return validate_result(cached, context, max_facts=2000, allow_fact_reviews=True)
+            return validate_result(cached, context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)
         chat, topic = context['chat_id'], context['topic_id']
         saved = self.store.thread(chat, topic)
         with Codex(config=self._config()) as codex:
@@ -293,7 +296,7 @@ class SalesCodexProvider(CodexProvider):
             if len(json.dumps(model_context, ensure_ascii=False)) > 180000:
                 raise SalesFailure('document_too_large')
             raw = self._run(thread, model_context)
-            payload = validate_result(raw, context, allow_fact_reviews=True)
+            payload = validate_result(raw, context, allow_fact_reviews=True, check_semantics=False)
             if raw.get('communication_profiles', []) != payload.get('communication_profiles', []):
                 fact_reviews = payload.get('fact_reviews', [])
                 # A neutralized profile must not survive as an unsupported claim in prose.
@@ -303,19 +306,19 @@ class SalesCodexProvider(CodexProvider):
                 revised = self._run(thread, corrected_context)
                 if revised.get('communication_profiles'):
                     raise ValueError('Invalid communication profile repair')
-                payload = validate_result(revised, context, allow_fact_reviews=True)
+                payload = validate_result(revised, context, allow_fact_reviews=True, check_semantics=False)
                 for review in payload.get('fact_reviews', []):
                     if review not in fact_reviews:
                         fact_reviews.append(review)
                 if fact_reviews:
                     payload['fact_reviews'] = fact_reviews
-                payload['communication_profiles'] = validate_result(raw, context, allow_fact_reviews=True).get('communication_profiles', [])
+                payload['communication_profiles'] = validate_result(raw, context, allow_fact_reviews=True, check_semantics=False).get('communication_profiles', [])
             if extracted:
                 merged = []
                 for fact in extracted + payload['facts']:
                     if fact not in merged:
                         merged.append(fact)
-                payload = validate_result({**payload, 'facts': merged}, context, max_facts=2000, allow_fact_reviews=True)
+                payload = validate_result({**payload, 'facts': merged}, context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)
             if payload.get('client_draft'):
                 payload = self._edit(codex, payload)
             self.store.turn_result(request_key, payload)
@@ -364,7 +367,7 @@ class SalesCodexProvider(CodexProvider):
                 payload = self.store.chunk_result(event['id'], index, fingerprint)
                 if payload is None:
                     raw = self._run(self._start(codex, ephemeral=True), partial)
-                    payload = validate_result({**raw, 'communication_profiles': []}, partial, allow_fact_reviews=True)
+                    payload = validate_result({**raw, 'communication_profiles': []}, partial, allow_fact_reviews=True, check_semantics=False)
                     # Role context may straddle a boundary; anchor it in the full saved source.
                     observations = [profile for profile in raw.get('communication_profiles', [])
                         if all(item['event_id'] == event['id'] and item['quote'] in text
