@@ -351,6 +351,8 @@ class SalesTelegram:
                 if not await asyncio.to_thread(delivery_allowed, self.service.store, row, self.service.commitments is not None):
                     continue
                 options = {}
+                if row['delivery_key'].startswith('reminder:'):
+                    options['parse_mode'] = 'HTML'
                 if row['delivery_key'].startswith('fact-review:'):
                     marker = row['delivery_key'].split(':')[1]
                     options['reply_markup'] = InlineKeyboardMarkup([[

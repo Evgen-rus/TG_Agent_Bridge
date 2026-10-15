@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import hashlib
+import html
 import json
 import logging
 import re
@@ -31,6 +32,8 @@ SCHEMA = _object({'updates': {'type': 'array', 'items': _object({
     'date_basis': {'type': 'string', 'enum': ['absolute', 'message_date', 'unknown', 'none']},
     'material': {'type': 'string', 'enum': ['current', 'historical', 'uncertain']},
     'reason': {'type': 'string'},
+    'reminder': {'type': 'string', 'enum': ['keep', 'set', 'cancel', 'clarify']},
+    'remind_at': {'type': ['string', 'null']},
 })}})
 
 TASK = """Ты ведёшь внутренний реестр договорённостей помощника менеджера Сали.
@@ -77,12 +80,34 @@ historical или uncertain. Не считай дату загрузки дат�
 через неделю из текущего сообщения. Для другого или неоднозначного срока оставь
 due_date=null, date_basis=unknown. Не выдавай прежнее обещание за новое изменение.
 """
+TASK += """
+Явные напоминания: «Сали, напомни завтра в 15:00 позвонить» — тоже manager_action,
+даже если это просьба, а не обещание. Для того же действия используй существующий id,
+party и action_key: напоминание и договорённость — ОДНА запись, не два задания.
+reminder=keep и remind_at=null для обычных обещаний и неизменённых напоминаний.
+reminder=set только по явной просьбе участника текущей переписки, material=current,
+из telegram_text/manager_feedback/audio_transcript; не из цитаты клиента, файла или картинки.
+remind_at — ISO с часовым поясом, точный момент по Новосибирску (UTC+7).
+Поддерживаются явная календарная дата/сегодня/завтра/день недели + ЧЧ:ММ или «в 15 часов»,
+либо «через N минут/часов» (N цифрами). Относительное время считай от date исходного
+сообщения, НЕ от now. due_date для напоминания оставь null, если нет отдельного срока обещания.
+Если время не задано, неоднозначно, не поддерживается или уже прошло — reminder=clarify,
+remind_at=null: приложение спросит точную дату и время. Не назначай время сам.
+Продолжение уточнения времени связывай с той же записью и предыдущей явной просьбой.
+Перенос явного напоминания: reminder=set с новым временем; отмена только уведомления:
+reminder=cancel, state=active. Выполнение/отмена самой задачи — state=done/cancelled.
+Ответ на напоминание разрешай по outgoing_messages и его commitment_ids.
+Не устанавливай новое напоминание без явного запроса и не подтверждай его сам:
+приложение отправит подтверждение только после сохранения. Не создавай отдельное
+обязательство с другим action_key для уже имеющегося действия.
+"""
 
 DDL = """
 CREATE TABLE IF NOT EXISTS commitments (
  id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
  kind TEXT NOT NULL, party TEXT NOT NULL, action TEXT NOT NULL, action_key TEXT NOT NULL,
  state TEXT NOT NULL, event_id INTEGER NOT NULL, quote TEXT NOT NULL, due_date TEXT,
+ remind_at REAL, reminder_event_id INTEGER, reminder_sent_at REAL,
  next_check REAL, scheduled INTEGER NOT NULL DEFAULT 0, quiet INTEGER NOT NULL DEFAULT 0, checks INTEGER NOT NULL DEFAULT 0,
  revision INTEGER NOT NULL DEFAULT 1, updated_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS commitments_due ON commitments(chat_id,topic_id,state,next_check);
@@ -169,7 +194,42 @@ def _fresh(db, chat, topic):
 
 def _due(db, chat, topic, now):
     return [dict(r) for r in db.execute("""SELECT * FROM commitments WHERE chat_id=? AND topic_id=?
-        AND state='active' AND scheduled=1 AND quiet=0 AND checks<2 AND next_check<=? ORDER BY next_check,id""", (chat, topic, now))]
+        AND state='active' AND scheduled=1 AND quiet=0 AND checks<2 AND next_check<=?
+        AND (remind_at IS NULL OR reminder_sent_at IS NOT NULL) ORDER BY next_check,id""", (chat, topic, now))]
+
+
+def _reminder_time(row, event, previous=None):
+    if row['reminder'] != 'set':
+        if row['remind_at'] is not None:
+            raise ValueError('Unexpected reminder time')
+        return None
+    if (row['material'] != 'current' or event['source'] not in ('telegram_text', 'manager_feedback', 'audio_transcript')
+            or row['state'] != 'active'):
+        raise ValueError('Untrusted reminder request')
+    # A follow-up may supply just the time, but must refer to an existing explicit request.
+    if not re.search(r'(?i)напом|напомин|перенес|перенёс|переноси|перенести|отлож', row['quote']) and not (
+            previous and previous['reminder_event_id']):
+        raise ValueError('Missing explicit reminder request')
+    moment = datetime.fromisoformat(row['remind_at'] or '')
+    if moment.utcoffset() is None:
+        raise ValueError('Reminder time requires timezone')
+    local = moment.astimezone(LOCAL)
+    base = datetime.fromisoformat(event['date'])
+    relative = re.search(r'(?i)через\s+(\d+)\s*(минут\w*|час\w*)', row['quote'])
+    if relative:
+        delta = timedelta(**{('minutes' if relative[2].lower().startswith('мин') else 'hours'): int(relative[1])})
+        if moment != base + delta:
+            raise ValueError('Unsupported reminder time')
+    else:
+        clock = re.search(r'(?i)\b(\d{1,2}):(\d{2})\b|\bв\s+(\d{1,2})(?![\d:])\s*(?:час\w*)?\b', row['quote'])
+        if not clock or (local.hour, local.minute, local.second, local.microsecond) != (
+                int(clock[1] or clock[3]), int(clock[2] or 0), 0, 0):
+            raise ValueError('Unsupported reminder time')
+        dated = {**row, 'date_basis': 'absolute'}
+        if not _date_supported(local.date(), dated, event) and not _date_supported(
+                local.date(), {**row, 'date_basis': 'message_date'}, event):
+            raise ValueError('Unsupported reminder date')
+    return moment.timestamp()
 
 
 def _question(rows):
@@ -195,11 +255,16 @@ def validate_updates(payload, context):
                 row['event_id'] not in sources or row['kind'] not in ('manager_action', 'client_wait') or
                 row['state'] not in ('active', 'paused', 'done', 'cancelled', 'hold') or
                 row['material'] not in ('current', 'historical', 'uncertain') or
-                row['date_basis'] not in ('absolute', 'message_date', 'unknown', 'none')):
+                row['date_basis'] not in ('absolute', 'message_date', 'unknown', 'none') or
+                row['reminder'] not in ('keep', 'set', 'cancel', 'clarify')):
             raise ValueError('Invalid commitment classification')
         event = sources[row['event_id']]
         if row['quote'] not in event['text']:
             raise ValueError('Invalid commitment source')
+        _reminder_time(row, event, existing.get(row['id']))
+        if row['reminder'] in ('cancel', 'clarify') and (
+                row['material'] != 'current' or event['source'] not in ('telegram_text', 'manager_feedback', 'audio_transcript')):
+            raise ValueError('Untrusted reminder request')
         if event['source'] == 'image_transcript' and not (
                 row['quote'] in event.get('image_caption', '') or any(
                     e['kind'] == 'readable_text' and row['quote'] in e['text'] for e in event.get('image_evidence', []))):
@@ -255,13 +320,13 @@ def delivery_allowed(store, row, enabled, now=None):
                 row['text'] = check['fallback_text']
             return not check['autonomous']
         valid = enabled and _fresh(db, row['chat_id'], row['topic_id']) and check['snapshot'] == _snapshot(db, row['chat_id'], row['topic_id'])
-        if check['autonomous']:
+        if check['autonomous'] == 1:
             today = datetime.fromtimestamp(now, LOCAL).date().isoformat()
             valid = valid and in_window(now) and not db.execute("""SELECT 1 FROM commitment_deliveries WHERE chat_id=? AND topic_id=?
                 AND autonomous=1 AND state='sent' AND date(sent_at+25200,'unixepoch')=?""", (row['chat_id'], row['topic_id'], today)).fetchone()
         if valid:
             return True
-        if enabled and check['autonomous'] and not in_window(now) and _fresh(db, row['chat_id'], row['topic_id']) and check['snapshot'] == _snapshot(db, row['chat_id'], row['topic_id']):
+        if enabled and check['autonomous'] == 1 and not in_window(now) and _fresh(db, row['chat_id'], row['topic_id']) and check['snapshot'] == _snapshot(db, row['chat_id'], row['topic_id']):
             return False  # Keep a failed delivery queued until working hours resume.
         db.execute("UPDATE commitment_deliveries SET state='cancelled' WHERE outbox_id=?", (row['id'],))
         _audit(db, None, None, now, 'delivery_cancelled', 'disabled_or_stale')
@@ -281,6 +346,12 @@ def acknowledge(db, row_id, now):
         return
     db.execute("UPDATE commitment_deliveries SET state='sent',sent_at=? WHERE outbox_id=?", (now, row_id))
     for ident in json.loads(check['ids']):
+        if check['autonomous'] == 2:
+            key = db.execute('SELECT delivery_key FROM outbox WHERE id=?', (row_id,)).fetchone()[0]
+            db.execute('UPDATE commitments SET reminder_sent_at=?,next_check=?,scheduled=1 WHERE id=? AND revision=?',
+                       (now, business_after(datetime.fromtimestamp(now, LOCAL), 3), ident, int(key.split(':')[2])))
+            _audit(db, ident, None, now, 'reminder_delivered', 'explicit')
+            continue
         db.execute('UPDATE commitments SET checks=checks+1,quiet=(checks+1>=2),next_check=? WHERE id=?',
                    (business_after(datetime.fromtimestamp(now, LOCAL), 3), ident))
         _audit(db, ident, None, now, 'check_delivered', 'autonomous' if check['autonomous'] else 'contextual')
@@ -384,8 +455,10 @@ class Commitments:
                         (chat, topic, row['kind'], _normalized(row['action_key'])))
                         if _normalized(r['party']) == _normalized(row['party'])), None)
                     if same:
-                        _audit(db, same['id'], row['event_id'], now, 'duplicate_ignored', row['reason'])
-                        continue
+                        if row['reminder'] == 'keep':
+                            _audit(db, same['id'], row['event_id'], now, 'duplicate_ignored', row['reason'])
+                            continue
+                        ident = same['id']
                 due = row['due_date']
                 next_check = None
                 if row['state'] == 'active':
@@ -407,6 +480,29 @@ class Commitments:
                     ident = db.execute('''INSERT INTO commitments(action,state,event_id,quote,due_date,next_check,quiet,updated_at,
                         chat_id,topic_id,kind,party,action_key,scheduled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (*values, chat, topic, row['kind'], row['party'], _normalized(row['action_key']), int(next_check is not None))).lastrowid
+                event = sources[row['event_id']]
+                intent = row['reminder']
+                reminder_at = _reminder_time(row, event, next((r for r in context['commitments'] if r['id'] == ident), None))
+                if intent == 'set' and reminder_at <= now:
+                    intent = 'clarify'
+                if row['state'] in ('done', 'cancelled', 'paused', 'hold') or intent in ('cancel', 'clarify'):
+                    db.execute('UPDATE commitments SET remind_at=NULL,reminder_sent_at=NULL WHERE id=?', (ident,))
+                notice = None
+                if intent == 'set':
+                    db.execute('UPDATE commitments SET remind_at=?,reminder_event_id=?,reminder_sent_at=NULL WHERE id=?',
+                               (reminder_at, event['id'], ident))
+                    label = datetime.fromtimestamp(reminder_at, LOCAL).strftime('%d.%m.%Y в %H:%M')
+                    notice = f"Напоминание сохранено на {label} (Новосибирск): {row['action']}."
+                elif intent == 'clarify':
+                    db.execute('UPDATE commitments SET reminder_event_id=?,quiet=1 WHERE id=?', (event['id'], ident))
+                    notice = f"На какую дату и время по Новосибирску напомнить: {row['action']}? Укажите, например: «завтра в 15:00»."
+                elif intent == 'cancel':
+                    notice = f"Напоминание отменено: {row['action']}."
+                if notice or row['state'] in ('done', 'cancelled', 'paused', 'hold'):
+                    db.execute("DELETE FROM outbox WHERE telegram_message_id IS NULL AND chat_id=? AND topic_id=? AND delivery_key LIKE ?",
+                               (chat, topic, f'reminder-notice:%:{ident}'))
+                if notice:
+                    self.store._queue(db, chat, topic, f'reminder-notice:{event["id"]}:{ident}', notice)
                 _audit(db, ident, row['event_id'], now, row['state'], row['reason'])
             db.executemany('INSERT INTO commitment_events VALUES (?)', [(i,) for i in ids])
             _audit(db, None, ids[-1], now, 'batch_analyzed', f'updates={len(updates)}')
@@ -441,6 +537,7 @@ class Commitments:
                 return None
             rows = [dict(r) for r in db.execute("""SELECT * FROM commitments WHERE chat_id=? AND topic_id=?
                 AND state='active' AND quiet=0 AND checks<2 AND (next_check<=? OR (next_check IS NULL AND due_date IS NULL))
+                AND (remind_at IS NULL OR reminder_sent_at IS NOT NULL)
                 ORDER BY next_check IS NULL,next_check,id""", (chat, topic, now)) if r['event_id'] not in exclude_events][:1]
             if not rows:
                 return None
@@ -477,6 +574,7 @@ class Commitments:
 
     async def run_once(self):
         service = self.service
+        await asyncio.to_thread(self.queue_reminders)
         if service._lock.locked() or not service.available():
             return
         with self.store.connect() as db:
@@ -494,3 +592,27 @@ class Commitments:
                     logger.warning('event=sales_commitments_failed error_type=%s', type(exc).__name__)
                     if getattr(exc, 'kind', '') not in ('', 'codex_turn_failed', 'document_too_large'):
                         await service.record_failure(exc)
+
+    def queue_reminders(self, now=None):
+        now = time.time() if now is None else now
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows = list(db.execute("""SELECT c.*,e.author_id,e.author FROM commitments c
+                JOIN events e ON e.id=c.reminder_event_id
+                WHERE c.chat_id=? AND c.state='active' AND c.quiet=0
+                AND c.remind_at<=? AND c.reminder_sent_at IS NULL""", (self.chat_id, now)))
+            for row in rows:
+                if not _fresh(db, self.chat_id, row['topic_id']):
+                    continue
+                if db.execute("""SELECT 1 FROM commitment_deliveries WHERE chat_id=? AND topic_id=?
+                    AND state='pending'""", (self.chat_id, row['topic_id'])).fetchone():
+                    continue
+                snap = _snapshot(db, self.chat_id, row['topic_id'])
+                key = f'reminder:{row["id"]}:{row["revision"]}:{snap}'
+                # The adapter formats only these application-generated messages as HTML.
+                name = html.escape(row['author'])
+                text = f'<a href="tg://user?id={row["author_id"]}">{name}</a>, напоминаю: {html.escape(row["action"])}.'
+                self.store._queue(db, self.chat_id, row['topic_id'], key, text)
+                outbox = db.execute('SELECT id FROM outbox WHERE delivery_key=?', (key,)).fetchone()
+                db.execute('INSERT INTO commitment_deliveries(outbox_id,chat_id,topic_id,snapshot,ids,autonomous) VALUES (?,?,?,?,?,2)',
+                           (outbox['id'], self.chat_id, row['topic_id'], snap, json.dumps([row['id']])))

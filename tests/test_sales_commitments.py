@@ -39,15 +39,15 @@ def proposal(event, **changes):
     return dict(id=0, kind='manager_action', party='Сергей', action='Отправить КП',
                 action_key='отправить кп', state='active', event_id=event['id'],
                 quote=event['text'], due_date='2026-10-12', date_basis='message_date',
-                material='current', reason='Явное обещание менеджера', **changes)
+                material='current', reason='Явное обещание менеджера', reminder='keep', remind_at=None, **changes)
 
 
-def add(engine, number=1, topic=10, text='Завтра отправлю КП', **changes):
+def add(engine, number=1, topic=10, text='Завтра отправлю КП', now=NOW, **changes):
     ingest(engine.store, number, topic=topic, text=text, respond=False)
     batch = engine.batch(topic)
     row = proposal(batch['events'][-1])
     row.update(changes)
-    assert engine.apply(batch, {'updates': [row]}, now=NOW)
+    assert engine.apply(batch, {'updates': [row]}, now=now)
     return engine.context(-100, topic)[-1]
 
 
@@ -561,3 +561,168 @@ def test_terminal_media_failure_holds_old_promises_but_allows_fresh_updates(engi
     assert registry(engine)[0]['quiet']
     update(engine, row['id'], 3, 'done', 'КП отправил')
     assert registry(engine)[0]['state'] == 'done'
+
+
+def reminder(engine, number=1, **changes):
+    return add(engine, number, text='Сали, напомни завтра в 15:00 отправить КП',
+               due_date=None, reminder='set', remind_at='2026-10-12T15:00:00+07:00', **changes)
+
+
+def clear_notices(engine):
+    for row in engine.store.deliveries():
+        if row['delivery_key'].startswith('reminder-notice:'):
+            engine.store.delivered(row['id'], row['id'] + 100)
+
+
+def test_explicit_reminder_reuses_promise_and_suppresses_both_checks(engine, monkeypatch):
+    add(engine)
+    reminder(engine, 2, now=stamp('2026-10-11T17:00:00'))
+    assert len(registry(engine)) == 1
+    assert '12.10.2026 в 15:00' in engine.store.deliveries()[0]['text']
+    clear_notices(engine)
+    engine.queue_due(10, stamp('2026-10-12T11:00:00'))
+    assert not engine.store.deliveries()
+    assert engine.contextual_check(-100, 10, stamp('2026-10-12T11:00:00')) is None
+    reopened = Commitments(SalesService(SalesStore(engine.store.path), Fake()), -100)
+    reopened.queue_reminders(stamp('2026-10-12T14:59:00'))
+    assert not engine.store.deliveries()
+    at = stamp('2026-10-12T15:00:00')
+    reopened.queue_reminders(at)
+    reopened.queue_reminders(at)
+    row, = engine.store.deliveries()
+    assert 'tg://user?id=7' in row['text']
+    assert delivery_allowed(engine.store, row, True, at)
+    monkeypatch.setattr('agentbridge.sales.storage.time.time', lambda: at)
+    engine.store.delivered(row['id'], 200)
+    assert registry(engine)[0]['reminder_sent_at'] == at
+    assert registry(engine)[0]['checks'] == 0
+    assert registry(engine)[0]['next_check'] == stamp('2026-10-15T10:00:00')
+    assert engine.contextual_check(-100, 10, at) is None
+    reopened.queue_reminders(at + 60)
+    assert not engine.store.deliveries()
+
+
+@pytest.mark.parametrize('state,intent', [('done', 'keep'), ('cancelled', 'keep'), ('paused', 'keep'), ('active', 'cancel')])
+def test_explicit_reminder_completion_or_cancellation_cancels_queued_send(engine, state, intent):
+    row = add(engine, text='Сали, напомни 16.10.2026 в 15:00 отправить КП', due_date=None,
+              reminder='set', remind_at='2026-10-16T15:00:00+07:00')
+    clear_notices(engine)
+    engine.queue_reminders(stamp('2026-10-16T15:00:00'))
+    delivery, = engine.store.deliveries()
+    update(engine, row['id'], 2, state, 'КП отправил, напоминание отмени', reminder=intent)
+    assert not delivery_allowed(engine.store, delivery, True, stamp('2026-10-16T15:00:00'))
+    assert registry(engine)[0]['remind_at'] is None
+
+
+def test_explicit_reminder_postpone_and_clarification(engine):
+    row = add(engine, text='Сали, напомни отправить КП', due_date=None, reminder='clarify')
+    assert 'На какую дату' in engine.store.deliveries()[0]['text']
+    assert registry(engine)[0]['quiet']
+    update(engine, row['id'], 2, 'active', '16.10.2026 в 15:00', reminder='set',
+           remind_at='2026-10-16T15:00:00+07:00')
+    assert not registry(engine)[0]['quiet']
+    clear_notices(engine)
+    engine.queue_reminders(stamp('2026-10-16T15:00:00'))
+    old, = engine.store.deliveries()
+    update(engine, row['id'], 3, 'active', 'Перенеси на 17.10.2026 в 21:30', reminder='set',
+           remind_at='2026-10-17T21:30:00+07:00')
+    assert not delivery_allowed(engine.store, old, True, stamp('2026-10-16T15:00:00'))
+    clear_notices(engine)
+    engine.queue_reminders(stamp('2026-10-17T21:30:00'))
+    new, = engine.store.deliveries()
+    assert delivery_allowed(engine.store, new, True, stamp('2026-10-17T21:30:00'))
+
+
+@pytest.mark.parametrize('change', [
+    {'remind_at': '2026-10-16T15:00:00'},
+    {'remind_at': '2026-10-16T16:00:00+07:00'},
+    {'remind_at': '2026-10-17T15:00:00+07:00'},
+    {'source': 'text_document'},
+    {'text': 'Завтра отправлю КП'},
+])
+def test_explicit_reminder_rejects_invented_time_or_non_request(engine, change):
+    source = change.get('source', 'telegram_text')
+    ingest(engine.store, text=change.get('text', 'Сали, напомни 16.10.2026 в 15:00 отправить КП'),
+           source=source, respond=False)
+    batch = engine.batch(10)
+    row = proposal(batch['events'][0])
+    row.update(reminder='set', due_date=None, remind_at=change.get('remind_at', '2026-10-16T15:00:00+07:00'))
+    with pytest.raises(ValueError):
+        engine.apply(batch, {'updates': [row]}, NOW)
+    assert not registry(engine)
+    assert engine.batch(10)
+
+
+def test_expired_request_asks_for_time_instead_of_claiming_scheduled(engine):
+    reminder(engine)
+    assert registry(engine)[0]['remind_at'] is None
+    assert 'На какую дату' in engine.store.deliveries()[0]['text']
+
+
+@pytest.mark.asyncio
+async def test_explicit_reminder_delivers_without_codex_and_retries_telegram(engine, monkeypatch):
+    add(engine, text='Сали, напомни 17.10.2026 в 21:30 отправить <КП>', action='Отправить <КП>',
+        due_date=None, reminder='set', remind_at='2026-10-17T21:30:00+07:00')
+    clear_notices(engine)
+    at = stamp('2026-10-17T21:30:00')
+    monkeypatch.setattr('agentbridge.sales.commitments.time.time', lambda: at)
+    engine.store.op_set('codex_failure', {'kind': 'codex_usage_limit'})
+    await engine.run_once()
+    adapter = SalesTelegram(-100, engine.service)
+    class Bot:
+        failed = True
+        async def send_message(self, **kwargs):
+            assert kwargs['chat_id'] == -100 and kwargs['message_thread_id'] == 10
+            assert kwargs['parse_mode'] == 'HTML'
+            assert '&lt;КП&gt;' in kwargs['text']
+            if self.failed:
+                raise OSError('network')
+            return NS(message_id=99)
+    bot = Bot()
+    await adapter.deliver_once(bot)
+    assert registry(engine)[0]['reminder_sent_at'] is None
+    bot.failed = False
+    await adapter.deliver_once(bot)
+    assert registry(engine)[0]['reminder_sent_at'] == at
+    assert not engine.store.deliveries()
+
+
+def test_reminder_relative_time_uses_source_timestamp_and_topic_isolation(engine):
+    add(engine, topic=20, text='Сали, напомни через 30 минут отправить КП', due_date=None,
+        reminder='set', remind_at='2026-10-11T10:30:00+00:00', now=stamp('2026-10-11T17:00:00'))
+    clear_notices(engine)
+    engine.queue_reminders(stamp('2026-10-11T17:30:00'))
+    delivery, = engine.store.deliveries()
+    assert delivery['topic_id'] == 20
+    assert not engine.context(-100, 10)
+    assert not delivery_allowed(engine.store, delivery, False, stamp('2026-10-11T17:30:00'))
+    assert registry(engine)[0]['remind_at'] == stamp('2026-10-11T17:30:00')
+
+
+def test_legacy_commitment_migration_preserves_thread_and_registry(engine):
+    old = add(engine)
+    engine.store.save_thread(-100, 10, 'keep-thread', 'keep-version', 'first_turn')
+    with engine.store.connect() as db:
+        for name in ('remind_at', 'reminder_event_id', 'reminder_sent_at'):
+            db.execute(f'ALTER TABLE commitments DROP COLUMN {name}')
+    reopened = SalesStore(engine.store.path)
+    assert reopened.thread(-100, 10)['thread_id'] == 'keep-thread'
+    with reopened.connect() as db:
+        row = dict(db.execute('SELECT * FROM commitments WHERE id=?', (old['id'],)).fetchone())
+    assert row['quote'] == old['quote'] and row['next_check'] == old['next_check']
+    assert row['remind_at'] is None
+
+
+def test_acknowledgement_of_old_reminder_cannot_consume_rescheduled_one(engine, monkeypatch):
+    row = add(engine, text='Сали, напомни 16.10.2026 в 15:00 отправить КП', due_date=None,
+              reminder='set', remind_at='2026-10-16T15:00:00+07:00')
+    clear_notices(engine)
+    engine.queue_reminders(stamp('2026-10-16T15:00:00'))
+    delivery, = engine.store.deliveries()
+    # Telegram has accepted the old message while a new time is being persisted.
+    update(engine, row['id'], 2, 'active', 'Перенеси на 17.10.2026 в 16:30', reminder='set',
+           remind_at='2026-10-17T16:30:00+07:00')
+    monkeypatch.setattr('agentbridge.sales.storage.time.time', lambda: stamp('2026-10-16T15:00:00'))
+    engine.store.delivered(delivery['id'], 999)
+    assert registry(engine)[0]['reminder_sent_at'] is None
+    assert registry(engine)[0]['remind_at'] == stamp('2026-10-17T16:30:00')

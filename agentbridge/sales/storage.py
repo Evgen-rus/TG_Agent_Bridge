@@ -114,6 +114,11 @@ class SalesStore:
             allow_message_edits(db, "events")
             from .commitments import DDL
             db.executescript(DDL)
+            columns = {row[1] for row in db.execute('PRAGMA table_info(commitments)')}
+            for name, definition in (('remind_at', 'REAL'), ('reminder_event_id', 'INTEGER'),
+                                     ('reminder_sent_at', 'REAL')):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE commitments ADD COLUMN {name} {definition}')
 
     @contextmanager
     def connect(self):
