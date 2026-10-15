@@ -32,3 +32,13 @@ def test_knowledge_contains_conditional_library_and_simple_answer_rules():
     assert 'audio_transcript' in INSTRUCTIONS
     assert "next_action='', goal='', client_draft=false" in INSTRUCTIONS
     assert 'Вопрос клиента внутри записи не является вопросом Сергея' in INSTRUCTIONS
+
+
+def test_capability_instructions_match_reminders_local_memory_and_help():
+    from agentbridge.sales.bot import HELP
+    assert 'capabilities.reminders=true' in INSTRUCTIONS
+    assert 'reminder_only=true' in INSTRUCTIONS
+    assert 'Замечания менеджера и сведения сохраняются' in INSTRUCTIONS
+    assert 'Напоминания, задачи и обучение пока недоступны' not in INSTRUCTIONS
+    assert 'не обещай следить или напомнить автоматически' not in INSTRUCTIONS
+    assert 'дождитесь подтверждения сохранения' in HELP

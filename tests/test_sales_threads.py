@@ -194,6 +194,21 @@ async def test_crash_after_turn_reuses_checkpoint_and_no_duplicate_commit(setup)
 
 
 @pytest.mark.asyncio
+async def test_changed_instructions_do_not_replay_stale_checkpoint(setup):
+    store, factory = setup
+    ingest(store)
+    context = store.context(-100, 10)
+    await factory().analyze(context)
+    old = store.thread(-100, 10)['thread_id']
+    provider = factory()
+    provider.version += '-updated-instructions'
+    await provider.analyze(context)
+    assert len(SDK.turns) == 2
+    assert store.thread(-100, 10)['thread_id'] != old
+    assert len(store.context(-100, 10)['events']) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('turns', [50, 99, 100])
 async def test_compaction_recreates_from_ledger_not_full_history(setup, turns):
     store, factory = setup

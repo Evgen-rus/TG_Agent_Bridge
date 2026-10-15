@@ -334,7 +334,8 @@ class SalesStore:
                            (fact_id, fact['replaces'], chat, topic))
         rec_id = db.execute('''INSERT INTO recommendations(chat_id,topic_id,event_ids,payload)
             VALUES (?,?,?,?)''', (chat, topic, encoded(ids), encoded(result))).lastrowid
-        cls._queue(db, chat, topic, f'recommendation:{rec_id}', result['answer'])
+        if not result.get('_reminder_handled'):
+            cls._queue(db, chat, topic, f'recommendation:{rec_id}', result['answer'])
         if result.get('_commitment_check'):
             from .commitments import attach_context_check
             attach_context_check(db, chat, topic, rec_id, result['_commitment_check'])

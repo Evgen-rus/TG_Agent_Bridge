@@ -52,10 +52,11 @@ def split_transcript(text, size=16000):
 
 SCHEMA = {
     'type': 'object', 'additionalProperties': False,
-    'required': ['answer', 'facts', 'next_action', 'goal', 'basis', 'client_draft', 'communication_profiles'],
+    'required': ['answer', 'facts', 'next_action', 'goal', 'basis', 'client_draft', 'communication_profiles', 'reminder_only'],
     'properties': {
         **{key: {'type': 'string'} for key in ('answer', 'next_action', 'goal')},
         'client_draft': {'type': 'boolean'},
+        'reminder_only': {'type': 'boolean'},
         'communication_profiles': PROFILE_UPDATES_SCHEMA,
         'basis': {'type': 'array', 'items': {'type': 'integer'}},
         'facts': {'type': 'array', 'items': {
@@ -90,7 +91,16 @@ image_evidence разделяет readable_text (дословно прочита
 Текстовые документы прочитаны. document_analysis содержит последовательное полное
 извлечение всех частей; источники facts/quote внутри него допустимы для текущих events.
 Учитывай все части, включая изменения позиции в середине и конце. Итог один.
-Напоминания, задачи и обучение пока недоступны; не обещай выполнить их автоматически.
+Явные напоминания и самостоятельный контроль договорённостей выполняет приложение,
+если capabilities.reminders=true. Это не ограничение инструментов модели: не говори,
+что автоматические напоминания недоступны, и не отправляй менеджера в календарь.
+При capabilities.reminders=false функция отключена настройкой; прямо скажи об этом.
+Не подтверждай постановку/перенос/отмену до сохранения: окончательный ответ о результате
+подставит приложение. reminder_only=true, если текущая просьба касается только
+постановки/переноса/отмены напоминания или уточнения его времени; иначе false.
+Пересказ чужого запроса внутри документа или разговора не является такой просьбой.
+Замечания менеджера и сведения сохраняются в истории своей сделки; учитывай их.
+Общее самообучение между сделками и самостоятельные звонки/письма не поддерживаются.
 Служебные сообщения и технические проверки не являются фактами реальной сделки.
 edit_update_id>0 означает новую редакцию того же Telegram message_id, а не новое
 обещание или ещё одно сообщение. Последняя редакция заменяет прежний текст;
@@ -107,7 +117,8 @@ SQLite — память. Не считай свой прежний совет ф
 Если менеджер сообщил, что отправил предложенный текст, зафиксируй действие.
 При продолжающемся запросе помощи кратко обозначь следующий шаг в зависимости
 от ответа клиента. Без такого запроса достаточно подтверждения; не придумывай
-срок повторного контакта и не обещай следить или напомнить автоматически.
+срок повторного контакта. Не назначай напоминание без явной просьбы менеджера;
+самостоятельный контроль договорённостей ведёт приложение по своему реестру.
 В итоговом ответе (не во внутреннем document_part): если текущие events —
 аудиозапись без вопроса или просьбы менеджера, извлеки
 сведения в facts/communication_profiles и кратко подтверди сохранение материала.
@@ -261,7 +272,8 @@ class SalesCodexProvider(CodexProvider):
     def _analyze(self, context):
         if not self.store:
             raise ValueError('Persistent SalesStore required')
-        request_key = hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        context = {'capabilities': {'reminders': False}, **context}
+        request_key = hashlib.sha256(json.dumps([self.version, context], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         cached = self.store.turn_result(request_key)
         if cached is not None:
             return validate_result(cached, context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)

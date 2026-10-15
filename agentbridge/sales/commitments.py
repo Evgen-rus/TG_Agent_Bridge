@@ -91,6 +91,9 @@ remind_at — ISO с часовым поясом, точный момент по
 Поддерживаются явная календарная дата/сегодня/завтра/день недели + ЧЧ:ММ или «в 15 часов»,
 либо «через N минут/часов» (N цифрами). Относительное время считай от date исходного
 сообщения, НЕ от now. due_date для напоминания оставь null, если нет отдельного срока обещания.
+Если названы только часы («в 17 часов», «в 17:00»), дата — сегодня по date сообщения,
+не завтра. Уже прошедшее время не переноси на следующий день. Для такой новой
+просьбы due_date=null; если это прежнее обязательство, сохраняй его отдельный срок.
 Если время не задано, неоднозначно, не поддерживается или уже прошло — reminder=clarify,
 remind_at=null: приложение спросит точную дату и время. Не назначай время сам.
 Продолжение уточнения времени связывай с той же записью и предыдущей явной просьбой.
@@ -226,7 +229,12 @@ def _reminder_time(row, event, previous=None):
                 int(clock[1] or clock[3]), int(clock[2] or 0), 0, 0):
             raise ValueError('Unsupported reminder time')
         dated = {**row, 'date_basis': 'absolute'}
-        if not _date_supported(local.date(), dated, event) and not _date_supported(
+        explicit_date = re.search(
+            r'(?i)\b(?:сегодня|завтра|послезавтра|через|понедельник|вторник|сред\w*|четверг|пятниц\w*|суббот\w*|воскресен\w*)\b'
+            r'|\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)\b'
+            r'|\b\d{1,2}\s+(?:январ|феврал|март|апрел|мая|июн|июл|август|сентябр|октябр|ноябр|декабр)', row['quote'])
+        today = not explicit_date and local.date() == base.astimezone(LOCAL).date()
+        if not today and not _date_supported(local.date(), dated, event) and not _date_supported(
                 local.date(), {**row, 'date_basis': 'message_date'}, event):
             raise ValueError('Unsupported reminder date')
     return moment.timestamp()
@@ -288,7 +296,8 @@ def validate_updates(payload, context):
                         row['material'] != 'current' or event['source'] not in ('telegram_text', 'manager_feedback', 'audio_transcript')))):
                 raise ValueError('Unanchored commitment date')
             if not inherited and not _date_supported(
-                    datetime.strptime(due, '%Y-%m-%d').date(), row, event):
+                    datetime.strptime(due, '%Y-%m-%d').date(), row, event) and not (
+                    row['reminder'] == 'set' and due == datetime.fromisoformat(row['remind_at']).astimezone(LOCAL).date().isoformat()):
                 raise ValueError('Unsupported commitment date')
     return payload['updates']
 
@@ -390,6 +399,12 @@ class Commitments:
     def context(self, chat, topic):
         with self.store.connect() as db:
             return [dict(r) for r in db.execute("SELECT * FROM commitments WHERE chat_id=? AND topic_id=? AND state IN ('active','paused') ORDER BY id LIMIT 50", (chat, topic))]
+
+    def notices(self, chat, topic, event_ids):
+        with self.store.connect() as db:
+            return [dict(r) for ident in event_ids for r in db.execute(
+                'SELECT text FROM outbox WHERE chat_id=? AND topic_id=? AND delivery_key LIKE ? ORDER BY id',
+                (chat, topic, f'reminder-notice:{ident}:%'))]
 
     def batch(self, topic):
         with self.store.connect() as db:
@@ -521,11 +536,16 @@ class Commitments:
             await asyncio.to_thread(self.apply, context, payload)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             attempts = retry.get('attempts', 0) + 1
             await asyncio.to_thread(self.store.op_set, key, dict(at=time.time() + min(3600, 300 * 2 ** min(attempts - 1, 4)), attempts=attempts))
             with self.store.connect() as db:
                 _audit(db, None, context['events'][-1]['id'], time.time(), 'analysis_failed', 'retry_scheduled')
+            reason = {'Unsupported reminder date': 'unsupported_reminder_date',
+                      'Unsupported reminder time': 'unsupported_reminder_time',
+                      'Missing explicit reminder request': 'missing_reminder_request',
+                      'Reminder time requires timezone': 'missing_reminder_timezone'}.get(str(exc), 'analysis_failed')
+            logger.warning('event=sales_commitments_retry reason=%s', reason)
             raise
         if retry:
             await asyncio.to_thread(self.store.op_set, key, None)

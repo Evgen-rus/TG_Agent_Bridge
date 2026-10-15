@@ -726,3 +726,100 @@ def test_acknowledgement_of_old_reminder_cannot_consume_rescheduled_one(engine, 
     engine.store.delivered(delivery['id'], 999)
     assert registry(engine)[0]['reminder_sent_at'] is None
     assert registry(engine)[0]['remind_at'] == stamp('2026-10-17T16:30:00')
+
+
+def ingest_sergey_request(engine):
+    engine.store.ingest(update_id=52, chat_id=-100, topic_id=10, title='Сделка',
+        message_id=204, author_id=7, author='Сергей', date='2026-10-15T09:53:39+00:00',
+        text='поставь напоминание, набрать в 17 часов ему')
+
+
+@pytest.mark.parametrize('due', [None, '2026-10-15'])
+def test_clock_only_request_means_source_day_and_does_not_require_today(engine, due):
+    ingest_sergey_request(engine)
+    batch = engine.batch(10)
+    row = proposal(batch['events'][0])
+    row.update(due_date=due, reminder='set', remind_at='2026-10-15T17:00:00+07:00')
+    assert engine.apply(batch, {'updates': [row]}, stamp('2026-10-15T16:54:00'))
+    assert registry(engine)[0]['remind_at'] == stamp('2026-10-15T17:00:00')
+    assert '15.10.2026 в 17:00' in engine.store.deliveries()[0]['text']
+
+
+def test_clock_only_request_does_not_silently_move_to_tomorrow(engine):
+    ingest_sergey_request(engine)
+    batch = engine.batch(10)
+    row = proposal(batch['events'][0])
+    row.update(due_date=None, reminder='set', remind_at='2026-10-16T17:00:00+07:00')
+    with pytest.raises(ValueError, match='Unsupported reminder date'):
+        engine.apply(batch, {'updates': [row]}, stamp('2026-10-15T16:54:00'))
+    row['remind_at'] = '2026-10-15T17:00:00+07:00'
+    assert engine.apply(batch, {'updates': [row]}, stamp('2026-10-15T17:01:00'))
+    assert registry(engine)[0]['remind_at'] is None
+    assert 'На какую дату' in engine.store.deliveries()[0]['text']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('background_first', [False, True])
+async def test_sergey_request_has_one_authoritative_confirmation_and_alarm(engine, monkeypatch, background_first):
+    class Provider(Fake):
+        async def analyze(self, context):
+            self.contexts.append(context)
+            # Even a stale model denial must never replace the persisted result.
+            return dict(answer='Автоматически напомнить не смогу: напоминания пока недоступны.',
+                        next_action='', goal='', basis=[context['events'][0]['id']], facts=[], reminder_only=True)
+        async def analyze_commitments(self, context):
+            row = proposal(context['events'][0])
+            row.update(due_date=None, reminder='set', remind_at='2026-10-15T17:00:00+07:00')
+            return {'updates': [row]}
+    engine.service.provider = Provider()
+    monkeypatch.setattr('agentbridge.sales.commitments.time.time', lambda: stamp('2026-10-15T16:54:00'))
+    ingest_sergey_request(engine)
+    if background_first:
+        await engine.observe(10)
+        clear_notices(engine)
+    await engine.service.process(-100, 10)
+    assert engine.service.provider.contexts[0]['capabilities']['reminders']
+    with engine.store.connect() as db:
+        messages = [r[0] for r in db.execute('SELECT text FROM outbox')]
+        saved = json.loads(db.execute('SELECT payload FROM recommendations').fetchone()[0])
+    assert len(messages) == 1 and 'сохранено на 15.10.2026 в 17:00' in messages[0]
+    assert saved['answer'] == messages[0]
+    assert 'недоступны' not in saved['answer']
+    clear_notices(engine)
+    at = stamp('2026-10-15T17:00:00')
+    engine.queue_reminders(at)
+    row, = engine.store.deliveries()
+    assert delivery_allowed(engine.store, row, True, at)
+    assert 'напоминаю:' in row['text']
+
+
+@pytest.mark.asyncio
+async def test_failed_scheduling_does_not_claim_success_or_global_unavailability(engine, monkeypatch, caplog):
+    class Provider(Fake):
+        async def analyze(self, context):
+            return dict(answer='Напоминание поставлено.', next_action='', goal='', basis=[], facts=[], reminder_only=True)
+        async def analyze_commitments(self, context):
+            raise ValueError('Unsupported reminder date')
+    engine.service.provider = Provider()
+    monkeypatch.setattr('agentbridge.sales.commitments.time.time', lambda: stamp('2026-10-15T16:54:00'))
+    ingest_sergey_request(engine)
+    await engine.service.process(-100, 10)
+    row, = engine.store.deliveries()
+    assert 'не удалось подтвердить' in row['text']
+    assert 'поставлено' not in row['text'] and 'недоступны' not in row['text']
+    assert not registry(engine) and engine.batch(10)
+    assert 'reason=unsupported_reminder_date' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_disabled_reminders_are_reported_as_disabled_setting(engine):
+    class Provider(Fake):
+        async def analyze(self, context):
+            assert context['capabilities']['reminders'] is False
+            return dict(answer='Уже напомню.', next_action='', goal='', basis=[], facts=[], reminder_only=True)
+    engine.service.commitments = None
+    engine.service.provider = Provider()
+    ingest_sergey_request(engine)
+    await engine.service.process(-100, 10)
+    row, = engine.store.deliveries()
+    assert 'отключены настройкой' in row['text']
