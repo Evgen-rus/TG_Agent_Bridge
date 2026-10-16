@@ -892,6 +892,15 @@ its detected WebM/MP4/Ogg container and existing STT settings; WebM is delivered
 a Telegram document rather than mislabeled as Opus voice. Transcript is retained;
 failures never invent text. Both channels use `documents.py` for TXT/MD/PDF/DOCX:
 offline subprocess, 25-second deadline, Linux CPU/address-space limits, 100 PDF
-pages, 120000 extracted characters, bounded DOCX ZIP/XML. Scanned PDFs ask for
-page images instead of pretending OCR succeeded. Tables use DOCX cells / PDF
+pages, 120000 extracted characters, bounded DOCX ZIP/XML. Web Rick/Sally and Sally Telegram render scanned/mixed PDFs (up to 10 pages)
+to temporary PNGs, all pages in order, at most 2400px per side, using pinned
+pypdfium2 inside the same bounded subprocess. Rick passes these images to its
+existing role-isolated provider; Sally uses the existing image_jobs/evidence
+flow so uncertain/visual observations do not become confirmed facts. Temporary
+pages are removed after processing; original PDFs remain private attachments.
+Long scans are rejected before model/Telegram sends, without partial reading. Tables use DOCX cells / PDF
 layout extraction. No executable documents or external fetches are enabled.
+
+Upload errors appear next to the composer with filename, reason and recovery steps.
+Drafts survive failure; each file fetch has a 60-second deadline and named progress.
+Recording uses icon-only square/cancel controls and requires a separate send.

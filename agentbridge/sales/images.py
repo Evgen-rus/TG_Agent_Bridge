@@ -5,6 +5,7 @@ import logging
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 
 from agentbridge.media import MAX_DOWNLOAD_BYTES, delete_media_file, media_destination
 from agentbridge.telegram.media import download_telegram_file
@@ -113,7 +114,8 @@ class ImageWorker:
                     self.store.image_failed(event_id, 'image_too_large', terminal=True)
                     return
                 with temp.open('rb') as stream:
-                    suffix = image_suffix(stream.read(16))
+                    header = stream.read(16)
+                    suffix = '.pdf' if header.startswith(b'%PDF-') else image_suffix(header)
                 if not suffix:
                     self.store.image_failed(event_id, 'image_invalid', terminal=True)
                     return
@@ -124,14 +126,29 @@ class ImageWorker:
                 self.store.image_failed(event_id, 'image_too_large', terminal=True)
                 return
             with path.open('rb') as stream:
-                if not image_suffix(stream.read(16)):
+                header = stream.read(16)
+                if not header.startswith(b'%PDF-') and not image_suffix(header):
                     self.store.image_failed(event_id, 'image_invalid', terminal=True)
                     return
             if not self.service.available():
                 return
             stage = 'model'
             logger.info('event=sales_image_read_started event_id=%s', event_id)
-            evidence = await self.service.read_image(path, row)
+            if header.startswith(b'%PDF-'):
+                from agentbridge.documents import document_material
+                with TemporaryDirectory(prefix='sally-pdf-') as folder:
+                    material = await asyncio.to_thread(document_material,path,Path(folder))
+                    evidence = []
+                    for n, page in enumerate(material['pages'],1):
+                        page_evidence = await self.service.read_image(Path(page),dict(row,caption=f'Страница {n} PDF. '+row['caption']))
+                        if page_evidence is None:
+                            return
+                        evidence.extend(dict(kind=item['kind'],text=f'[Страница {n}]\n'+item['text']) for item in page_evidence)
+                    if not material['pages']:
+                        evidence = [dict(kind='readable_text',text=material['text'])]
+                    validate_image({'evidence':evidence})
+            else:
+                evidence = await self.service.read_image(path, row)
             if evidence is not None:
                 self.store.image_read(event_id, evidence)
                 logger.info('event=sales_image_read_finished event_id=%s', event_id)

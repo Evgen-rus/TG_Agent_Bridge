@@ -9,7 +9,7 @@ it('сохраняет текст, файл и ключ после сетево�
  const u=userEvent.setup(),keys:string[]=[],errors:string[]=[];
  const send=vi.fn(async(_text:string,_ids:string[],key:string)=>{keys.push(key);if(keys.length===1)throw new Error('Нет сети')});
  const fetch=vi.fn(async()=>new Response(JSON.stringify({id:'private-file'}),{status:201}));vi.stubGlobal('fetch',fetch);
- const {container}=render(<MediaComposer visible product="rick" context="101" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={s=>errors.push(s)} onSend={send}/>);
+ const {container}=render(<MediaComposer visible product="rick" context="101" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={s=>{if(s)errors.push(s)}} onSend={send}/>);
  await u.type(screen.getByLabelText('Сообщение'),'Вопрос по фото');
  await u.upload(container.querySelector('input[type=file]')!,new File(['image'],'screen.png',{type:'image/png'}));
  await u.click(screen.getByRole('button',{name:'Отправить сообщение'}));
@@ -47,8 +47,48 @@ it('записывает голос, останавливает микрофон
  vi.stubGlobal('fetch',vi.fn(async()=>new Response(JSON.stringify({id:'voice-id'}),{status:201})));
  render(<MediaComposer visible product="sally" context="101" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={()=>{}} onSend={send}/>);
  fireEvent.click(screen.getByRole('button',{name:'Записать голосовое'}));
- fireEvent.click(await screen.findByRole('button',{name:'Завершить запись'}));
+ const square=await screen.findByRole('button',{name:'Завершить запись'});
+ expect(square.textContent).toBe('');expect(screen.getByRole('button',{name:'Отменить запись'}).textContent).toBe('');
+ expect(screen.queryByRole('button',{name:'Записать голосовое'})).toBeNull();
+ expect(screen.queryByRole('button',{name:'Отправить сообщение'})).toBeNull();
+ fireEvent.click(square);
+ expect(send).not.toHaveBeenCalled();
  expect(stop).toHaveBeenCalled();expect(await screen.findByText('Голосовое.webm')).toBeTruthy();
  await u.click(screen.getByRole('button',{name:'Отправить сообщение'}));
  await waitFor(()=>expect(send).toHaveBeenCalledWith('',['voice-id'],expect.any(String)));
+});
+
+
+it('ошибка PDF сохраняет оба вложения и объясняет, какой файл заменить',async()=>{
+ const u=userEvent.setup(),send=vi.fn(async()=>{}),errors:string[]=[];
+ vi.stubGlobal('fetch',vi.fn(async()=>new Response(JSON.stringify({error:'PDF со сканами: максимум 10 страниц. Разделите PDF.'}),{status:422})));
+ const {container}=render(<MediaComposer visible product="sally" context="0" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={s=>{if(s)errors.push(s)}} onSend={send}/>);
+ await u.upload(container.querySelector('input[type=file]')!,[new File(['pdf'],'contract.pdf',{type:'application/pdf'}),new File(['audio'],'voice.webm',{type:'audio/webm'})]);
+ await u.click(screen.getByRole('button',{name:'Отправить сообщение'}));
+ await waitFor(()=>expect(errors[0]).toContain('«contract.pdf»: PDF со сканами'));
+ expect(errors[0]).toContain('Удалите этот файл крестиком');
+ expect(screen.getByText('contract.pdf')).toBeTruthy();expect(screen.getByText('voice.webm')).toBeTruthy();
+ expect(screen.queryByRole('status')).toBeNull();expect(send).not.toHaveBeenCalled();
+ expect((screen.getByRole('button',{name:'Отправить сообщение'}) as HTMLButtonElement).disabled).toBe(false);
+});
+
+
+it('крестик отменяет запись без отправки и без удаления старого текста',async()=>{
+ const stop=vi.fn(),send=vi.fn(async()=>{});
+ vi.stubGlobal('navigator',{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[{stop}]})}});
+ class Recorder{
+  static isTypeSupported(){return true}
+  state='inactive';mimeType='audio/webm';onstop?:()=>void;
+  start(){this.state='recording'}
+  stop(){this.state='inactive';this.onstop?.()}
+ }
+ vi.stubGlobal('MediaRecorder',Recorder);
+ const u=userEvent.setup();
+ render(<MediaComposer visible product="sally" context="0" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={()=>{}} onSend={send}/>);
+ await u.type(screen.getByLabelText('Сообщение'),'Мой вопрос');
+ await u.click(screen.getByRole('button',{name:'Записать голосовое'}));
+ await u.click(await screen.findByRole('button',{name:'Отменить запись'}));
+ expect(stop).toHaveBeenCalled();expect(send).not.toHaveBeenCalled();
+ expect(screen.queryByText('Голосовое.webm')).toBeNull();expect((screen.getByLabelText('Сообщение') as HTMLTextAreaElement).value).toBe('Мой вопрос');
+ expect(screen.getByRole('button',{name:'Записать голосовое'})).toBeTruthy();
 });

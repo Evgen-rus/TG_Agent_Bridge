@@ -7,7 +7,8 @@ import warnings
 import threading
 from uuid import uuid4
 
-from agentbridge.documents import extract_document
+from agentbridge.documents import document_material
+from tempfile import TemporaryDirectory
 from agentbridge.media import MAX_DOWNLOAD_BYTES, safe_filename
 from agentbridge.sales.images import image_suffix
 from agentbridge.sales.audio import audio_suffix
@@ -39,7 +40,8 @@ def classify(path, filename):
     target = path.with_suffix(suffix)
     path.replace(target)
     try:
-        extract_document(target)
+        with TemporaryDirectory(prefix='document-check-') as folder:
+            document_material(target, Path(folder))
     except Exception as exc:
         target.unlink(missing_ok=True)
         raise WebError(422, str(exc) if isinstance(exc, ValueError) else 'Не удалось прочитать документ.') from None

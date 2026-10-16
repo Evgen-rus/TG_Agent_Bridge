@@ -20,7 +20,7 @@ from .storage import SALI_NAME, should_respond
 from .commitments import Commitments, delivery_allowed, disable
 
 logger = logging.getLogger(__name__)
-HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. Для напоминания напишите, например: «Сали, напомни сегодня в 17:00 позвонить клиенту». Время — по Новосибирску; дождитесь подтверждения сохранения. Напоминания доступны при включённом контроле договорённостей. PDF/DOCX с текстовым слоем — до 20 МБ, PDF до 100 страниц; сканы присылайте изображениями. В General отвечаю на обращение по имени, тегу или ответу на моё сообщение. Администратор может запросить /restart с подтверждением.'
+HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. Для напоминания напишите, например: «Сали, напомни сегодня в 17:00 позвонить клиенту». Время — по Новосибирску; дождитесь подтверждения сохранения. Напоминания доступны при включённом контроле договорённостей. PDF/DOCX с текстовым слоем — до 20 МБ, PDF до 100 страниц; сканированные и смешанные PDF — до 10 страниц, длинные разделите на части. В General отвечаю на обращение по имени, тегу или ответу на моё сообщение. Администратор может запросить /restart с подтверждением.'
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 
 
@@ -160,6 +160,7 @@ class SalesTelegram:
             if (await asyncio.to_thread(self.service.store.op_get, retry_key, 0) or 0) > time.time():
                 continue
             document = {}
+            image = None
             try:
                 document = json.loads(row['text'])
                 from pathlib import Path
@@ -172,25 +173,29 @@ class SalesTelegram:
                 payload = await remote.download_as_bytearray()
                 if len(payload) > limit:
                     raise ValueError('size')
-                from agentbridge.documents import extract_document
+                from agentbridge.documents import document_material
                 from pathlib import Path
                 from tempfile import TemporaryDirectory
                 with TemporaryDirectory(prefix='sally-document-') as folder:
                     path = Path(folder) / ('document'+Path(document['filename']).suffix.lower())
                     path.write_bytes(bytes(payload))
-                    body = await asyncio.to_thread(extract_document, path)
-            except (UnicodeError, ValueError):
-                text = (document.get('caption','')+'\n' if document.get('caption') else '')+'[Документ не прочитан: проверьте формат, размер и текстовый слой. Сканы пришлите изображениями.]'
+                    material = await asyncio.to_thread(document_material, path, Path(folder)/'pages')
+                    body = material['text']
+                    if material['pages']:
+                        image = dict(file_id=document['file_id'],filename=document['filename'],caption=document.get('caption',''))
+            except (UnicodeError, ValueError) as exc:
+                reason = str(exc) if isinstance(exc, ValueError) and str(exc) != 'size' else 'Проверьте формат и размер документа (до 20 МБ; TXT/MD до 2 МБ).'
+                text = (document.get('caption','')+'\n' if document.get('caption') else '')+'[Документ не прочитан: '+reason+']'
                 source = 'unsupported_attachment'
             except Exception as exc:
                 logger.warning('event=sales_document_deferred error_type=%s', type(exc).__name__)
                 await asyncio.to_thread(self.service.store.op_set, retry_key, time.time() + 60)
                 continue
             else:
-                text = (document['caption'] + '\n\n' if document['caption'] else '') + body
-                source = 'text_document'
+                text = document.get('caption','') if image else (document['caption'] + '\n\n' if document['caption'] else '') + body
+                source = 'image_pending' if image else 'text_document'
             await asyncio.to_thread(self.service.store.op_set, f"document-source:{row['id']}", document)
-            await asyncio.to_thread(self.service.store.hydrate_document, row['id'], text, source)
+            await asyncio.to_thread(self.service.store.hydrate_document, row['id'], text, source, image)
             await asyncio.to_thread(self.service.store.op_set, retry_key, None)
 
     async def callback(self, update, context):

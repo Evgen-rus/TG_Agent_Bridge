@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .store import WebError, WebStore
 
@@ -65,6 +66,7 @@ class WebRuntime:
                 await asyncio.sleep(.5)
                 continue
             job, user = claimed
+            materials = None
             try:
                 if not self.store.allowed(user, self.product, job['context']):
                     raise WebError(403, 'Доступ к контексту отозван')
@@ -73,7 +75,8 @@ class WebRuntime:
                     chat = self.service.registry.get(int(job['context']))
                     if not chat:
                         raise WebError(404, 'Чат недоступен')
-                    question, attachments = await self.prepare_rick(job,user,payload)
+                    materials = TemporaryDirectory(prefix='rick-document-')
+                    question, attachments = await self.prepare_rick(job,user,payload,Path(materials.name))
                     async with self.service._chat_locks.setdefault(chat.telegram_chat_id, asyncio.Lock()):
                         if user['role'] == 'owner':
                             result = await self.service._answer_owner_query_for_chat(chat, question, attachments=attachments)
@@ -98,6 +101,9 @@ class WebRuntime:
                 logger.warning('event=web_job_failed product=%s error_type=%s', self.product, type(exc).__name__)
                 message = exc.message if isinstance(exc, WebError) else 'Не удалось завершить обработку. Проверьте историю перед повтором.'
                 self.store.finish(job['id'], 'error', message)
+            finally:
+                if materials:
+                    materials.cleanup()
 
     async def sales(self, job, user, payload):
         topic = int(job['context'])
@@ -110,9 +116,12 @@ class WebRuntime:
         from agentbridge.telegram.formatter import split_owner_message
         from agentbridge.sales.storage import should_respond
         attachments = self.store.media(user,'sally',job['context'],payload.get('attachments',[]))
-        from agentbridge.documents import extract_document
-        documents = {item['id']:await asyncio.to_thread(extract_document,Path(item['path']))
-                     for item in attachments if item['kind']=='document'}
+        from agentbridge.documents import document_material
+        documents = {}
+        for item in attachments:
+            if item['kind']=='document':
+                with TemporaryDirectory(prefix='sally-document-') as folder:
+                    documents[item['id']] = await asyncio.to_thread(document_material,Path(item['path']),Path(folder))
         # Text is split by the same Telegram limits as all other owner delivery.
         parts = [(None,t) for t in split_owner_message(user['name']+' · через приложение\n'+payload['text'])]
         parts.extend((item,'') for item in attachments)
@@ -162,8 +171,13 @@ class WebRuntime:
                     audio = dict(**media, routing=dict(bot_username=self.app.bot.username or '',general=topic==0,
                         replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to']))))
                 else:
-                    body = documents[item['id']]
-                    source = 'text_document'
+                    material = documents[item['id']]
+                    if material['pages']:
+                        source = 'image_pending'
+                        image = dict(**media,caption='',media_group_id='web:'+str(job['id']))
+                    else:
+                        body = material['text']
+                        source = 'text_document'
             respond = should_respond(payload['text'],self.app.bot.username or '',general=topic==0,
                                      replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to'])))
             self.service.store.ingest(update_id=synthetic,chat_id=self.settings.chat_id,topic_id=topic,title=deal['title'],
@@ -200,9 +214,9 @@ class WebRuntime:
                 result = next((json.loads(r['payload'])['answer'] for r in recs if ids.intersection(json.loads(r['event_ids']))), '')
                 self.store.finish(job['id'],'done',result or 'Сообщение доставлено и сохранено. Салли не отвечает на каждую реплику.')
 
-    async def prepare_rick(self,job,user,payload):
+    async def prepare_rick(self,job,user,payload,image_dir=None):
         from agentbridge.agents.base import MediaAttachment
-        from agentbridge.documents import extract_document
+        from agentbridge.documents import document_material
         from agentbridge.transcribe import transcribe_audio_file
         rows = self.store.media(user,'rick',job['context'],payload.get('attachments',[]))
         question, images = payload['text'], []
@@ -216,7 +230,11 @@ class WebRuntime:
                     raise WebError(422,'Речь не распознана. Исходная запись сохранена.')
                 question += '\n[Расшифровка '+row['filename']+']\n'+transcript
             else:
-                question += '\n[Документ '+row['filename']+']\n'+await asyncio.to_thread(extract_document,path)
+                material = await asyncio.to_thread(document_material,path,image_dir/row['id'] if image_dir else None)
+                question += '\n[Документ '+row['filename']+']\n'+material['text']
+                for n, page in enumerate(material['pages'],1):
+                    question += f'\n[Изображение страницы {n} документа {row["filename"]} приложено; не угадывай нечитаемый текст.]'
+                    images.append(MediaAttachment(page,'image','image/png',f'{row["filename"]}, страница {n}'))
         if len(question)>150000:
             raise WebError(413,'Слишком много текста в одном запросе; разделите документы.')
         with self.store.connect() as db:

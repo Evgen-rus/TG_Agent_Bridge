@@ -237,3 +237,99 @@ def test_web_generated_sally_answer_has_ambiguity_guard(setup):
     row=s.store.deliveries()[0]
     assert s.store.claim_web_response(row)
     assert not SalesStore(s.store.path).claim_web_response(row)
+
+
+def scan_pdf(path, pages=2):
+    from PIL import Image, ImageDraw
+    images = []
+    for n in range(pages):
+        image = Image.new('RGB', (600,800), 'white')
+        ImageDraw.Draw(image).text((40,40),f'Contract page {n+1}: price 150000',fill='black',font_size=30)
+        images.append(image)
+    images[0].save(path, 'PDF', save_all=True, append_images=images[1:])
+    return path.read_bytes()
+
+
+def test_scanned_pdf_renders_complete_ordered_pages_and_rejects_oversized_scan(tmp_path):
+    from agentbridge.documents import document_material
+    from PIL import Image
+    pdf = tmp_path/'scan.pdf'
+    scan_pdf(pdf)
+    material = document_material(pdf,tmp_path/'pages')
+    assert len(material['pages'])==2
+    assert [Path(p).name for p in material['pages']]==['page-001.png','page-002.png']
+    with Image.open(material['pages'][0]) as image:
+        assert image.width==1200 and image.height==1600
+        assert image.convert('L').getextrema()[0]<100
+    scan_pdf(pdf,11)
+    with pytest.raises(ValueError,match='Разделите PDF'):
+        document_material(pdf,tmp_path/'too-many')
+    assert not list((tmp_path/'too-many').glob('*.png'))
+
+
+@pytest.mark.asyncio
+async def test_sally_pdf_and_voice_share_durable_batch_and_visual_evidence(setup):
+    from agentbridge.sales.images import ImageWorker
+    s = setup
+    raw = scan_pdf(s.root/'scan.pdf')
+    pdf = upload(s.access,s.user,'sally','101','scan.pdf',BytesIO(raw),len(raw))
+    audio = upload(s.access,s.user,'sally','101','voice.webm',BytesIO(b'\x1a\x45\xdf\xa3webm'+b'x'*20),28)
+    payload = {'text':'Салли, проверь документ','attachments':[pdf['id'],audio['id']]}
+    job = enqueue(s,payload)
+    await s.runtime.sales(job,s.user,payload)
+    with s.store.connect() as db:
+        event = db.execute('SELECT event_id FROM audio_jobs').fetchone()
+        db.execute('UPDATE deals SET batch_cutoff_id=(SELECT MAX(id) FROM events) WHERE topic_id=101')
+    async def download(custom_path):
+        Path(custom_path).write_bytes(raw)
+    async def get_file(file_id):
+        return SimpleNamespace(file_size=len(raw),download_to_drive=download)
+    s.bot.get_file=get_file
+    seen = []
+    async def read_image(path,source):
+        assert Path(path).is_file() and Path(path).suffix=='.png'
+        seen.append(str(path))
+        return [dict(kind='readable_text',text='Цена 150000'),dict(kind='uncertain',text='Подпись неразборчива')]
+    s.provider.read_image = read_image
+    await ImageWorker(s.service,s.root/'images').run_once(s.bot,-100)
+    assert len(seen)==2 and not any(Path(p).exists() for p in seen)
+    assert not s.store.pending_topics(batched=True)
+    s.store.audio_transcribed(event[0],'Салли, проверь документ')
+    await s.service.process(-100,101,batch=True)
+    s.runtime.reconcile_sales()
+    assert s.provider.calls==1 and len(s.bot.calls)==3
+    with s.store.connect() as db:
+        evidence=json.loads(db.execute('SELECT payload FROM image_jobs').fetchone()[0])
+        assert '[Страница 2]' in evidence[-1]['text'] and evidence[-1]['kind']=='uncertain'
+    assert s.access.history(s.user,'sally','101')[0]['state']=='done'
+
+
+@pytest.mark.asyncio
+async def test_rick_scan_keeps_source_and_passes_page_images_without_telegram(setup):
+    s=setup
+    raw=scan_pdf(s.root/'scan.pdf')
+    item=upload(s.access,s.user,'rick','101','scan.pdf',BytesIO(raw),len(raw))
+    question,images=await s.runtime.prepare_rick({'id':10,'context':'101'},s.user,
+        {'text':'Проверь','attachments':[item['id']]},s.root/'rendered')
+    assert len(images)==2 and 'страницы 2' in question
+    assert all(Path(i.path).is_file() and i.kind=='image' for i in images)
+    assert Path(s.access.media(s.user,'rick','101',[item['id']])[0]['path']).is_file()
+    assert not s.bot.calls
+
+
+def test_mixed_pdf_keeps_text_and_renders_every_page_and_password_is_rejected(tmp_path):
+    from agentbridge.documents import document_material
+    from pypdf import PdfReader,PdfWriter
+    from pypdf.generic import DictionaryObject,NameObject,DecodedStreamObject
+    scan=tmp_path/'scan.pdf';scan_pdf(scan,1)
+    writer=PdfWriter();page=writer.add_blank_page(300,400)
+    font=DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')})
+    page[NameObject('/Resources')]=DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):font})})
+    stream=DecodedStreamObject();stream.set_data(b'BT /F1 18 Tf 10 350 Td (Text page) Tj ET')
+    page[NameObject('/Contents')]=stream
+    writer.append(PdfReader(scan));mixed=tmp_path/'mixed.pdf';writer.write(mixed)
+    material=document_material(mixed,tmp_path/'pages')
+    assert 'Text page' in material['text'] and len(material['pages'])==2
+    writer.encrypt('test-password');writer.write(mixed)
+    with pytest.raises(ValueError,match='без пароля'):document_material(mixed,tmp_path/'locked')
+    assert not list((tmp_path/'locked').glob('*.png'))

@@ -38,6 +38,8 @@ it('реальный UI: вход, контекст, ошибка отправк
  await u.type(screen.getByRole('textbox',{name:'Сообщение'}),'Мой вопрос');
  await u.click(screen.getByRole('button',{name:'Отправить сообщение'}));
  expect(await screen.findByText('Сеть недоступна')).toBeTruthy();
+ expect(screen.getByRole('alert').closest('.screen')).toBeNull();
+ expect(screen.getByRole('alert').nextElementSibling?.className).toBe('media-compose');
  await u.click(screen.getByRole('button',{name:'Отправить сообщение'}));
  expect(await screen.findByText('Готовый ответ')).toBeTruthy();
  expect(keys.length).toBe(2);

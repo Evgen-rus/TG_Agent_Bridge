@@ -627,9 +627,11 @@ class SalesStore:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM events WHERE chat_id=? AND processed IN (0,1) AND source='text_document_pending' ORDER BY id LIMIT 10", (chat,))]
 
-    def hydrate_document(self, row_id, text, source='text_document'):
+    def hydrate_document(self, row_id, text, source='text_document', image=None):
         with self.connect() as db:
-            db.execute("UPDATE events SET text=?,source=? WHERE id=? AND processed IN (0,1) AND source='text_document_pending'", (text, source, row_id))
+            changed = db.execute("UPDATE events SET text=?,source=? WHERE id=? AND processed IN (0,1) AND source='text_document_pending'", (text, source, row_id)).rowcount
+            if changed and image:
+                db.execute('INSERT OR IGNORE INTO image_jobs(event_id,metadata) VALUES (?,?)', (row_id, encoded(image)))
 
     def awaiting_audio(self, chat):
         with self.connect() as db:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
@@ -278,3 +279,17 @@ def test_windows_restart_is_refused_without_subprocess(monkeypatch):
     monkeypatch.setattr(operations.subprocess, 'run', lambda *args, **kwargs: pytest.fail('No subprocess on unsupported platform'))
     with pytest.raises(RuntimeError):
         operations.restart_sales()
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_telegram_uses_durable_image_evidence_queue(tmp_path):
+    from test_mobile_media import scan_pdf
+    payload=scan_pdf(tmp_path/'scan.pdf')
+    bridge,bot=adapter(tmp_path,Bot(payload=payload))
+    await bridge.ingest(message(document=NS(file_id='pdf-file',file_name='scan.pdf',file_size=len(payload))),NS(bot=bot))
+    await bridge.hydrate_documents(bot)
+    with bridge.service.store.connect() as db:
+        assert db.execute('SELECT source FROM events').fetchone()[0]=='image_pending'
+        assert json.loads(db.execute('SELECT metadata FROM image_jobs').fetchone()[0])['file_id']=='pdf-file'
+    await bridge.hydrate_documents(bot)
+    assert bot.downloads==1

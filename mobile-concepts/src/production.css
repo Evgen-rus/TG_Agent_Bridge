@@ -35,3 +35,5 @@
 .live-app .bubble p{white-space:pre-wrap;overflow-wrap:anywhere}
 .live-app .bubble small{display:block;font-size:11px;color:var(--muted)}
 .general-link{margin-bottom:16px;width:100%}
+
+.compose-error{margin:8px 12px;max-height:24dvh;overflow-y:auto;flex-shrink:0}.compose-error p{margin:0;overflow-wrap:anywhere}
