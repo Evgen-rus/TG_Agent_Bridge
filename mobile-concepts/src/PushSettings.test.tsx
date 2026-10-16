@@ -50,3 +50,11 @@ it('replaces a browser subscription from an expired or different login after exp
  await screen.findByText('Уведомления включены на этом устройстве.');
  expect(subscription.unsubscribe).toHaveBeenCalledOnce();expect(subscribe).toHaveBeenCalledOnce();
 });
+
+it('uses Sally subscription endpoints and labels independently',async()=>{
+ const {fetch}=browser();render(<PushSettings csrf="csrf" product="sally"/>);
+ expect(screen.getByText('Уведомления Салли')).toBeTruthy();
+ fireEvent.click(screen.getByRole('button',{name:'Включить на этом устройстве'}));
+ await screen.findByText('Уведомления включены на этом устройстве.');
+ expect(fetch).toHaveBeenLastCalledWith('/sally/api/push-subscribe',expect.anything());
+});

@@ -45,7 +45,10 @@ def validate_subscription(value):
 
 
 class PushService:
-    def __init__(self, store, key_path: Path | None = None, sender=None):
+    def __init__(self, store, key_path: Path | None = None, sender=None, product='rick'):
+        if product not in ('rick', 'sally'):
+            raise ValueError('Invalid push product')
+        self.product = product
         self.store = store
         self.key_path = key_path or store.path.parent / 'vapid-private.pem'
         self.sender = sender or self._send
@@ -65,7 +68,34 @@ class PushService:
                     attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
                     state TEXT NOT NULL DEFAULT 'pending',
                     UNIQUE(subscription_id,event_key));
+                CREATE TABLE IF NOT EXISTS web_presence (
+                    session_hash TEXT NOT NULL, window_id TEXT NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(session_hash,window_id));
             ''')
+
+    def presence(self, user, session_token, visible, window_id='main'):
+        if type(visible) is not bool or not isinstance(window_id,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',window_id):
+            raise WebError(400, 'Некорректное состояние окна')
+        current = self.store.session(session_token, self.product)
+        if current['id'] != user['id']:
+            raise WebError(403, 'Нет доступа')
+        with self.store.connect() as db:
+            db.execute('DELETE FROM web_presence WHERE updated<?', (time.time()-12,))
+            if visible:
+                db.execute('INSERT INTO web_presence VALUES (?,?,?) ON CONFLICT(session_hash,window_id) DO UPDATE SET updated=excluded.updated',
+                           (digest(session_token),window_id,time.time()))
+            else:
+                db.execute('DELETE FROM web_presence WHERE session_hash=? AND window_id=?',(digest(session_token),window_id))
+        return {'ok': True}
+
+    def acknowledge(self,session_token):
+        # Only a successful foreground poll consumes notices; a lost window heartbeat merely delays delivery.
+        with self.store.connect() as db:
+            if db.execute('SELECT 1 FROM web_presence WHERE session_hash=? AND updated>?',
+                          (digest(session_token),time.time()-12)).fetchone():
+                db.execute("""UPDATE web_push_queue SET state='suppressed' WHERE state='pending'
+                    AND subscription_id IN (SELECT id FROM web_push_subscriptions WHERE session_hash=?)""",
+                           (digest(session_token),))
 
     def config(self, user=None, session_token=None):
         from cryptography.hazmat.primitives import serialization
@@ -93,7 +123,7 @@ class PushService:
         return result
 
     def subscribe(self, user, session_token, subscription):
-        current = self.store.session(session_token, 'rick')
+        current = self.store.session(session_token, self.product)
         if current['id'] != user['id']:
             raise WebError(403, 'Нет доступа')
         subscription = validate_subscription(subscription)
@@ -124,18 +154,23 @@ class PushService:
             raise ValueError('Invalid push event')
         now = time.time()
         destination = {'context':str(context)}
-        if kind=='reminder' and event_key.startswith('reminder:') and event_key[9:].isdigit():
-            destination['reminder'] = event_key[9:]
-        payload = json.dumps({'title': 'Рик', 'body': 'Время напоминания. Откройте Рика.' if kind == 'reminder' else 'Ответ Рика готов. Откройте приложение.',
-                              'url': '/rick/?' + urlencode(destination), 'tag': digest(event_key)}, ensure_ascii=False)
+        reminder_id = event_key.split(':')[1] if event_key.startswith('reminder:') else ''
+        if kind=='reminder' and reminder_id.isdigit():
+            destination['reminder'] = reminder_id
+        name = 'Рик' if self.product=='rick' else 'Сали'
+        body = ('Время напоминания. Откройте Рика.' if self.product=='rick' else 'Время напоминания. Откройте Сали.') if kind=='reminder' else f'Ответ {"Рика" if self.product=="rick" else "Сали"} готов. Откройте приложение.'
+        if self.product=='sally':
+            event_key = 'sally:'+event_key
+        payload = json.dumps({'title': name, 'body': body,
+                              'url': '/'+self.product+'/?' + urlencode(destination), 'tag': digest(event_key)}, ensure_ascii=False)
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             if not db.execute('INSERT OR IGNORE INTO web_push_events VALUES (?,?)', (user_id, event_key)).rowcount:
                 return
             rows = db.execute('''SELECT p.id FROM web_push_subscriptions p JOIN sessions s ON s.hash=p.session_hash
                 JOIN users u ON u.id=p.user_id WHERE p.user_id=? AND s.user_id=p.user_id
-                AND s.product='rick' AND s.expires>? AND u.disabled=0 AND u.role IN ('owner','rick') AND p.created<=?''',
-                (user_id, now, created_at if created_at is not None else now)).fetchall()
+                AND s.product=? AND s.expires>? AND u.disabled=0 AND u.role IN ('owner',?) AND p.created<=?''',
+                (user_id, self.product, now, self.product, created_at if created_at is not None else now)).fetchall()
             db.executemany('INSERT OR IGNORE INTO web_push_queue(subscription_id,event_key,payload,next_attempt) VALUES (?,?,?,?)',
                            [(r['id'], event_key, payload, now) for r in rows])
 
@@ -160,17 +195,23 @@ class PushService:
             db.execute('''DELETE FROM web_push_queue WHERE subscription_id IN (
                 SELECT p.id FROM web_push_subscriptions p LEFT JOIN sessions s ON s.hash=p.session_hash
                 LEFT JOIN users u ON u.id=p.user_id WHERE s.hash IS NULL OR s.user_id!=p.user_id
-                OR s.product!='rick' OR s.expires<=? OR u.id IS NULL OR u.disabled!=0 OR u.role NOT IN ('owner','rick'))''', (time.time(),))
+                OR s.product NOT IN ('rick','sally') OR s.expires<=? OR u.id IS NULL OR u.disabled!=0 OR (u.role!='owner' AND u.role!=s.product))''', (time.time(),))
             db.execute('DELETE FROM web_push_queue WHERE subscription_id NOT IN (SELECT id FROM web_push_subscriptions)')
-            rows = db.execute('''SELECT q.*,p.subscription FROM web_push_queue q JOIN web_push_subscriptions p ON p.id=q.subscription_id
-                WHERE q.state='pending' AND q.next_attempt<=? ORDER BY q.id LIMIT 5''', (time.time(),)).fetchall()
+            rows = db.execute('''SELECT q.*,p.subscription,p.session_hash FROM web_push_queue q JOIN web_push_subscriptions p ON p.id=q.subscription_id
+                JOIN sessions s ON s.hash=p.session_hash
+                WHERE q.state='pending' AND q.next_attempt<=? AND s.product=? ORDER BY q.id LIMIT 5''', (time.time(),self.product)).fetchall()
         for row in rows:
             # Recheck immediately before each send, including revocation during this batch.
             with self.store.connect() as db:
                 active = db.execute('''SELECT 1 FROM web_push_subscriptions p JOIN sessions s ON s.hash=p.session_hash
                     JOIN users u ON u.id=p.user_id JOIN web_push_queue q ON q.subscription_id=p.id
-                    WHERE q.id=? AND s.user_id=p.user_id AND s.product='rick' AND s.expires>? AND u.disabled=0
-                    AND u.role IN ('owner','rick')''', (row['id'], time.time())).fetchone()
+                    WHERE q.id=? AND q.state='pending' AND s.user_id=p.user_id AND s.product=? AND s.expires>? AND u.disabled=0
+                    AND u.role IN ('owner',?)''', (row['id'], self.product, time.time(), self.product)).fetchone()
+                visible = db.execute('SELECT 1 FROM web_presence WHERE session_hash=? AND updated>?',
+                                     (row['session_hash'],time.time()-12)).fetchone()
+                if active and visible:
+                    db.execute('UPDATE web_push_queue SET next_attempt=? WHERE id=?',(time.time()+2,row['id']))
+                    continue
             if not active:
                 continue
             status = None

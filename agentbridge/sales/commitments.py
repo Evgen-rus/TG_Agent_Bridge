@@ -631,7 +631,8 @@ class Commitments:
                 key = f'reminder:{row["id"]}:{row["revision"]}:{snap}'
                 # The adapter formats only these application-generated messages as HTML.
                 name = html.escape(row['author'])
-                text = f'<a href="tg://user?id={row["author_id"]}">{name}</a>, напоминаю: {html.escape(row["action"])}.'
+                addressee = f'<a href="tg://user?id={row["author_id"]}">{name}</a>' if row["author_id"]>0 else name
+                text = f'{addressee}, напоминаю: {html.escape(row["action"])}.'
                 self.store._queue(db, self.chat_id, row['topic_id'], key, text)
                 outbox = db.execute('SELECT id FROM outbox WHERE delivery_key=?', (key,)).fetchone()
                 db.execute('INSERT INTO commitment_deliveries(outbox_id,chat_id,topic_id,snapshot,ids,autonomous) VALUES (?,?,?,?,?,2)',

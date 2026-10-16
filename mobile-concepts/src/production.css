@@ -47,3 +47,5 @@
 .agent-working i:nth-child(2){animation-delay:.15s}.agent-working i:nth-child(3){animation-delay:.3s}
 @keyframes agent-pulse{0%,70%,100%{opacity:.3}35%{opacity:1}}
 @media(prefers-reduced-motion:reduce){.agent-working i{animation:none;opacity:.7}}
+
+.due-reminder{position:sticky;top:0;z-index:5;border:2px solid var(--accent,#b68b46);box-shadow:0 0 0 3px #b68b4624}

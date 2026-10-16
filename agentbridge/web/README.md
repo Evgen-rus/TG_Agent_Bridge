@@ -90,12 +90,15 @@ Web. Other approvals and memory confirmation remain in Telegram. Web never
 impersonates Telegram callback users or exposes general, developer, restart or
 analytics execution through reminder controls.
 
-Rick recording has two controls: square discards the recording; arrow finishes
-and immediately uploads/sends. Failed uploads/sends retain the draft. Sally keeps
-finish, preview, cancel and separate send. Rick's “Ещё” contains the owner link
-to Telegram and opt-in notifications per device.
+Both apps have two recording controls: square discards the recording; arrow
+finishes and immediately uploads/sends. Failed uploads/sends retain the draft.
+“Ещё” contains the product's Telegram link and opt-in notifications per device.
+Sally reminder cards show the proposed time/text and require confirmation before
+her own commitment registry and Telegram outbox are updated. Clarification and
+cancellation are available in deals and General. No Rick
+business store/provider is used by Sally reminders.
 
-Web Push runs inside Rick with the existing service worker. `pywebpush` handles
+Web Push runs inside each existing bot process with its scoped service worker. `pywebpush` handles
 encryption/VAPID; no extra service, scheduler, account or env setting is needed.
 The private key is generated at `runtime/web/vapid-private.pem` (0600 on Linux).
 Retain it with runtime backups; never commit or expose it. Subscriptions, event
@@ -103,7 +106,7 @@ dedupe and delivery queue are in `access.sqlite3`. Only known HTTPS Apple,
 Google and Mozilla push hosts are allowed; redirects and env proxies are disabled.
 
 Notifications need explicit browser permission via “Включить на этом устройстве”,
-a valid Rick login, OS permissions and network. On iOS 16.4+ install on the Home
+a valid product login, OS permissions and network. On iOS 16.4+ install on the Home
 Screen and open there. Delivery timing depends on browser/OS. Logout, expiry or
 revocation suppress queued sends; re-login requires enabling the new session.
 Only a generic answer/reminder notice appears on the lock screen; opening it
@@ -117,6 +120,13 @@ Telegram keeps its original retries. Push acceptance does not prove phone displa
 A crash after acceptance may repeat a push; stable notification tags collapse
 copies. Ready-answer push refers to Web answers; Telegram answers arrive there
 through the original Telegram flow.
+
+While the app is visible, all sections suppress system push for that session;
+due reminders appear inside their matching chat. Foreground notification polling
+acknowledges queued notices; a five-second per-window heartbeat defers delivery
+until that acknowledgement. If the OS kills the app without a hidden signal,
+the twelve-second lease expires and queued push resumes. Normal minimize clears
+presence immediately. Other devices and the other product are unaffected.
 
 The service worker caches only hashed build assets, never HTML/API/client history.
 No client data is written to localStorage. Manifests have different id/start_url,

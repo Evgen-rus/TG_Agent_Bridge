@@ -4,6 +4,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def make_server(root: Path, store, data, origin, port=18082):
     from .push import PushService
-    push = PushService(store)
+    pushes = {product:PushService(store,product=product) for product in ('rick','sally')}
     parsed_origin = urlsplit(origin)
     if parsed_origin.scheme != 'https' or not parsed_origin.netloc or parsed_origin.path:
         raise ValueError('AGENTBRIDGE_WEB_ORIGIN must be an HTTPS origin without a path')
@@ -81,6 +82,7 @@ def make_server(root: Path, store, data, origin, port=18082):
                 product = parts[1] if len(parts)>1 else ''
                 if product not in ('rick','sally'):
                     raise WebError(404,'Страница не найдена')
+                push = pushes[product]
                 cookie_name = '__Secure-'+product+'_sid'
                 cookies = SimpleCookie()
                 cookies.load(self.headers.get('Cookie',''))
@@ -124,18 +126,28 @@ def make_server(root: Path, store, data, origin, port=18082):
                         return self.send(200,{'ok':True},cookie=f'{cookie_name}=; Path=/{product}/; Secure; HttpOnly; SameSite=Strict; Max-Age=0')
                     if endpoint == 'api/contexts' and not mutation:
                         return self.send(200,data.contexts(user,product))
-                    if endpoint == 'api/push-config' and not mutation and product=='rick':
+                    if endpoint == 'api/presence' and mutation:
+                        return self.send(200,push.presence(user,token,payload.get('visible'),payload.get('window_id','main')))
+                    if endpoint == 'api/notifications' and not mutation:
+                        after = float(parse_qs(urlsplit(self.path).query).get('after',['0'])[0])
+                        if not math.isfinite(after) or after<0:
+                            raise WebError(400,'Некорректное время')
+                        result = data.notifications(user,product,after)
+                        push.acknowledge(token)
+                        return self.send(200,result)
+                    if endpoint == 'api/push-config' and not mutation:
                         return self.send(200,push.config(user,token))
-                    if endpoint == 'api/push-subscribe' and mutation and product=='rick':
+                    if endpoint == 'api/push-subscribe' and mutation:
                         store.throttle('push:'+str(user['id']),limit=10,seconds=60)
                         return self.send(200,push.subscribe(user,token,payload.get('subscription')))
-                    if endpoint == 'api/push-unsubscribe' and mutation and product=='rick':
+                    if endpoint == 'api/push-unsubscribe' and mutation:
                         return self.send(200,push.unsubscribe(user,token))
-                    if endpoint == 'api/telegram' and not mutation and product=='rick' and user['role']=='owner':
-                        return self.send(200,{'url':data.telegram_url(data.owner_chat) if data.owner_chat else ''})
-                    if endpoint == 'api/reminder' and not mutation and product=='rick':
+                    if endpoint == 'api/telegram' and not mutation:
+                        chat = data.owner_chat if product=='rick' and user['role']=='owner' else data.sales_chat if product=='sally' else None
+                        return self.send(200,{'url':data.telegram_url(chat) if chat else ''})
+                    if endpoint == 'api/reminder' and not mutation:
                         ident = int(parse_qs(urlsplit(self.path).query).get('id',['0'])[0])
-                        return self.send(200,data.reminder(user,ident))
+                        return self.send(200,data.reminder(user,ident,product))
                     if endpoint == 'api/invite-contexts' and not mutation and user['role']=='owner':
                         target = parse_qs(urlsplit(self.path).query).get('product',[''])[0]
                         if target not in ('rick','sally'):
@@ -182,9 +194,9 @@ def make_server(root: Path, store, data, origin, port=18082):
                         return self.send(200,data.detail(user,product,context))
                     if endpoint == 'api/history' and not mutation:
                         return self.send(200,store.history(user,product,context))
-                    if endpoint == 'api/reminder-action' and mutation and product=='rick':
+                    if endpoint == 'api/reminder-action' and mutation:
                         job = store.reminder_action(user,context,payload.get('job_id'),payload.get('revision'),
-                                                    payload.get('action'),payload.get('text',''))
+                                                    payload.get('action'),payload.get('text',''),product=product)
                         return self.send(202,{'id':job})
                     if endpoint == 'api/ask' and mutation:
                         store.throttle('ask:'+str(user['id']),limit=30,seconds=60)

@@ -166,3 +166,80 @@ def test_reminder_click_identifies_the_actual_reminder_without_lock_screen_text(
     push.service.flush()
     assert push.calls[0][1]['url']=='/rick/?context=&reminder=10'
     assert push.calls[0][1]['body']=='Время напоминания. Откройте Рика.'
+
+
+def test_visible_session_suppresses_push_and_hidden_or_stale_resumes(push):
+    push.service.subscribe(push.user,'token',subscription())
+    push.service.presence(push.user,'token',True)
+    push.service.enqueue(1,'answer:visible','1')
+    push.service.flush()
+    assert not push.calls
+    push.service.acknowledge('token')
+    with push.store.connect() as db:
+        assert db.execute('SELECT state FROM web_push_queue').fetchone()[0]=='suppressed'
+    push.service.presence(push.user,'token',False)
+    push.service.enqueue(1,'answer:hidden','1')
+    push.service.flush()
+    assert len(push.calls)==1
+    push.service.presence(push.user,'token',True)
+    with push.store.connect() as db:
+        db.execute('UPDATE web_presence SET updated=?',(time.time()-13,))
+    push.service.enqueue(1,'answer:stale','1')
+    push.service.flush()
+    assert len(push.calls)==2
+    with pytest.raises(WebError):
+        push.service.presence(push.user,'other',True)
+    with pytest.raises(WebError):
+        push.service.presence(push.user,'token','yes')
+
+
+def test_products_and_device_presence_are_isolated(push):
+    with push.store.connect() as db:
+        db.execute("INSERT INTO sessions VALUES (?,1,'sally','csrf',?)",(digest('sally-token'),time.time()+3600))
+        db.execute("INSERT INTO sessions VALUES (?,1,'rick','csrf',?)",(digest('second-rick'),time.time()+3600))
+    sally=PushService(push.store,sender=push.service.sender,product='sally')
+    sally_user=push.store.session('sally-token','sally')
+    sally.subscribe(sally_user,'sally-token',subscription('https://fcm.googleapis.com/sally'))
+    push.service.subscribe(push.user,'token',subscription())
+    push.service.subscribe(push.user,'second-rick',subscription('https://fcm.googleapis.com/other-device'))
+    push.service.presence(push.user,'token',True)
+    push.service.enqueue(1,'reminder:10:revision','1','reminder')
+    sally.enqueue(1,'reminder:10:revision','101','reminder')
+    push.service.flush()
+    assert len(push.calls)==1 and push.calls[0][1]['url']=='/rick/?context=1&reminder=10'
+    sally.flush()
+    assert len(push.calls)==2 and push.calls[1][1]['url']=='/sally/?context=101&reminder=10'
+    assert push.calls[1][1]['body']=='Время напоминания. Откройте Сали.'
+    assert push.calls[0][1]['tag']!=push.calls[1][1]['tag']
+    with pytest.raises(WebError):
+        sally.subscribe(push.user,'token',subscription())
+
+
+def test_lost_hidden_signal_defers_until_lease_expires_without_dropping(push):
+    push.service.subscribe(push.user,'token',subscription())
+    push.service.presence(push.user,'token',True,'first')
+    push.service.presence(push.user,'token',True,'second')
+    push.service.presence(push.user,'token',False,'first')
+    push.service.enqueue(1,'answer:pending','1')
+    push.service.flush()
+    assert not push.calls
+    with push.store.connect() as db:
+        assert db.execute('SELECT state FROM web_push_queue').fetchone()[0]=='pending'
+        db.execute('UPDATE web_presence SET updated=?',(time.time()-13,))
+        db.execute('UPDATE web_push_queue SET next_attempt=0')
+    push.service.flush()
+    assert len(push.calls)==1
+
+
+def test_foreground_poll_during_delivery_prevents_sending_already_acknowledged_rows(push):
+    push.service.subscribe(push.user,'token',subscription())
+    push.service.enqueue(1,'answer:first','1')
+    push.service.enqueue(1,'answer:second','1')
+    def send(subscription,payload):
+        push.calls.append(json.loads(payload))
+        push.service.presence(push.user,'token',True)
+        push.service.acknowledge('token')
+        push.service.presence(push.user,'token',False)
+    push.service.sender=send
+    push.service.flush()
+    assert len(push.calls)==1

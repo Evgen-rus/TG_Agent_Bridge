@@ -24,7 +24,16 @@ class WebData:
         self.rick_path, self.sales_path, self.sales_chat = rick_path, sales_path, sales_chat
         self.owner_chat = owner_chat
 
-    def reminder(self,user,ident):
+    def reminder(self,user,ident,product='rick'):
+        if product=='sally':
+            if not WebStore.allowed(user,product):
+                raise WebError(403,'Напоминание недоступно')
+            with reader(self.sales_path) as db:
+                row = db.execute('SELECT c.*,d.title FROM commitments c JOIN deals d ON d.chat_id=c.chat_id AND d.topic_id=c.topic_id WHERE c.chat_id=? AND c.id=? AND c.remind_at IS NOT NULL',(self.sales_chat,ident)).fetchone()
+            if not row:
+                raise WebError(404,'Напоминание недоступно')
+            from datetime import datetime,timezone
+            return dict(id=row['id'],action=row['action'],remind_at_utc=datetime.fromtimestamp(row['remind_at'],timezone.utc).isoformat(),sent_at=row['reminder_sent_at'],related_chat_name=row['title'])
         if user['role']!='owner' or not WebStore.allowed(user,'rick'):
             raise WebError(403,'Напоминание доступно владельцу')
         with reader(self.rick_path) as db:
@@ -33,6 +42,26 @@ class WebData:
         if not row:
             raise WebError(404,'Напоминание недоступно')
         return dict(row)
+
+    def notifications(self,user,product,after):
+        import time
+        now = time.time()
+        after = max(float(after),now-86400)
+        if not WebStore.allowed(user,product):
+            raise WebError(403,'Нет доступа')
+        notifications = []
+        if product=='sally':
+            with reader(self.sales_path) as db:
+                rows = db.execute("SELECT id,topic_id,remind_at FROM commitments WHERE chat_id=? AND state='active' AND quiet=0 AND remind_at>? AND remind_at<=?",(self.sales_chat,after,now)).fetchall()
+            for row in rows:
+                notifications.append(dict(id=f"sally-reminder:{row['id']}:{row['remind_at']}",context=str(row['topic_id']),reminder_id=row['id'],url=f"/sally/?context={row['topic_id']}&reminder={row['id']}"))
+        elif user['role']=='owner':
+            with reader(self.rick_path) as db:
+                rows = db.execute("SELECT id,related_chat_id,remind_at_utc FROM reminders WHERE owner_chat_id=? AND julianday(remind_at_utc)>julianday(?,'unixepoch') AND julianday(remind_at_utc)<=julianday(?,'unixepoch')",(self.owner_chat,after,now)).fetchall()
+            for row in rows:
+                context = str(row['related_chat_id']) if row['related_chat_id'] else ''
+                notifications.append(dict(id=f"rick-reminder:{row['id']}",context=context,reminder_id=row['id'],url=f"/rick/?context={context}&reminder={row['id']}"))
+        return dict(notifications=notifications,cursor=now)
 
     def contexts(self, user, product):
         if not WebStore.allowed(user, product):

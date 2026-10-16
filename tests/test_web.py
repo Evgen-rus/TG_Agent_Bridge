@@ -284,8 +284,25 @@ def test_http_rick_telegram_and_push_routes_are_authenticated(web,http):
     config=json.loads(http('GET','/rick/api/push-config',headers=headers)[2])
     assert config['public_key'] and config['subscribed'] is False
     assert http('POST','/rick/api/push-subscribe',{'subscription':{}},headers)[0]==400
+    assert http('POST','/rick/api/presence',{'visible':True,'window_id':'test'},headers)[0]==200
+    assert http('POST','/rick/api/presence',{'visible':'yes'},headers)[0]==400
+    assert http('POST','/rick/api/presence',{'visible':False},dict(headers,**{'X-CSRF-Token':'wrong'}))[0]==403
+    assert json.loads(http('GET','/rick/api/notifications?after=0',headers=headers)[2])['notifications']==[]
+    assert http('GET','/rick/api/notifications?after=nan',headers=headers)[0]==400
     assert http('POST','/rick/api/reminder-action',{'context':'-100123456','job_id':1,'revision':1,'action':'confirm'},
                 dict(headers,**{'X-CSRF-Token':'wrong'}))[0]==403
+
+
+def test_http_sally_notifications_and_push_stay_in_product(web,http):
+    actor,token=user(web.access,'sergey',[],'sally')
+    web.data.sales_chat=-100999
+    headers={'Cookie':'__Secure-sally_sid='+token,'X-CSRF-Token':actor['csrf'],
+             'Origin':'https://example.test','Content-Type':'application/json'}
+    assert http('GET','/sally/api/push-config',headers=headers)[0]==200
+    assert json.loads(http('GET','/sally/api/telegram',headers=headers)[2])['url']=='https://t.me/c/999/'
+    assert http('POST','/sally/api/presence',{'visible':True},headers)[0]==200
+    assert json.loads(http('GET','/sally/api/notifications?after=0',headers=headers)[2])['notifications']==[]
+    assert http('GET','/rick/api/push-config',headers=headers)[0]==401
 
 
 def test_notification_scan_queues_due_reminders_independently_from_telegram(web,chat_registry):

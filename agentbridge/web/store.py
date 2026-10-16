@@ -199,8 +199,8 @@ class WebStore:
             db.execute("""UPDATE jobs SET task_id=?,state='review',result=?,can_confirm=?,
                 revision=revision+1,updated=? WHERE id=?""", (task_id,text,int(can_confirm),time.time(),job_id))
 
-    def reminder_action(self, user, context, job_id, revision, action, text=''):
-        if user['role'] != 'owner' or not self.allowed(user,'rick',context):
+    def reminder_action(self, user, context, job_id, revision, action, text='', product='rick'):
+        if not self.allowed(user,product,context) or (product=='rick' and user['role']!='owner'):
             raise WebError(403,'Напоминания доступны владельцу')
         if type(job_id) is not int or type(revision) is not int or action not in ('confirm','cancel','refine'):
             raise WebError(400,'Некорректное подтверждение')
@@ -208,8 +208,8 @@ class WebStore:
             raise WebError(400,'Напишите уточнение до 6000 символов')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            job = db.execute("SELECT * FROM jobs WHERE id=? AND user_id=? AND product='rick' AND context=?",
-                             (job_id,user['id'],context)).fetchone()
+            job = db.execute("SELECT * FROM jobs WHERE id=? AND user_id=? AND product=? AND context=?",
+                             (job_id,user['id'],product,context)).fetchone()
             if not job or not job['task_id']:
                 raise WebError(404,'Напоминание недоступно')
             if job['revision'] != revision:
@@ -226,13 +226,13 @@ class WebStore:
 
     def interrupted(self, product):
         with self.connect() as db:
-            if product == 'rick':
+            if product in ('rick','sally'):
                 # Fixed reminder actions are replayable; arbitrary model turns are not.
-                db.execute("""UPDATE jobs SET state='pending' WHERE product='rick' AND state='running'
-                    AND task_id IS NOT NULL AND action IN ('confirm','cancel')""")
+                db.execute("""UPDATE jobs SET state='pending' WHERE product=? AND state='running'
+                    AND task_id IS NOT NULL AND action IN ('confirm','cancel')""",(product,))
                 db.execute("""UPDATE jobs SET state='review',can_confirm=0,revision=revision+1,
                     result='Уточнение было прервано. Уточните дату, время и текст ещё раз.'
-                    WHERE product='rick' AND state='running' AND task_id IS NOT NULL AND action='refine'""")
+                    WHERE product=? AND state='running' AND task_id IS NOT NULL AND action='refine'""",(product,))
             if product == 'sally':
                 # Only Sally's persisted ingest and acknowledged sends can safely resume.
                 db.execute("""UPDATE jobs SET state='pending' WHERE product='sally' AND state='running'

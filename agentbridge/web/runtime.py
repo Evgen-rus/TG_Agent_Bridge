@@ -45,8 +45,7 @@ class WebRuntime:
                            sales_path,sales_chat,self.settings.owner_chat_id)
             self.server = start_server(self.root, self.store, data)
         self.task = asyncio.create_task(self.run(), name='web-'+self.product)
-        if self.product == 'rick':
-            self.notification_task = asyncio.create_task(self.notifications(), name='web-rick-notifications')
+        self.notification_task = asyncio.create_task(self.notifications(), name='web-'+self.product+'-notifications')
 
     async def stop(self, app):
         if self.notification_task:
@@ -175,7 +174,7 @@ class WebRuntime:
 
     async def notifications(self):
         from .push import PushService
-        push = PushService(self.store)
+        push = PushService(self.store,product=self.product)
         while True:
             try:
                 await asyncio.to_thread(self.queue_notifications,push)
@@ -188,6 +187,9 @@ class WebRuntime:
 
     def queue_notifications(self,push):
         import time
+        if self.product=='sally':
+            from .sales_reminders import queue_notifications
+            return queue_notifications(self,push)
         cutoff = time.time()-86400
         with self.store.connect() as db:
             jobs = db.execute("""SELECT id,user_id,context,state,revision,updated FROM jobs
@@ -217,6 +219,9 @@ class WebRuntime:
             raise WebError(404, 'Сделка недоступна')
         if self.service.store.awaiting_fact_review(self.settings.chat_id, topic):
             raise WebError(409, 'Сначала завершите проверку фактов в Telegram')
+        from .sales_reminders import handle_reminder
+        if await handle_reminder(self,job,user,payload):
+            return
         from agentbridge.telegram.formatter import split_owner_message
         from agentbridge.sales.storage import should_respond
         attachments = self.store.media(user,'sally',job['context'],payload.get('attachments',[]))
@@ -226,6 +231,8 @@ class WebRuntime:
             if item['kind']=='document':
                 with TemporaryDirectory(prefix='sally-document-') as folder:
                     documents[item['id']] = await asyncio.to_thread(document_material,Path(item['path']),Path(folder))
+        with self.store.connect() as db:
+            prepared = db.execute('SELECT prepared FROM jobs WHERE id=?',(job['id'],)).fetchone()[0]
         # Text is split by the same Telegram limits as all other owner delivery.
         parts = [(None,t) for t in split_owner_message(user['name']+' · через приложение\n'+payload['text'])]
         parts.extend((item,'') for item in attachments)
@@ -274,6 +281,8 @@ class WebRuntime:
                     source = 'audio_pending'
                     audio = dict(**media, routing=dict(bot_username=self.app.bot.username or '',general=topic==0,
                         replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to']))))
+                    if prepared:
+                        body,source,audio = prepared,'audio_transcript',None
                 else:
                     material = documents[item['id']]
                     if material['pages']:
@@ -287,7 +296,7 @@ class WebRuntime:
             self.service.store.ingest(update_id=synthetic,chat_id=self.settings.chat_id,topic_id=topic,title=deal['title'],
                 message_id=sent['message_id'],author_id=-user['id'],author=user['name'],
                 date=datetime.fromtimestamp(job['created'],timezone.utc).isoformat(),text=body,source=source,
-                respond=respond or bool(audio),reply_to=payload.get('reply_to'),audio=audio,image=image,media=media)
+                respond=respond or bool(audio) or bool(prepared),reply_to=payload.get('reply_to'),audio=audio,image=image,media=media)
             with self.service.store.connect() as db:
                 event_id = db.execute('SELECT id FROM events WHERE update_id=?',(synthetic,)).fetchone()[0]
             if item:
@@ -303,7 +312,7 @@ class WebRuntime:
 
     def reconcile_sales(self):
         with self.store.connect() as db:
-            jobs = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE product='sally' AND state IN ('waiting','review')")]
+            jobs = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE product='sally' AND task_id IS NULL AND state IN ('waiting','review')")]
         for job in jobs:
             with self.service.store.connect() as db:
                 events = db.execute('SELECT id,processed FROM events WHERE update_id<=? AND update_id>?',

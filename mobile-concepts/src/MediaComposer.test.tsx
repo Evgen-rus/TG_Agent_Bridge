@@ -18,19 +18,15 @@ function microphone(){
  return stop;
 }
 
-it('Сали сохраняет квадрат завершения, крестик отмены и прослушивание перед отправкой',async()=>{
+it('Салли использует квадрат отмены и стрелку немедленной отправки',async()=>{
  const stop=microphone(),send=vi.fn(async()=>{});
- vi.stubGlobal('URL',{createObjectURL:()=> 'blob:test',revokeObjectURL:()=>{}});
  vi.stubGlobal('fetch',vi.fn(async()=>new Response(JSON.stringify({id:'voice-id'}),{status:201})));
- const {container}=render(<MediaComposer visible product="sally" context="101" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={()=>{}} onSend={send}/>);
+ render(<MediaComposer visible product="sally" context="101" csrf="csrf" busy={false} onReplyClear={()=>{}} onError={()=>{}} onSend={send}/>);
  fireEvent.click(screen.getByRole('button',{name:'Записать голосовое'}));await act(async()=>{});
- expect(screen.getByRole('button',{name:'Отменить запись'}).querySelector('.lucide-x')).toBeTruthy();
- expect(screen.queryByRole('button',{name:'Отправить голосовое'})).toBeNull();
- fireEvent.click(screen.getByRole('button',{name:'Завершить запись'}));
- expect(stop).toHaveBeenCalledOnce();expect(send).not.toHaveBeenCalled();
- expect(screen.getByText('Голосовое.webm')).toBeTruthy();expect(container.querySelector('audio')?.src).toBe('blob:test');
- fireEvent.click(screen.getByRole('button',{name:'Отправить сообщение'}));
+ expect(screen.getByRole('button',{name:'Отменить запись'}).querySelector('.lucide-square')).toBeTruthy();
+ fireEvent.click(screen.getByRole('button',{name:'Отправить голосовое'}));
  await waitFor(()=>expect(send).toHaveBeenCalledWith('',['voice-id'],expect.any(String)));
+ expect(stop).toHaveBeenCalledOnce();
 });
 
 it('ошибка немедленной отправки сохраняет голосовое для повтора',async()=>{

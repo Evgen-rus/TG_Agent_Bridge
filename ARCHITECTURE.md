@@ -911,17 +911,35 @@ layout extraction. No executable documents or external fetches are enabled.
 
 Upload errors appear next to the composer with filename, reason and recovery steps.
 Drafts survive failure; each file fetch has a 60-second deadline and named progress.
-Rick recording uses square to discard and arrow to finish and immediately send;
-Sally keeps finish/preview/cancel and separate send. Context/visibility changes
+Both apps use square to discard and arrow to finish and immediately send.
+Context/visibility changes
 cannot send a late recording; upload failure retains the draft.
 
-Rick Web Push uses a separate asynchronous task in the existing process, so a
-model turn cannot hold up due notifications. Subscriptions are bound to the Rick
+Rick and Sally Web Push each use a separate asynchronous task in their existing
+process, so a model turn cannot hold up due notifications. Subscriptions are bound to the product
 session/user and rechecked before delivery. Logout/expiry/revocation suppresses
 sends. The durable transport queue retries transient errors, removes 404/410
 endpoints, and deduplicates events across restarts. Generic notifications contain
-no client text; clicks open the authorized Rick context. Existing Telegram
+no client text; clicks open the authorized product context. Existing Telegram
 reminder delivery runs independently. Only events from the past 24 hours and
 after device subscription qualify. Push acceptance is not proof of OS display;
 delivery is at least once with a stable notification tag. VAPID secrets stay in
 ignored runtime storage. See `web/README.md` for device activation and limits.
+
+Visible windows report session-bound presence every five seconds, separately per
+window. Push delivery waits while a twelve-second presence lease is current;
+successful foreground notification polls consume queued notices for that session.
+Hidden/pagehide requests clear only their own window. A lost close signal delays
+delivery until the lease expires instead of discarding the notice. Other devices
+and the other product remain independent. Foreground polling shows due reminders
+in the matching chat without a system notification, including reminders created
+in Telegram. It does not cache business history offline.
+
+Sally Web reminder plans use her existing ephemeral commitment extractor and
+time validation. Pending cards live in Sally's operations store; confirm/refine/
+cancel controls use transport job revisions and the requesting user/context.
+Confirmation atomically saves an internal source event, commitment reminder,
+audit entry, Telegram confirmation outbox and completed plan in Sally's database.
+Replays recover that result without creating a second reminder. Existing
+commitment revision checks reject stale plans. Other Telegram planning remains
+unchanged; General reminders use topic zero in Sally's own registry.
