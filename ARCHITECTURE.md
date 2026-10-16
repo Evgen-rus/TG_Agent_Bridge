@@ -865,6 +865,10 @@ General; other flagged topics keep their ID. It has an independent persistent
 thread and internal-assistant instructions, no sales facts/profiles or automatic
 deal commitments. It responds only to name/tag or reply to Sally; audio repeats
 this decision after transcription. Ordinary General messages are still persisted.
+General keeps its bounded SQLite history when resuming a thread: quiet documents,
+images and conversation may not have been sent to the model before a later voice
+question. General v2 explicitly identifies extracted media and replaces v1 on
+the next turn; other deal threads are unchanged.
 Telegram topic semantics: https://core.telegram.org/api/forum and
 https://core.telegram.org/bots/api#message . No history backfill is invented.
 

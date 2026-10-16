@@ -91,6 +91,54 @@ async def test_persistent_threads_resume_restart_and_topic_isolation(setup):
                for c in SDK.configs)
 
 
+@pytest.mark.asyncio
+async def test_general_resume_keeps_quiet_pdf_and_text_for_later_voice_question(setup):
+    store, factory = setup
+    ingest(store, 1, topic=0, text='Салли, привет')
+    await SalesService(store, factory()).process(-100, 0)
+    first = store.thread(-100, 0)['thread_id']
+    ingest(store, 2, topic=0, text='', source='image_pending', respond=False,
+           image=dict(file_id='pdf',filename='scan.pdf',caption=''))
+    with store.connect() as db:
+        pdf_event = db.execute('SELECT id FROM events WHERE update_id=2').fetchone()[0]
+    store.image_read(pdf_event,[dict(kind='readable_text',text='PDF: приглашение на обучение'),
+                                dict(kind='uncertain',text='Дата плохо читается')])
+    ingest(store, 3, topic=0, text='Текст из второго документа', source='text_document', respond=False)
+    ingest(store, 4, topic=20, text='ЧУЖАЯ СДЕЛКА', respond=False)
+    assert not store.pending_topics()
+    ingest(store, 5, topic=0, text='', source='audio_pending', audio=dict(file_id='voice',
+           caption='',routing=dict(bot_username='sally',general=True)))
+    with store.connect() as db:
+        voice_event = db.execute('SELECT id FROM events WHERE update_id=5').fetchone()[0]
+    store.audio_transcribed(voice_event,'Салли, прочитай PDF и скажи, что полезного')
+    reopened = SalesStore(store.path)
+    await SalesService(reopened, factory(reopened)).process(-100, 0)
+    assert SDK.resumes == [first]
+    sent = SDK.turns[-1][1]
+    pdf = next(e for e in sent['history'] if e['id']==pdf_event)
+    assert pdf['source']=='image_transcript' and 'приглашение' in pdf['text']
+    assert pdf['image_evidence'][-1]['kind']=='uncertain'
+    assert any(e['text']=='Текст из второго документа' for e in sent['history'])
+    assert [e['id'] for e in sent['events']]==[voice_event]
+    assert 'ЧУЖАЯ СДЕЛКА' not in json.dumps(sent,ensure_ascii=False)
+    assert not sent['communication_profiles'] and not sent['facts']
+
+
+@pytest.mark.asyncio
+async def test_general_old_instructions_are_replaced_without_touching_deal_threads(setup):
+    store, factory = setup
+    provider = factory()
+    ingest(store, 1, topic=0, text='Салли, продолжи')
+    ingest(store, 2, topic=20, text='Другая сделка', respond=False)
+    store.save_thread(-100,0,'old-general',provider.version+'-general-v1','first_turn')
+    store.save_thread(-100,20,'untouched-deal',provider.version,'first_turn')
+    await SalesService(store, provider).process(-100,0)
+    assert not SDK.resumes and len(SDK.starts)==1
+    assert 'image_evidence' in SDK.starts[0]['developer_instructions']
+    assert store.thread(-100,0)['thread_version'].endswith('-general-v2')
+    assert store.thread(-100,20)['thread_id']=='untouched-deal'
+
+
 @pytest.mark.parametrize('ephemeral', [False, True])
 def test_start_preserves_codex_base_and_sales_developer_rules(setup, ephemeral):
     _, factory = setup
