@@ -231,8 +231,7 @@ class WebRuntime:
             if item['kind']=='document':
                 with TemporaryDirectory(prefix='sally-document-') as folder:
                     documents[item['id']] = await asyncio.to_thread(document_material,Path(item['path']),Path(folder))
-        with self.store.connect() as db:
-            prepared = db.execute('SELECT prepared FROM jobs WHERE id=?',(job['id'],)).fetchone()[0]
+        transcripts = self.service.store.op_get('web-audio:'+str(job['id']),{})
         # Text is split by the same Telegram limits as all other owner delivery.
         parts = [(None,t) for t in split_owner_message(user['name']+' · через приложение\n'+payload['text'])]
         parts.extend((item,'') for item in attachments)
@@ -281,8 +280,8 @@ class WebRuntime:
                     source = 'audio_pending'
                     audio = dict(**media, routing=dict(bot_username=self.app.bot.username or '',general=topic==0,
                         replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to']))))
-                    if prepared:
-                        body,source,audio = prepared,'audio_transcript',None
+                    if item['id'] in transcripts:
+                        body,source,audio = transcripts[item['id']],'audio_transcript',None
                 else:
                     material = documents[item['id']]
                     if material['pages']:
@@ -291,12 +290,13 @@ class WebRuntime:
                     else:
                         body = material['text']
                         source = 'text_document'
-            respond = should_respond(payload['text'],self.app.bot.username or '',general=topic==0,
+            response_text = payload['text']+'\n'+(transcripts.get(item['id'],'') if item else '')
+            respond = should_respond(response_text,self.app.bot.username or '',general=topic==0,
                                      replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to'])))
             self.service.store.ingest(update_id=synthetic,chat_id=self.settings.chat_id,topic_id=topic,title=deal['title'],
                 message_id=sent['message_id'],author_id=-user['id'],author=user['name'],
                 date=datetime.fromtimestamp(job['created'],timezone.utc).isoformat(),text=body,source=source,
-                respond=respond or bool(audio) or bool(prepared),reply_to=payload.get('reply_to'),audio=audio,image=image,media=media)
+                respond=respond or bool(audio),reply_to=payload.get('reply_to'),audio=audio,image=image,media=media)
             with self.service.store.connect() as db:
                 event_id = db.execute('SELECT id FROM events WHERE update_id=?',(synthetic,)).fetchone()[0]
             if item:

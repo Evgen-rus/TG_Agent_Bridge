@@ -44,25 +44,28 @@ async def handle_reminder(runtime,job,user,payload):
     else:
         question = payload['text']
         attachments = runtime.store.media(user,'sally',job['context'],payload.get('attachments',[]))
+        if any(r['kind']!='audio' for r in attachments):
+            if re.search(r'(?i)напом|напомин',question):
+                raise WebError(409,'Для напоминания отправьте отдельный текст или голосовое сообщение без файлов.')
+            return False
         audio = [r for r in attachments if r['kind']=='audio']
         if audio:
             from agentbridge.transcribe import transcribe_audio_file
-            if job.get('prepared'):
-                question = job['prepared']
-            else:
-                for item in audio:
-                    from pathlib import Path
+            from pathlib import Path
+            transcripts = store.op_get('web-audio:'+str(job['id']),{})
+            for item in audio:
+                if item['id'] not in transcripts:
                     transcript = await transcribe_audio_file(Path(item['path']),api_key=runtime.settings.openai_api_key,
                                                              model=runtime.settings.transcription_model)
                     if not transcript or not transcript.strip():
                         raise WebError(422,'Речь не распознана. Запись сохранена.')
-                    question += '\n'+transcript
-                with runtime.store.connect() as db:
-                    db.execute('UPDATE jobs SET prepared=? WHERE id=?',(question,job['id']))
+                    transcripts[item['id']] = transcript
+                    store.op_set('web-audio:'+str(job['id']),transcripts)
+                question += '\n'+transcripts[item['id']]
+            with runtime.store.connect() as db:
+                db.execute('UPDATE jobs SET prepared=? WHERE id=?',(question,job['id']))
         if not re.search(r'(?i)напом|напомин',question) or re.search(r'(?i)не\s+напомин|отмен[а-я]*\s+напомин',question):
             return False
-        if any(r['kind']!='audio' for r in attachments):
-            raise WebError(409,'Для напоминания отправьте отдельный текст или голосовое сообщение без файлов.')
         if not getattr(service,'commitments',None):
             runtime.store.finish(job['id'],'error','Напоминания Сали отключены настройкой.')
             return True
@@ -147,6 +150,8 @@ def queue_notifications(runtime,push):
         users = db.execute("SELECT id FROM users WHERE role IN ('owner','sally') AND disabled=0").fetchall()
     for job in jobs:
         push.enqueue(job['user_id'],f"answer:{job['id']}:{job['revision']}:{job['state']}",job['context'],'answer',created_at=job['updated'])
+    if not getattr(runtime.service,'commitments',None):
+        return
     with runtime.service.store.connect() as db:
         reminders = db.execute("SELECT * FROM commitments WHERE chat_id=? AND state='active' AND quiet=0 AND remind_at BETWEEN ? AND ?",
                                (runtime.settings.chat_id,cutoff,time.time())).fetchall()

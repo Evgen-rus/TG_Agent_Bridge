@@ -52,6 +52,9 @@ class WebData:
         notifications = []
         if product=='sally':
             with reader(self.sales_path) as db:
+                enabled = db.execute("SELECT value FROM operations WHERE key='commitments_enabled'").fetchone()
+                if enabled and not json.loads(enabled[0]):
+                    return dict(notifications=[],cursor=now)
                 rows = db.execute("SELECT id,topic_id,remind_at FROM commitments WHERE chat_id=? AND state='active' AND quiet=0 AND remind_at>? AND remind_at<=?",(self.sales_chat,after,now)).fetchall()
             for row in rows:
                 notifications.append(dict(id=f"sally-reminder:{row['id']}:{row['remind_at']}",context=str(row['topic_id']),reminder_id=row['id'],url=f"/sally/?context={row['topic_id']}&reminder={row['id']}"))

@@ -167,3 +167,68 @@ async def test_sally_general_reminder_queues_and_reads_from_sally_only(tmp_path)
     assert response['notifications'][0]['context']=='0'
     with pytest.raises(WebError):
         data.reminder({**actor,'role':'rick'},reminder['id'],'sally')
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('count',[1,2])
+async def test_sally_normal_audio_general_uses_individual_cached_transcripts(tmp_path,monkeypatch,count):
+    from io import BytesIO
+    from agentbridge.web.media import upload
+    runtime,job,actor=setup(tmp_path)
+    job['context']='0'
+    runtime.settings=SimpleNamespace(chat_id=-100,openai_api_key='fake',transcription_model='fake')
+    with runtime.service.store.connect() as db:
+        db.execute("INSERT INTO deals(chat_id,topic_id,title) VALUES (-100,0,'General')")
+    with runtime.store.connect() as db:
+        db.execute("UPDATE jobs SET context='0' WHERE id=?",(job['id'],))
+    transcript=AsyncMock(side_effect=['Сали, разберём первый вопрос','Сали, второй вопрос'][:count])
+    monkeypatch.setattr('agentbridge.transcribe.transcribe_audio_file',transcript)
+    identifiers=[]
+    for i in range(count):
+        raw=b'\x1a\x45\xdf\xa3webm'+b'x'*20
+        item=upload(runtime.store,actor,'sally','0',f'voice{i}.webm',BytesIO(raw),len(raw))
+        identifiers.append(item['id'])
+    payload=dict(text='',attachments=identifiers)
+    class Bot:
+        username='sally_bot'
+        message_id=100
+        async def send_message(self,**kwargs):
+            self.message_id+=1
+            return SimpleNamespace(message_id=self.message_id)
+        async def send_document(self,**kwargs):
+            self.message_id+=1
+            return SimpleNamespace(message_id=self.message_id,document=SimpleNamespace(file_id=f'file{self.message_id}'))
+    runtime.app=SimpleNamespace(bot=Bot())
+    await runtime.sales(job,actor,payload)
+    await runtime.sales(job,actor,payload)
+    assert transcript.await_count==count
+    with runtime.service.store.connect() as db:
+        rows=db.execute("SELECT text,processed FROM events WHERE source='audio_transcript' ORDER BY id").fetchall()
+        assert [r['text'] for r in rows]==['Сали, разберём первый вопрос','Сали, второй вопрос'][:count]
+        assert all(r['processed']==0 for r in rows)
+        assert db.execute('SELECT count(*) FROM audio_jobs').fetchone()[0]==0
+    assert runtime.service.provider.analyze_commitments.await_count==0
+
+@pytest.mark.asyncio
+async def test_sally_disabled_reminders_suppress_push_and_foreground(tmp_path):
+    runtime,job,actor=setup(tmp_path)
+    await handle_reminder(runtime,job,actor,json.loads(job['payload']))
+    review=runtime.store.history(actor,'sally','101')[0]
+    runtime.store.reminder_action(actor,'101',job['id'],review['revision'],'confirm',product='sally')
+    job,actor=runtime.store.claim('sally')
+    await handle_reminder(runtime,job,actor,{})
+    with runtime.service.store.connect() as db:
+        db.execute('UPDATE commitments SET remind_at=?',(datetime.now(timezone.utc).timestamp()-1,))
+    from agentbridge.web.sales_reminders import queue_notifications
+    class Push:
+        events=[]
+        def enqueue(self,*args,**kwargs):
+            self.events.append(args[1])
+    runtime.service.commitments=None
+    runtime.service.store.op_set('commitments_enabled',False)
+    push=Push()
+    queue_notifications(runtime,push)
+    assert any(e.startswith('answer:') for e in push.events)
+    assert not any(e.startswith('reminder:') for e in push.events)
+    from agentbridge.web.data import WebData
+    data=WebData(runtime.store,None,tmp_path/'missing-rick.sqlite3',runtime.service.store.path,-100)
+    assert data.notifications(actor,'sally',0)['notifications']==[]
