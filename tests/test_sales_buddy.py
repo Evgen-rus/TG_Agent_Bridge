@@ -375,9 +375,10 @@ async def test_attachment_caption_never_implies_read_contents(tmp_path):
     store = SalesStore(tmp_path / 'sales.sqlite3')
     adapter = SalesTelegram(-100, SalesService(store, Fake()))
     await adapter.ingest(update(text='', caption='Вот КП, посмотри', document=NS(file_id='fake', file_name='offer.pdf')), NS(bot=Bot()))
-    row = store.context(-100, 10)['events'][0]
-    assert row['source'] == 'unsupported_attachment'
-    assert 'не разобрано' in row['text'] and 'Вот КП' in row['text']
+    row = store.awaiting_documents(-100)[0]
+    assert row['source'] == 'text_document_pending'
+    assert 'Вот КП' in row['text']
+    assert not store.pending_topics()
 
 
 def test_large_card_is_bounded_without_erasing_old_confirmed_facts(tmp_path):

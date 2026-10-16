@@ -1795,13 +1795,13 @@ class AgentBridgeApplication:
         return "\n\n".join(parts), len(messages), total, truncated
 
     async def _answer_owner_query_for_chat(
-        self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None,
+        self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None, attachments=(),
     ) -> str:
         async with self._owner_query_locks.setdefault(chat.telegram_chat_id, asyncio.Lock()):
-            return await self._answer_owner_query_for_chat_locked(chat, question, scope=scope)
+            return await self._answer_owner_query_for_chat_locked(chat, question, scope=scope, attachments=attachments)
 
     async def _answer_owner_query_for_chat_locked(
-        self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None,
+        self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None, attachments=(),
     ) -> str:
         if self.attachment_fetcher is not None:
             await self.attachment_fetcher(chat.telegram_chat_id)
@@ -1838,8 +1838,8 @@ class AgentBridgeApplication:
                 )
             ]
             args = {"question": question, "chat_name": chat.name, "context_pack": pack, "thread_id": thread_id}
-            if selected:
-                args["attachments"] = tuple(MediaAttachment(item.media_path, item.media_kind, item.media_mime, item.media_filename) for item in selected)
+            if selected or attachments:
+                args["attachments"] = tuple(MediaAttachment(item.media_path, item.media_kind, item.media_mime, item.media_filename) for item in selected) + tuple(attachments)
             result = await answerer(**args)
             if isinstance(result, OwnerQueryAnswer):
                 self.store.save_owner_query_thread(

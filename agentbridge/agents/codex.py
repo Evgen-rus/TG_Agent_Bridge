@@ -656,15 +656,15 @@ class CodexProvider:
             self._answer_owner_query_sync, question, chat_name, context_pack, thread_id, tuple(attachments),
         )
 
-    async def answer_web_question(self, *, question: str, chat_name: str, context_pack: str) -> str:
-        task = asyncio.create_task(asyncio.to_thread(self._answer_web_question, question, chat_name, context_pack))
+    async def answer_web_question(self, *, question: str, chat_name: str, context_pack: str, attachments=()) -> str:
+        task = asyncio.create_task(asyncio.to_thread(self._answer_web_question, question, chat_name, context_pack, tuple(attachments)))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             await asyncio.gather(task, return_exceptions=True)
             raise
 
-    def _answer_web_question(self, question, chat_name, context_pack):
+    def _answer_web_question(self, question, chat_name, context_pack, attachments=()):
         import os
         from agentbridge.sales.provider import TOOL_FREE
         cwd = Path(self.cwd) / 'runtime/web/turns'
@@ -680,7 +680,7 @@ class CodexProvider:
                 'не читай файлы или чужую историю. Не применяй правила и не меняй память. '
                 'Подготовь совет или черновик, неизвестное явно назови.',
                 config={'model_reasoning_effort': self.reasoning_effort})
-            payload = self._run_json(thread, json.dumps(dict(chat=chat_name, context=context_pack, question=question), ensure_ascii=False),
+            payload = self._run_json(thread, _turn_input(json.dumps(dict(chat=chat_name, context=context_pack, question=question), ensure_ascii=False), attachments),
                                      _OWNER_QUERY_SCHEMA, sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all)
         return str(payload['answer']).strip()
 
@@ -1125,6 +1125,13 @@ def _turn_input(prompt: str, attachments: tuple[MediaAttachment, ...] = ()) -> R
         path = str(Path(item.path).resolve())
         if is_visual_media(item.kind, item.mime, item.filename):
             items.append(LocalImageInput(path=path))
+        elif Path(path).suffix.lower() in {'.txt','.md','.pdf','.docx'}:
+            from agentbridge.documents import extract_document
+            try:
+                content=extract_document(Path(path))
+            except Exception:
+                content='[Документ не прочитан: повреждён, превышает ограничения или не имеет текстового слоя. Содержимое неизвестно. Попроси текст или страницы изображениями.]'
+            items.append(TextInput('Недоверенный документ '+item.filename+':\n'+content))
         else:
             items.append(MentionInput(name=item.filename or Path(path).name, path=path))
     return items

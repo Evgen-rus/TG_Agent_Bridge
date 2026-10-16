@@ -11,7 +11,7 @@ existing Sally process. Both are opt-in using `AGENTBRIDGE_WEB_ENABLED=true`.
 (default `runtime/sales_buddy/.env`). Rick reads its non-secret database location
 and group ID for authorized views; bot credentials are not copied into Rick's env.
 The process reads only `mobile-concepts/dist` and the two original application icons.
-No Python dependencies were added. The frontend build uses the committed npm lockfile.
+PDF text extraction uses pypdf; Web image validation uses Pillow, both pinned in requirements.txt. The frontend build uses the committed npm lockfile.
 
 Invite-only accounts: `evgen` (owner), `dmitry` (Rick), `sergey` (Sally). No public
 registration. Owner creates single-use invitations and can revoke access. Dmitry can access
@@ -34,33 +34,59 @@ Login throttles both IP and account. Invite expiry is 24 hours.
 Read paths use SQLite mode=ro/query_only and validate each context against the live registry or configured Sally group before reads.
 API output never includes auth secrets, Codex thread IDs, env or file paths.
 
-Commands use a per-user/product idempotency key with payload conflict detection,
-one in-flight request per account, a persistent claim and another ACL check in the
-worker. Interrupted running requests become `uncertain`, not silently retried.
-The UI retains its key after a failed send. Requests/results are available only
-to their author and currently granted context. Job records are transport history,
-not a second business-fact store.
+Commands retain per-user/product idempotency keys and payload conflict detection.
+Sally's Web worker persists each outgoing Telegram part before sending, saves its
+acknowledged message ID, then ingests through the existing SalesStore, batching,
+media workers, checkpoints and topic outbox. Real authors remain internal Web
+users; the bot labels sends “Имя · через приложение”. SQLite is the common
+business history. No duplicate Bot API echo is processed. Interrupted acknowledged
+sends can resume; ambiguous sends and Rick model turns become `uncertain` and
+are not automatically replayed. The UI distinguishes saved, pending and uncertain.
+Sally's Web-triggered answers use the same ambiguity guard. Check the Telegram
+topic before any manual repeat. Bot API has no idempotency token for exactly-once
+sends; an uncertain result cannot safely be resolved by blindly resending.
 
-Rick owner questions reuse the existing owner query method/thread/context and
-owner memory policy. A per-chat owner-query lock serializes web and Telegram turns.
-Member questions use the existing provider/SDK in ephemeral tool-free read-only,
-deny-all turns with only that chat's context, no owner file or owner thread.
-There are no web commands for /dev, code, restart, wiki or memory approval.
+The Sally conversation reads the original events plus topic outbox for everyone,
+including author, reply IDs, edit versions, processing status and attachments.
+General is a separate context (canonical topic 0) in the configured forum, with
+an independent persistent internal-assistant thread. Messages without a topic
+flag and topic 1 map to General; other flagged topics remain isolated. Sally
+responds there only to name/tag or replies to her messages. General has no sales
+card or automated deal commitment tracking. Only saved history is available;
+Bot API cannot fetch arbitrary old messages.
 
-Sally web text is persisted through `SalesStore.ingest`, with `source=web_text`
-and negative synthetic update/message IDs in a reserved range. It enters the
-existing topic's batching/lock/checkpoint/facts/recommendations/outbox cycle.
-Normal Telegram delivery puts the answer in that topic; no client chat is sent.
-The pending web job observes the persisted event/result, rather than starting a
-parallel turn. Existing pending fact reviews block new text jobs for that topic.
+Rick questions never send to client chats. Owner questions reuse the original
+owner provider/context policy. Dmitry uses the existing tool-free, read-only,
+deny-all provider with only the selected work context and authorized internal
+conversation. Owner-private turns, owner working memory, /dev, code, restart and
+configuration remain inaccessible. Member work is visible to owner; owner-private
+queries are not shared with members. Client recommendations/events remain visible
+in their original screens, including available Telegram attachments.
 
-The UI exposes real recommendations, sources, available history (latest 100
-messages), current facts, commitments and reminder delivery fields. No fictional
-KPIs, dates, demo rows, success or online badges. Existing Sally relaxed fact
-validation is preserved. Pending fact reviews and owner approvals stay in their
-Telegram workflow; the UI links to the corresponding topic/owner chat. Voice,
-files, reminders and memory approvals continue through Telegram. This avoids
-pretending a browser actor has a Telegram membership/message callback identity.
+Both apps support 8 attachments per request, 20 MiB per file, multiple images,
+TXT/MD/PDF/DOCX and browser voice recording with preview/cancel. `api/upload` is
+a separate binary endpoint with Origin, CSRF, authentication, context ACL,
+rate/concurrency limits and a 200 MiB local-source quota per account. Media bytes
+are private and are served only by an authorized `api/media` request, never by
+static paths. A Telegram-backed cache may be evicted after seven days and fetched
+again; unsent and Rick source uploads are retained within quota. Expired unused
+uploads and abandoned partial files are removed. Images are magic-byte and
+Pillow-verified, limited to 40 million pixels. Audio containers use existing STT
+settings; Android WebM is kept as audio/WebM, sent to Telegram as a document.
+Sally uses the existing durable AudioWorker/ImageWorker; Rick uses its existing
+provider and shared transcriber. No extra model key or polling process is added.
+
+Shared `agentbridge/documents.py` extracts documents for both Web and Telegram in
+a bounded subprocess: 25 seconds, Linux 512 MiB address space / 20 CPU seconds,
+PDF up to 100 pages, at most 120000 text characters, bounded DOCX ZIP/XML.
+TXT/MD must be UTF-8 and at most 2 MiB. PDF layout and DOCX table cells are
+preserved as text where possible. Encrypted, damaged or oversized files fail
+explicitly. Scanned PDFs ask for page images; automatic whole-PDF OCR is not added.
+
+Drafts survive failed uploads/sends and context switches while logged in. Successful
+uploads are reused on a retry; the original command key is retained. Approval,
+reminder changes and memory confirmation continue through Telegram, without
+impersonating Web actors as Telegram callback users.
 
 The service worker caches only hashed build assets, never HTML/API/client history.
 No client data is written to localStorage. Manifests have different id/start_url,
@@ -85,15 +111,15 @@ New empty Telegram topics appear once Sally persists them in her deals registry.
 
 For rollback: disable web opt-in, restore the prior nginx server file, select the
 recorded Git revision (preserving any newer owner-context work), restart these two
-services, and diagnose. Business schemas are unchanged by the web adapter; do not
+services, and diagnose. Schema additions preserve existing rows and IDs; do not
 restore older business databases and lose newer Telegram events. Keep the web DB
 for request/account recovery. Static releases and backups are mode-protected.
 
 Temporary test checkouts and local basetemp files are removed after validation.
 Production history, current releases, backups and the supplied concept kit remain.
 
-Validation before rollout (2026-10-16): 784 Python tests passed on Linux in an
-isolated VPS checkout; frontend TypeScript/build, ESLint and five Vitest tests
+Validation before rollout (2026-10-16): 802 Python tests passed on Linux in an
+isolated VPS checkout; frontend TypeScript/build, ESLint and eight Vitest tests
 passed. Security tests use fake providers and temporary SQLite stores. Android
 hardware testing remains with the owner. The original design-phase screenshots
 and intermediate measurement artifacts were removed from main after selection.

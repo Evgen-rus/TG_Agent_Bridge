@@ -43,7 +43,19 @@ class WebStore:
                     state TEXT NOT NULL DEFAULT 'pending', result TEXT NOT NULL DEFAULT '',
                     created REAL NOT NULL, updated REAL NOT NULL,
                     UNIQUE(user_id,product,key));
+                CREATE TABLE IF NOT EXISTS media (
+                    id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, product TEXT NOT NULL,
+                    context TEXT NOT NULL, filename TEXT NOT NULL, kind TEXT NOT NULL,
+                    mime TEXT NOT NULL, path TEXT NOT NULL, created REAL NOT NULL,
+                    file_id TEXT NOT NULL DEFAULT '', event_id INTEGER, job_id INTEGER,
+                    requested INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS web_delivery (
+                    job_id INTEGER NOT NULL, part INTEGER NOT NULL,
+                    state TEXT NOT NULL, message_id INTEGER, file_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(job_id,part));
             ''')
+            if 'prepared' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN prepared TEXT NOT NULL DEFAULT ''")
         if os.name=='posix':
             path.chmod(0o600)
 
@@ -149,11 +161,19 @@ class WebStore:
                 if old['payload'] != encoded or old['context'] != context:
                     raise WebError(409, 'Ключ уже использован для другого действия')
                 return old['id']
-            if db.execute("SELECT 1 FROM jobs WHERE user_id=? AND state IN ('pending','running')", (user['id'],)).fetchone():
+            for item in payload.get('attachments',[]):
+                media = db.execute('SELECT * FROM media WHERE id=? AND user_id=? AND product=? AND context=? AND job_id IS NULL',
+                    (item,user['id'],product,context)).fetchone()
+                if not media or not Path(media['path']).is_file():
+                    raise WebError(409,'Вложение недоступно или уже использовано')
+            if db.execute("SELECT 1 FROM jobs WHERE user_id=? AND state IN ('pending','running','waiting','review')", (user['id'],)).fetchone():
                 raise WebError(409, 'Дождитесь завершения предыдущего запроса')
             now = time.time()
-            return db.execute('''INSERT INTO jobs(user_id,product,context,key,payload,created,updated)
+            job = db.execute('''INSERT INTO jobs(user_id,product,context,key,payload,created,updated)
                 VALUES (?,?,?,?,?,?,?)''', (user['id'], product, context, key, encoded, now, now)).lastrowid
+            for item in payload.get('attachments',[]):
+                db.execute('UPDATE media SET job_id=? WHERE id=?',(job,item))
+            return job
 
     def claim(self, product):
         with self.connect() as db:
@@ -170,6 +190,10 @@ class WebStore:
 
     def interrupted(self, product):
         with self.connect() as db:
+            if product == 'sally':
+                # Only Sally's persisted ingest and acknowledged sends can safely resume.
+                db.execute("""UPDATE jobs SET state='pending' WHERE product='sally' AND state='running'
+                    AND NOT EXISTS(SELECT 1 FROM web_delivery d WHERE d.job_id=jobs.id AND d.state='sending')""")
             db.execute("""UPDATE jobs SET state='uncertain',result=? WHERE product=? AND state='running'""",
                        ('Обработка была прервана. Результат не подтверждён; проверьте историю перед повтором.', product))
 
@@ -177,6 +201,32 @@ class WebStore:
         if not self.allowed(user, product, context):
             raise WebError(403, 'Нет доступа')
         with self.connect() as db:
-            return [dict(r) for r in db.execute('''SELECT id,payload,state,result,created FROM jobs
-                WHERE user_id=? AND product=? AND context=? ORDER BY id DESC LIMIT 30''',
-                (user['id'], product, context))][::-1]
+            rows = [dict(r) for r in db.execute('''SELECT j.id,j.payload,j.state,j.result,j.created,j.prepared,u.name AS author FROM jobs j JOIN users u ON u.id=j.user_id
+                WHERE (j.user_id=? OR (?='rick' AND u.role='rick')) AND j.product=? AND j.context=? ORDER BY j.id DESC LIMIT 30''',
+                (user['id'], product, product, context))][::-1]
+            for row in rows:
+                row['attachments']=[dict(r) for r in db.execute('SELECT id,filename,kind,mime FROM media WHERE job_id=?',(row['id'],))]
+            return rows
+
+    def media(self, user, product, context, ids):
+        if not isinstance(ids, list) or len(ids) > 8 or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
+            raise WebError(400, 'Не более 8 разных вложений')
+        result = []
+        with self.connect() as db:
+            for ident in ids:
+                row = db.execute('SELECT * FROM media WHERE id=? AND user_id=? AND product=? AND context=?',
+                                 (ident, user['id'], product, context)).fetchone()
+                if not row:
+                    raise WebError(404, 'Вложение недоступно')
+                result.append(dict(row))
+        return result
+
+    def delivery(self, job_id, part, **values):
+        with self.connect() as db:
+            if values:
+                db.execute('''INSERT INTO web_delivery(job_id,part,state,message_id,file_id) VALUES (?,?,?,?,?)
+                    ON CONFLICT(job_id,part) DO UPDATE SET state=excluded.state,
+                    message_id=excluded.message_id,file_id=excluded.file_id''',
+                    (job_id, part, values['state'], values.get('message_id'), values.get('file_id', '')))
+            row = db.execute('SELECT * FROM web_delivery WHERE job_id=? AND part=?', (job_id, part)).fetchone()
+            return dict(row) if row else None

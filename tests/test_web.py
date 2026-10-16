@@ -98,8 +98,8 @@ def test_jobs_idempotency_conflicts_restart_and_revoked_acl(web):
     assert claimed['id']==job
     reopened=WebStore(web.access.path)
     reopened.interrupted('sally')
-    assert reopened.history(actor,'sally','101')[0]['state']=='uncertain'
-    assert reopened.claim('sally') is None
+    assert reopened.history(actor,'sally','101')[0]['state']=='pending'
+    assert reopened.claim('sally')[0]['id']==job
     with reopened.connect() as db:
         db.execute('UPDATE users SET disabled=1 WHERE id=?',(actor['id'],))
     with pytest.raises(WebError):
@@ -136,7 +136,7 @@ def http(web):
     thread.start()
     def request(method,path,body=None,headers=None):
         connection=HTTPConnection('127.0.0.1',server.server_address[1],timeout=5)
-        connection.request(method,path,json.dumps(body) if body is not None else None,headers or {})
+        connection.request(method,path,body if isinstance(body,bytes) else json.dumps(body) if body is not None else None,headers or {})
         response=connection.getresponse()
         result=response.read()
         connection.close()
@@ -273,16 +273,80 @@ async def test_sally_web_ingest_uses_existing_process_and_deduplicates(web):
     actor,_=user(web.access,'sergey',['101'],'sally')
     job_id=web.access.enqueue(actor,'sally','101','s'*20,{'text':'Question'})
     job,actor=web.access.claim('sally')
+    class Bot:
+        username='sally_bot'
+        calls=0
+        async def send_message(self,**kwargs):
+            self.calls+=1
+            return SimpleNamespace(message_id=500)
+    bot=Bot()
+    runtime.app=SimpleNamespace(bot=bot)
     task=asyncio.create_task(runtime.sales(job,actor,{'text':'Question'}))
     for _ in range(100):
         if web.sales.pending_topics(): break
         await asyncio.sleep(.01)
     await service.process(-100,101)
     await task
+    runtime.reconcile_sales()
     await runtime.sales(job,actor,{'text':'Question'})
     assert provider.calls==1
+    assert bot.calls==1
     assert web.access.history(actor,'sally','101')[0]['state']=='done'
     assert web.access.history(actor,'sally','101')[0]['id']==job_id
     with web.sales.connect() as db:
         assert db.execute("SELECT count(*) FROM events WHERE source='web_text'").fetchone()[0]==1
         assert db.execute('SELECT count(*) FROM outbox WHERE chat_id=-100 AND topic_id=101').fetchone()[0]>=1
+
+
+def test_binary_upload_auth_csrf_scope_private_read_and_mime(web,http):
+    from io import BytesIO
+    from PIL import Image
+    actor,token=user(web.access,'sergey',[],'sally')
+    headers={'Cookie':'__Secure-sally_sid='+token,'X-CSRF-Token':actor['csrf'],
+             'Origin':'https://example.test','Content-Type':'application/octet-stream'}
+    blob=BytesIO();Image.new('RGB',(8,8)).save(blob,format='PNG');raw=blob.getvalue()
+    endpoint='/sally/api/upload?context=101&filename=screenshot.png'
+    assert http('POST',endpoint,raw,dict(headers,Origin='https://evil.test'))[0]==403
+    assert http('POST',endpoint,raw,dict(headers,**{'X-CSRF-Token':'wrong'}))[0]==403
+    assert http('POST',endpoint.replace('101','999'),raw,headers)[0]==404
+    status,_,body=http('POST',endpoint,raw,headers)
+    assert status==201
+    media=json.loads(body)
+    url='/sally/api/media?context=101&id='+media['id']
+    status,response,body=http('GET',url,headers=headers)
+    assert status==200 and body==raw
+    assert response['Cache-Control']=='no-store' and response['Content-Type']=='image/png'
+    assert http('GET',url)[0]==401
+    owner,owner_token=user(web.access,'evgen',[],'sally')
+    assert http('GET',url,headers={'Cookie':'__Secure-sally_sid='+owner_token})[0]==404
+    assert http('GET',url.replace('101','102'),headers=headers)[0]==404
+    post=dict(headers,**{'Content-Type':'application/json','Idempotency-Key':'binary-command-key'})
+    assert http('POST','/sally/api/ask',{'context':'101','text':'Фото','attachments':[media['id']]},post)[0]==202
+    assert http('POST','/sally/api/ask',{'context':'101','text':'Фото','attachments':[media['id']]},post)[0]==202
+    with web.access.connect() as db:db.execute('UPDATE media SET event_id=1 WHERE id=?',(media['id'],))
+    assert http('GET',url,headers={'Cookie':'__Secure-sally_sid='+owner_token})[0]==200
+
+
+def test_sally_shared_chronology_authorship_reply_and_context_boundaries(web):
+    actor,_=user(web.access,'sergey',[],'sally')
+    web.sales.ingest(update_id=1,chat_id=-100,topic_id=101,title='Deal',message_id=20,
+        author_id=1,author='Евгений',date='2026-10-16T09:00:00Z',text='Вопрос')
+    web.sales.ingest(update_id=2,chat_id=-100,topic_id=101,title='Deal',message_id=21,
+        author_id=2,author='Сергей',date='2026-10-16T09:01:00Z',text='Ответ',reply_to=20)
+    context=web.sales.context(-100,101)
+    web.sales.complete(-100,101,context['events'],dict(answer='Ответ Салли',facts=[],next_action='',goal='',basis=[]))
+    with web.sales.connect() as db:db.execute('UPDATE outbox SET telegram_message_id=22')
+    detail=web.data.detail(actor,'sally','101')
+    assert [m['author'] for m in detail['messages']]==['Евгений','Сергей','Салли']
+    assert [m['message_id'] for m in detail['messages']]==[20,21,22]
+    web.data.reply_target('101',20)
+    with pytest.raises(WebError):web.data.reply_target('102',20)
+
+
+def test_rick_owner_private_turns_and_member_work_are_separate(web):
+    owner,_=user(web.access,'evgen',[],'rick')
+    member,_=user(web.access,'dmitry',[],'rick')
+    web.access.enqueue(owner,'rick','-100123456','owner-private-key1',{'text':'OWNER PRIVATE'})
+    web.access.enqueue(member,'rick','-100123456','member-shared-key1',{'text':'SHARED WORK'})
+    assert 'OWNER PRIVATE' not in json.dumps(web.access.history(member,'rick','-100123456'))
+    assert len(web.access.history(owner,'rick','-100123456'))==2

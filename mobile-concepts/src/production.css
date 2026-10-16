@@ -23,3 +23,15 @@
 .live-app .context-select{margin:14px 0}
 .live-app .invite-url{font-size:12px;margin-top:7px}
 .live-app .recommendation h3{overflow-wrap:anywhere}
+.media-compose{background:var(--surface);border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}
+.media-compose .composer{position:static;border:0;padding:8px;gap:5px}
+.media-compose .composer button{min-width:40px;min-height:44px;flex-shrink:0}
+.attachment-draft{display:flex;gap:8px;flex-wrap:wrap;padding:0 12px;max-height:130px;overflow-y:auto}
+.attachment-draft span{display:flex;align-items:center;font-size:12px;max-width:100%;overflow-wrap:anywhere}
+.attachment-draft button{background:transparent;color:var(--text);min-height:40px;padding:8px}
+.message-media img{max-width:100%;max-height:360px;border-radius:12px;object-fit:contain}
+.message-media audio,.attachment-draft audio{max-width:100%;height:44px}
+.message-media small{display:block;white-space:normal}
+.live-app .bubble p{white-space:pre-wrap;overflow-wrap:anywhere}
+.live-app .bubble small{display:block;font-size:11px;color:var(--muted)}
+.general-link{margin-bottom:16px;width:100%}

@@ -20,7 +20,7 @@ from .storage import SALI_NAME, should_respond
 from .commitments import Commitments, delivery_allowed, disable
 
 logger = logging.getLogger(__name__)
-HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. Для напоминания напишите, например: «Сали, напомни сегодня в 17:00 позвонить клиенту». Время — по Новосибирску; дождитесь подтверждения сохранения. Напоминания доступны при включённом контроле договорённостей. PDF/DOCX пока не разбираю. Администратор может запросить /restart с подтверждением.'
+HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. Для напоминания напишите, например: «Сали, напомни сегодня в 17:00 позвонить клиенту». Время — по Новосибирску; дождитесь подтверждения сохранения. Напоминания доступны при включённом контроле договорённостей. PDF/DOCX с текстовым слоем — до 20 МБ, PDF до 100 страниц; сканы присылайте изображениями. В General отвечаю на обращение по имени, тегу или ответу на моё сообщение. Администратор может запросить /restart с подтверждением.'
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 
 
@@ -78,7 +78,11 @@ class SalesTelegram:
             await asyncio.to_thread(self.service.store.request_restart,
                 self.chat_id, topic, user.id, update.update_id)
             return
-        if not topic or not getattr(message, 'is_topic_message', False):
+        # General has no topic flag and can carry the replied-to message's thread ID.
+        # Only this configured forum reaches here; flagged topics retain their own ID.
+        if not getattr(message, 'is_topic_message', False) or topic == 1:
+            topic = 0
+        elif not topic:
             return
         title = getattr(getattr(message, 'forum_topic_created', None), 'name', '')
         if title:
@@ -118,10 +122,10 @@ class SalesTelegram:
             image = dict(file_id=ref.file_id, file_size=ref.file_size,
                 filename=ref.filename, mime=ref.mime, media_group_id=ref.media_group_id, caption=text)
             source = 'image_pending'
-        elif document and (document.file_name or '').lower().endswith(('.txt', '.md')):
+        elif document and (document.file_name or '').lower().endswith(('.txt', '.md', '.pdf', '.docx')):
             if await asyncio.to_thread(self.service.store.event_seen, update.update_id):
                 return
-            text = json.dumps({'file_id': document.file_id, 'size': document.file_size,
+            text = json.dumps({'file_id': document.file_id, 'size': getattr(document,'file_size',None),
                 'caption': text, 'filename': document.file_name}, ensure_ascii=False)
             source = 'text_document_pending'
         elif any(getattr(message, kind, None) for kind in ('document', 'voice', 'audio', 'photo', 'video')):
@@ -133,19 +137,22 @@ class SalesTelegram:
         addressed_elsewhere = bool(reply and getattr(reply, 'from_user', None)
             and reply.message_id != topic
             and reply.from_user.id != context.bot.id)
-        routing = dict(bot_username=context.bot.username or '', addressed_elsewhere=addressed_elsewhere)
+        routing = dict(bot_username=context.bot.username or '', addressed_elsewhere=addressed_elsewhere,
+            general=topic==0, replied_to_bot=bool(reply and getattr(reply, 'from_user', None) and reply.from_user.id==context.bot.id))
         respond = should_respond(text, **routing)
         if metadata is not None:
             metadata['routing'] = routing
             respond = True  # Decide from the caption and transcript after STT.
         await asyncio.to_thread(self.service.store.ingest,
             update_id=update.update_id, chat_id=self.chat_id, topic_id=topic,
-            title=title or f'Тема {topic}', message_id=message.message_id,
+            title=title or ('General' if topic==0 else f'Тема {topic}'), message_id=message.message_id,
             author_id=user.id, author=user.full_name,
             date=((getattr(message, "edit_date", None) or message.date) if is_edit else message.date).isoformat(),
             text=text, reply_to=getattr(reply, 'message_id', None), respond=respond,
             authorization_pending=authorization_pending,
-            source=source, audio=metadata, image=image, is_edit=is_edit)
+            source=source, audio=metadata, image=image, is_edit=is_edit,
+            media=(dict(file_id=ref.file_id,filename=ref.filename,mime=ref.mime,kind=ref.kind) if ref else
+                dict(file_id=metadata['file_id'],filename=metadata['filename'],mime=metadata['mime'],kind=metadata['kind']) if metadata else None))
 
     async def hydrate_documents(self, bot):
         for row in await asyncio.to_thread(self.service.store.awaiting_documents, self.chat_id):
@@ -155,19 +162,25 @@ class SalesTelegram:
             document = {}
             try:
                 document = json.loads(row['text'])
-                if not document['size'] or document['size'] > MAX_TEXT_FILE_BYTES:
+                from pathlib import Path
+                limit = MAX_TEXT_FILE_BYTES if Path(document['filename']).suffix.lower() in {'.txt','.md'} else 20*1024*1024
+                if not document['size'] or document['size'] > limit:
                     raise ValueError('size')
                 remote = await bot.get_file(document['file_id'])
-                if remote.file_size and remote.file_size > MAX_TEXT_FILE_BYTES:
+                if remote.file_size and remote.file_size > limit:
                     raise ValueError('size')
                 payload = await remote.download_as_bytearray()
-                if len(payload) > MAX_TEXT_FILE_BYTES:
+                if len(payload) > limit:
                     raise ValueError('size')
-                body = bytes(payload).decode('utf-8-sig')
-                if '\x00' in body or not body.strip():
-                    raise ValueError('encoding')
+                from agentbridge.documents import extract_document
+                from pathlib import Path
+                from tempfile import TemporaryDirectory
+                with TemporaryDirectory(prefix='sally-document-') as folder:
+                    path = Path(folder) / ('document'+Path(document['filename']).suffix.lower())
+                    path.write_bytes(bytes(payload))
+                    body = await asyncio.to_thread(extract_document, path)
             except (UnicodeError, ValueError):
-                text = '[Текстовый файл не прочитан: требуется UTF-8, непустой текст и размер до 2 МБ.]'
+                text = (document.get('caption','')+'\n' if document.get('caption') else '')+'[Документ не прочитан: проверьте формат, размер и текстовый слой. Сканы пришлите изображениями.]'
                 source = 'unsupported_attachment'
             except Exception as exc:
                 logger.warning('event=sales_document_deferred error_type=%s', type(exc).__name__)
@@ -349,6 +362,8 @@ class SalesTelegram:
                 continue
             try:
                 if not await asyncio.to_thread(delivery_allowed, self.service.store, row, self.service.commitments is not None):
+                    continue
+                if not await asyncio.to_thread(self.service.store.claim_web_response,row):
                     continue
                 options = {}
                 if row['delivery_key'].startswith('reminder:'):

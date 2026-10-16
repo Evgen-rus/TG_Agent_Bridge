@@ -847,11 +847,51 @@ sees all current/future monitored Rick chats; Sergey sees all current/future
 topics in the configured Sally group, including for existing accounts/invitations. Owner Rick questions
 reuse owner methods; a per-chat owner-query lock serializes web/Telegram access.
 Non-owner questions are ephemeral tool-free provider turns with no owner context.
-Sally web text uses the existing durable ingest, batching, model lock, checkpoint,
-facts and topic outbox, with an explicit web source and reserved negative IDs.
-Interrupted web jobs are marked uncertain, without replaying costly turns.
+Sally Web first persists the transport job and private uploads. A per-part SQLite
+delivery ledger freezes acknowledged Telegram message IDs; ambiguous sends stop
+as `uncertain` and are never automatically resent. Acknowledged jobs resume after
+restart and ingest once through the original SalesStore with real Telegram message
+IDs, reserved negative update IDs and the real internal author (negative Web user
+ID, never Sally). All attachment events and their question enter the existing
+batch, model lock, media workers, checkpoint, facts and topic outbox. Analysis
+completion is reconciled from business events without blocking the Web worker.
+Web-triggered Sally outbox answers also stop after an ambiguous delivery; the
+answer remains visible in Web. Existing Telegram-only outbox retry is preserved.
+Interrupted Rick model jobs remain uncertain and are not replayed automatically.
 
-The selected Signal/Ledger React views expose real data and distinct manifests and
-sessions at `/rick/` and `/sally/`. Approval, media and reminder commands stay in
-existing Telegram workflows; no web actor is impersonated as a Telegram callback.
-Only immutable frontend assets are eligible for service-worker caching.
+General is canonical SalesStore topic 0 in the configured forum only. Unflagged
+forum messages (including General replies with a thread ID) and topic 1 route to
+General; other flagged topics keep their ID. It has an independent persistent
+thread and internal-assistant instructions, no sales facts/profiles or automatic
+deal commitments. It responds only to name/tag or reply to Sally; audio repeats
+this decision after transcription. Ordinary General messages are still persisted.
+Telegram topic semantics: https://core.telegram.org/api/forum and
+https://core.telegram.org/bots/api#message . No history backfill is invented.
+
+The Signal/Ledger views keep their existing design and separate sessions at
+`/rick/` and `/sally/`. Sally reads chronological business events plus the original
+outbox for everyone, refreshing every 2.5 seconds. Edits retain immutable source
+versions and reply IDs. Rick keeps client events/recommendations and internal Web
+turns separate; member work is visible to owner, owner-private turns never to
+members. Follow-ups include only authorized working conversation. No Rick Web
+path sends to client Telegram chats. Owner-only memory and development controls
+are not exposed to members. Approvals remain Telegram workflows.
+
+`web/media.py` handles binary uploads (20 MiB each, at most 8 per request, bounded
+upload concurrency/rate/quota) with product/context/user ACL, Origin and CSRF.
+SQLite stores private random file IDs and Telegram references; bytes are below
+`runtime/web/media`, never static assets. Media GET validates current context and
+membership before reading; missing Telegram copies are downloaded by the existing
+bot process on demand. The local cache expires after seven days when Telegram can
+restore it; unsent and Rick source uploads are retained, within a 200 MiB account
+quota. Only immutable frontend assets are eligible for service-worker caching.
+
+Images use real-content Pillow validation on Web upload and the existing agent
+image mechanisms; Sally albums share one batch. Browser MediaRecorder audio uses
+its detected WebM/MP4/Ogg container and existing STT settings; WebM is delivered as
+a Telegram document rather than mislabeled as Opus voice. Transcript is retained;
+failures never invent text. Both channels use `documents.py` for TXT/MD/PDF/DOCX:
+offline subprocess, 25-second deadline, Linux CPU/address-space limits, 100 PDF
+pages, 120000 extracted characters, bounded DOCX ZIP/XML. Scanned PDFs ask for
+page images instead of pretending OCR succeeded. Tables use DOCX cells / PDF
+layout extraction. No executable documents or external fetches are enabled.

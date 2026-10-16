@@ -32,6 +32,9 @@ class WebRuntime:
     async def start(self, app):
         self.app = app
         self.store.interrupted(self.product)
+        if self.product=='sally':
+            with self.service.store.connect() as db:
+                db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,0,'General')", (self.settings.chat_id,))
         if self.product == 'rick':
             from .data import WebData
             from .server import start_server
@@ -51,6 +54,12 @@ class WebRuntime:
 
     async def run(self):
         while True:
+            try:
+                await self.refresh_media()
+                if self.product=='sally':
+                    await asyncio.to_thread(self.reconcile_sales)
+            except Exception as exc:
+                logger.warning('event=web_refresh_failed product=%s error_type=%s', self.product, type(exc).__name__)
             claimed = await asyncio.to_thread(self.store.claim, self.product)
             if not claimed:
                 await asyncio.sleep(.5)
@@ -64,14 +73,22 @@ class WebRuntime:
                     chat = self.service.registry.get(int(job['context']))
                     if not chat:
                         raise WebError(404, 'Чат недоступен')
+                    question, attachments = await self.prepare_rick(job,user,payload)
                     async with self.service._chat_locks.setdefault(chat.telegram_chat_id, asyncio.Lock()):
                         if user['role'] == 'owner':
-                            result = await self.service._answer_owner_query_for_chat(chat, payload['text'])
+                            result = await self.service._answer_owner_query_for_chat(chat, question, attachments=attachments)
                         else:
                             # No owner thread, context file, tools or persistent member memory.
-                            result = await self.service.provider.answer_web_question(
-                                question=payload['text'], chat_name=chat.name,
-                                context_pack=self.service._context_pack(chat))
+                            history=self.store.history(user,'rick',job['context'])
+                            conversation=[dict(author=r['author'],question=(r['prepared'] or json.loads(r['payload'])['text'])[:4000],answer=r['result'][:4000])
+                                          for r in history if r['id']!=job['id'] and r['state']=='done'][-5:]
+                            pack=self.service._context_pack(chat)
+                            if conversation:
+                                pack+='\n\nНедоверенная внутренняя рабочая переписка по этому чату:\n'+json.dumps(conversation,ensure_ascii=False)
+                            args = dict(question=question, chat_name=chat.name, context_pack=pack)
+                            if attachments:
+                                args['attachments'] = attachments
+                            result = await self.service.provider.answer_web_question(**args)
                     self.store.finish(job['id'], 'done', result)
                 else:
                     await self.sales(job, user, payload)
@@ -90,26 +107,178 @@ class WebRuntime:
             raise WebError(404, 'Сделка недоступна')
         if self.service.store.awaiting_fact_review(self.settings.chat_id, topic):
             raise WebError(409, 'Сначала завершите проверку фактов в Telegram')
-        # Negative IDs cannot collide with real Telegram updates/messages.
-        synthetic = -1_000_000_000_000 - job['id']
-        self.service.store.ingest(update_id=synthetic, chat_id=self.settings.chat_id,
-            topic_id=topic, title=deal['title'], message_id=synthetic,
-            author_id=-user['id'], author=user['name']+' · Web',
-            date=datetime.now(timezone.utc).isoformat(), text=payload['text'], source='web_text', respond=True)
-        # The existing analysis loop owns batching, locking, checkpoints and Telegram delivery.
-        for _ in range(600):
-            with self.service.store.connect() as db:
-                event = db.execute('SELECT id,processed FROM events WHERE update_id=?', (synthetic,)).fetchone()
-                if event['processed'] in (1,3):
-                    rows = db.execute('SELECT event_ids,payload FROM recommendations WHERE chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 50', (self.settings.chat_id,topic)).fetchall()
-                    result = next((json.loads(r['payload'])['answer'] for r in rows if event['id'] in json.loads(r['event_ids'])), '')
-                    self.store.finish(job['id'], 'done' if result else 'error', result or 'Материал сохранён, но ответ не подтверждён. Проверьте историю сделки.')
-                    return
-            if self.service.store.awaiting_fact_review(self.settings.chat_id, topic):
-                self.store.finish(job['id'], 'review', 'Ответ ожидает подтверждения фактов в Telegram. Материал сохранён.')
+        from agentbridge.telegram.formatter import split_owner_message
+        from agentbridge.sales.storage import should_respond
+        attachments = self.store.media(user,'sally',job['context'],payload.get('attachments',[]))
+        from agentbridge.documents import extract_document
+        documents = {item['id']:await asyncio.to_thread(extract_document,Path(item['path']))
+                     for item in attachments if item['kind']=='document'}
+        # Text is split by the same Telegram limits as all other owner delivery.
+        parts = [(None,t) for t in split_owner_message(user['name']+' · через приложение\n'+payload['text'])]
+        parts.extend((item,'') for item in attachments)
+        delivered = []
+        for part,(item,text) in enumerate(parts):
+            saved = self.store.delivery(job['id'],part)
+            if saved and saved['state']=='sending':
+                self.store.finish(job['id'],'uncertain','Telegram мог принять сообщение. Проверьте тему перед повторной отправкой.')
                 return
-            await asyncio.sleep(1)
-        self.store.finish(job['id'], 'uncertain', 'Материал сохранён в сделке. Обработка пока не завершена; проверьте историю позднее.')
+            if not saved or saved['state']!='sent':
+                options = dict(chat_id=self.settings.chat_id, message_thread_id=topic or None)
+                if payload.get('reply_to'):
+                    from telegram import ReplyParameters
+                    options['reply_parameters'] = ReplyParameters(message_id=payload['reply_to'])
+                self.store.delivery(job['id'],part,state='sending')
+                try:
+                    if item:
+                        path = Path(item['path'])
+                        with path.open('rb') as stream:
+                            # Documents preserve screenshot pixels and the browser audio container.
+                            result = await self.app.bot.send_document(document=stream,filename=item['filename'],caption=user['name']+' · через приложение',**options)
+                            file_id = result.document.file_id
+                    else:
+                        result = await self.app.bot.send_message(text=text,**options)
+                        file_id = ''
+                except Exception:
+                    self.store.finish(job['id'],'uncertain','Доставка Telegram не подтверждена. Проверьте тему перед повтором; автоматического повтора нет.')
+                    return
+                saved = self.store.delivery(job['id'],part,state='sent',message_id=result.message_id,file_id=file_id)
+            delivered.append(saved)
+        # All sends were acknowledged. Ingest once with real Telegram IDs and internal authorship.
+        # One text event plus attachment events enter the same normal topic batch.
+        for part,((item,text),sent) in enumerate(zip(parts,delivered)):
+            synthetic = -2_000_000_000_000 - job['id']*100 - part
+            body = payload['text'] if part==0 else ''
+            source, audio, image, media = 'web_text', None, None, None
+            if part>0 and not item:
+                body = ''  # Split transport parts are represented by the first full logical text.
+                continue
+            if item:
+                media = dict(file_id=sent['file_id'],filename=item['filename'],mime=item['mime'],kind=item['kind'])
+                if item['kind']=='image':
+                    source = 'image_pending'
+                    image = dict(**media,caption='',media_group_id='web:'+str(job['id']))
+                elif item['kind']=='audio':
+                    source = 'audio_pending'
+                    audio = dict(**media, routing=dict(bot_username=self.app.bot.username or '',general=topic==0,
+                        replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to']))))
+                else:
+                    body = documents[item['id']]
+                    source = 'text_document'
+            respond = should_respond(payload['text'],self.app.bot.username or '',general=topic==0,
+                                     replied_to_bot=bool(payload.get('reply_to') and self.is_sally_reply(topic,payload['reply_to'])))
+            self.service.store.ingest(update_id=synthetic,chat_id=self.settings.chat_id,topic_id=topic,title=deal['title'],
+                message_id=sent['message_id'],author_id=-user['id'],author=user['name'],
+                date=datetime.fromtimestamp(job['created'],timezone.utc).isoformat(),text=body,source=source,
+                respond=respond or bool(audio),reply_to=payload.get('reply_to'),audio=audio,image=image,media=media)
+            with self.service.store.connect() as db:
+                event_id = db.execute('SELECT id FROM events WHERE update_id=?',(synthetic,)).fetchone()[0]
+            if item:
+                with self.store.connect() as db:
+                    db.execute('UPDATE media SET file_id=?,event_id=? WHERE id=?',(sent['file_id'],event_id,item['id']))
+        self.store.finish(job['id'],'waiting','Доставлено в Telegram. Материал сохранён в общей истории.')
+        self.reconcile_sales()
+
+    def is_sally_reply(self,topic,message_id):
+        with self.service.store.connect() as db:
+            return db.execute('SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=? AND telegram_message_id=?',
+                             (self.settings.chat_id,topic,message_id)).fetchone() is not None
+
+    def reconcile_sales(self):
+        with self.store.connect() as db:
+            jobs = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE product='sally' AND state IN ('waiting','review')")]
+        for job in jobs:
+            with self.service.store.connect() as db:
+                events = db.execute('SELECT id,processed FROM events WHERE update_id<=? AND update_id>?',
+                    (-2_000_000_000_000-job['id']*100,-2_000_000_000_000-job['id']*100-100)).fetchall()
+                if not events or any(e['processed'] in (-2,-1,0) for e in events):
+                    if self.service.store.awaiting_fact_review(self.settings.chat_id,int(job['context'])):
+                        self.store.finish(job['id'],'review','Материал сохранён. Ответ ожидает проверки фактов в Telegram.')
+                    continue
+                ids = {e['id'] for e in events}
+                recs = db.execute('SELECT event_ids,payload FROM recommendations WHERE chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 100',
+                                 (self.settings.chat_id,int(job['context']))).fetchall()
+                result = next((json.loads(r['payload'])['answer'] for r in recs if ids.intersection(json.loads(r['event_ids']))), '')
+                self.store.finish(job['id'],'done',result or 'Сообщение доставлено и сохранено. Салли не отвечает на каждую реплику.')
+
+    async def prepare_rick(self,job,user,payload):
+        from agentbridge.agents.base import MediaAttachment
+        from agentbridge.documents import extract_document
+        from agentbridge.transcribe import transcribe_audio_file
+        rows = self.store.media(user,'rick',job['context'],payload.get('attachments',[]))
+        question, images = payload['text'], []
+        for row in rows:
+            path = Path(row['path'])
+            if row['kind']=='image':
+                images.append(MediaAttachment(str(path),'image',row['mime'],row['filename']))
+            elif row['kind']=='audio':
+                transcript = await transcribe_audio_file(path,api_key=self.settings.openai_api_key,model=self.settings.transcription_model)
+                if not transcript or not transcript.strip():
+                    raise WebError(422,'Речь не распознана. Исходная запись сохранена.')
+                question += '\n[Расшифровка '+row['filename']+']\n'+transcript
+            else:
+                question += '\n[Документ '+row['filename']+']\n'+await asyncio.to_thread(extract_document,path)
+        if len(question)>150000:
+            raise WebError(413,'Слишком много текста в одном запросе; разделите документы.')
+        with self.store.connect() as db:
+            db.execute('UPDATE jobs SET prepared=? WHERE id=?', (question,job['id']))
+        return question, tuple(images)
+
+    async def refresh_media(self):
+        if not hasattr(self,'app'):
+            return
+        from .media import cleanup
+        from agentbridge.media import MAX_DOWNLOAD_BYTES
+        import mimetypes
+        import time
+        if time.time()-getattr(self,'_last_media_refresh',0)<2:
+            return
+        self._last_media_refresh=time.time()
+        # Metadata only: business history remains in the original stores.
+        connect = self.service.store.connect if self.product=='sally' else self.service.store._connect
+        with connect() as db:
+            if self.product=='sally':
+                records = [dict(r) for r in db.execute('''SELECT e.id,e.topic_id,m.metadata FROM event_media m
+                    JOIN events e ON e.id=m.event_id WHERE e.chat_id=? AND e.processed>=0 AND e.processed!=2
+                    ORDER BY e.id DESC LIMIT 200''',(self.settings.chat_id,))]
+            else:
+                records = [dict(id=r['id'],topic_id=r['chat_id'],metadata=json.dumps(dict(file_id=r['telegram_file_id'],
+                    kind=r['media_kind'],mime=r['media_mime'],filename=r['media_filename']))) for r in db.execute('''SELECT * FROM telegram_messages
+                    WHERE telegram_file_id!='' ORDER BY id DESC LIMIT 200''')]
+        folder = self.store.path.parent/'media'
+        folder.mkdir(exist_ok=True)
+        with self.store.connect() as db:
+            for row in records:
+                if db.execute('SELECT 1 FROM media WHERE product=? AND event_id=?',(self.product,row['id'])).fetchone():
+                    continue
+                meta=json.loads(row['metadata'])
+                ident=self.product+'-'+str(row['id'])
+                suffix=Path(meta.get('filename','')).suffix.lower()
+                if suffix not in {'.jpg','.jpeg','.png','.webp','.gif','.ogg','.mp3','.m4a','.wav','.webm','.flac','.pdf','.docx','.txt','.md'}:
+                    suffix='.bin'
+                kind=meta.get('kind','document')
+                kind='image' if kind in ('photo','image') else 'audio' if kind in ('voice','audio') else 'document'
+                db.execute('''INSERT OR IGNORE INTO media(id,user_id,product,context,filename,kind,mime,path,created,file_id,event_id)
+                    VALUES (?,0,?,?,?,?,?,?,?,?,?)''',(ident,self.product,str(row['topic_id']),meta.get('filename') or 'file'+suffix,
+                    kind,mimetypes.guess_type('a'+suffix)[0] or 'application/octet-stream',str(folder/(ident+suffix)),time.time(),meta['file_id'],row['id']))
+            pending=[dict(r) for r in db.execute('SELECT * FROM media WHERE product=? AND requested=1 AND file_id!=? LIMIT 4',(self.product,''))]
+        for row in pending:
+            path=Path(row['path'])
+            temp=path.with_suffix('.part')
+            try:
+                remote=await self.app.bot.get_file(row['file_id'])
+                if not remote.file_size or remote.file_size>MAX_DOWNLOAD_BYTES:
+                    continue
+                await remote.download_to_drive(custom_path=temp)
+                if temp.stat().st_size>MAX_DOWNLOAD_BYTES:
+                    continue
+                temp.replace(path)
+                with self.store.connect() as db:
+                    db.execute('UPDATE media SET requested=0,created=? WHERE id=?',(time.time(),row['id']))
+            except Exception as exc:
+                logger.warning('event=web_media_download_failed error_type=%s',type(exc).__name__)
+            finally:
+                temp.unlink(missing_ok=True)
+        await asyncio.to_thread(cleanup,self.store)
 
 
 def attach_web(app, root: Path, product, service, settings):

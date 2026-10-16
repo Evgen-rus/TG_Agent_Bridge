@@ -638,7 +638,7 @@ async def test_sepia_falls_back_to_rick_draft_when_a_number_changes(fake_codex) 
 
 
 @pytest.mark.asyncio
-async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_codex, tmp_path) -> None:
+async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_codex, tmp_path,monkeypatch) -> None:
     from openai_codex import LocalImageInput, MentionInput, TextInput
 
     from agentbridge.agents.base import MediaAttachment
@@ -647,6 +647,7 @@ async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_co
     pdf = tmp_path / "scan.pdf"
     image.write_bytes(b"jpeg")
     pdf.write_bytes(b"%PDF")
+    monkeypatch.setattr('agentbridge.documents.extract_document',lambda path:'Extracted PDF text')
     provider = CodexProvider()
     first = await provider.suggest(
         message="[фото]", sender_name="Alice", chat_name="Acme", wiki="wiki", rules=[], thread_id=None,
@@ -661,7 +662,7 @@ async def test_codex_suggest_attaches_images_and_pdfs_to_the_chat_thread(fake_co
     second_input = fake_codex.threads[1].prompts[0]
     assert isinstance(first_input[0], TextInput)
     assert any(isinstance(item, LocalImageInput) and item.path == str(image.resolve()) for item in first_input)
-    assert any(isinstance(item, MentionInput) and item.path == str(pdf.resolve()) for item in second_input)
+    assert any(isinstance(item, TextInput) and 'Extracted PDF text' in item.text for item in second_input)
     assert fake_codex.resumes == ["thread-started"]
 
 

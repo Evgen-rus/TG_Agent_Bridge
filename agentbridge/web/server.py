@@ -58,8 +58,8 @@ def make_server(root: Path, store, data, origin, port=18082):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            self.send_header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=()')
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
             if cookie:
                 self.send_header('Set-Cookie', cookie)
             self.send_header('Connection','close')
@@ -84,18 +84,19 @@ def make_server(root: Path, store, data, origin, port=18082):
                 cookies.load(self.headers.get('Cookie',''))
                 token = cookies[cookie_name].value if cookie_name in cookies else ''
                 payload = {}
+                endpoint = '/'.join(parts[2:])
+                binary = endpoint == 'api/upload'
                 if mutation:
                     if self.headers.get('Origin') != origin:
                         raise WebError(403,'Источник запроса не разрешён')
-                    if self.headers.get('Content-Type','').split(';')[0] != 'application/json':
+                    if not binary and self.headers.get('Content-Type','').split(';')[0] != 'application/json':
                         raise WebError(415,'Ожидается JSON')
                     length = int(self.headers.get('Content-Length','0'))
-                    if not 0 < length <= 32768:
+                    if not 0 < length <= (20*1024*1024 if binary else 32768):
                         raise WebError(413,'Слишком большой запрос')
-                    payload = json.loads(self.rfile.read(length))
+                    payload = {} if binary else json.loads(self.rfile.read(length))
                     if not isinstance(payload,dict):
                         raise WebError(400,'Некорректный запрос')
-                endpoint = '/'.join(parts[2:])
                 ip = self.headers.get('X-Real-IP') or self.client_address[0]
                 if endpoint == 'api/login' and mutation:
                     login, password = payload.get('login',''), payload.get('password','')
@@ -142,17 +143,46 @@ def make_server(root: Path, store, data, origin, port=18082):
                             db.execute('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE login=?)',(payload['login'],))
                         return self.send(200,{'ok':True})
                     query = parse_qs(urlsplit(self.path).query)
-                    context = str(payload.get('context','')) if mutation else query.get('context',[''])[0]
+                    context = str(payload.get('context','')) if mutation and not binary else query.get('context',[''])[0]
                     data.context(user,product,context)
+                    if binary and mutation:
+                        from .media import upload
+                        return self.send(201,upload(store,user,product,context,
+                            query.get('filename',['file'])[0],self.rfile,length))
+                    if endpoint == 'api/media' and not mutation:
+                        ident = query.get('id',[''])[0]
+                        with store.connect() as db:
+                            row = db.execute('SELECT * FROM media WHERE id=? AND product=? AND context=?', (ident,product,context)).fetchone()
+                            shared = row and row['job_id'] and db.execute("SELECT 1 FROM jobs j JOIN users u ON u.id=j.user_id WHERE j.id=? AND u.role='rick'",(row['job_id'],)).fetchone()
+                            if not row or (row['user_id'] != user['id'] and not (product=='sally' and row['event_id'] is not None) and row['user_id'] != 0 and not shared):
+                                raise WebError(404,'Вложение недоступно')
+                            file = Path(row['path'])
+                            if not file.is_relative_to(store.path.parent/'media') or not file.is_file():
+                                db.execute('UPDATE media SET requested=1 WHERE id=?', (ident,))
+                                raise WebError(409,'Загружаем вложение из Telegram. Повторите через несколько секунд.')
+                        return self.send(200,file.read_bytes(),row['mime'])
                     if endpoint == 'api/detail' and not mutation:
                         return self.send(200,data.detail(user,product,context))
                     if endpoint == 'api/history' and not mutation:
                         return self.send(200,store.history(user,product,context))
                     if endpoint == 'api/ask' and mutation:
+                        store.throttle('ask:'+str(user['id']),limit=30,seconds=60)
                         text = payload.get('text','')
-                        if not isinstance(text,str) or not 1<=len(text.strip())<=6000:
+                        ids = payload.get('attachments',[])
+                        attachments = store.media(user,product,context,ids)
+                        if not isinstance(text,str) or len(text.strip())>6000 or not (text.strip() or attachments):
                             raise WebError(400,'Введите сообщение до 6000 символов')
-                        job = store.enqueue(user,product,context,self.headers.get('Idempotency-Key',''),{'text':text.strip()})
+                        reply = payload.get('reply_to')
+                        if reply is not None:
+                            if type(reply) is not int or product != 'sally':
+                                raise WebError(400,'Недопустимый ответ')
+                            data.reply_target(context,reply)
+                        command = {'text':text.strip()}
+                        if ids:
+                            command['attachments'] = ids
+                        if reply is not None:
+                            command['reply_to'] = reply
+                        job = store.enqueue(user,product,context,self.headers.get('Idempotency-Key',''),command)
                         return self.send(202,{'id':job})
                     raise WebError(404,'Действие недоступно')
                 if mutation:

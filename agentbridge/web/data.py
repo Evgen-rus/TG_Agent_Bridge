@@ -32,7 +32,7 @@ class WebData:
         else:
             with reader(self.sales_path) as db:
                 rows = [dict(id=str(r['topic_id']), title=r['title']) for r in db.execute(
-                    'SELECT topic_id,title FROM deals WHERE chat_id=? AND topic_id>0 ORDER BY topic_id DESC', (self.sales_chat,))]
+                    'SELECT topic_id,title FROM deals WHERE chat_id=? AND topic_id>=0 ORDER BY topic_id DESC', (self.sales_chat,))]
         rows = [r for r in rows if WebStore.allowed(user, product, r['id'])]
         with reader(self.rick_path if product=='rick' else self.sales_path) as db:
             for row in rows:
@@ -47,6 +47,8 @@ class WebData:
                         payload=json.loads(latest['payload'])
                         row['latest']=dict(id=latest['id'],summary=payload.get('next_action') or 'Ответ Салли',draft=payload.get('answer',''))
         rows.sort(key=lambda r:r.get('latest',{}).get('id',0),reverse=True)
+        if product=='sally':
+            rows.sort(key=lambda r:r['id']!='0')
         return rows
 
     def context(self, user, product, context):
@@ -69,14 +71,40 @@ class WebData:
                 if user['role'] == 'owner':
                     reminders = [dict(r) for r in db.execute('''SELECT id,text AS action,remind_at_utc,sent_at FROM reminders
                         WHERE related_chat_id=? ORDER BY id DESC LIMIT 30''', (int(context),))]
+            with self.store.connect() as db:
+                media=[dict(r) for r in db.execute("SELECT id,event_id,filename,kind,mime FROM media WHERE product='rick' AND context=? AND user_id=0",(context,))]
+            for event in events:
+                event['attachments']=[r for r in media if r['event_id']==event['id']]
             return dict(**item, events=events, recommendations=recommendations,
                         facts=json.loads(state[0]) if state else {}, commitments=reminders, reviews=[],
                         telegram_url=self.telegram_url(self.owner_chat) if user['role']=='owner' else '')
         with reader(self.sales_path) as db:
             scope = (self.sales_chat, int(context))
-            events = [dict(r) for r in db.execute('''SELECT id,author,text,date,source,processed FROM events
+            events = [dict(r) for r in db.execute('''SELECT id,author,text,date,source,processed,message_id,reply_to,edit_update_id FROM events
                 WHERE chat_id=? AND topic_id=? AND processed NOT IN (-1,-2,2)
-                AND source NOT IN ('audio_pending','image_pending','text_document_pending') ORDER BY id DESC LIMIT 100''', scope)][::-1]
+                ORDER BY id DESC LIMIT 100''', scope)][::-1]
+            for event in events:
+                event['key']='event:'+str(event['id'])
+                if event['source']=='text_document_pending':
+                    meta=json.loads(event['text'])
+                    event['text']=(meta.get('caption') or '')+'\n[Документ обрабатывается]'
+            # Responses are the original durable Telegram outbox, not per-user Web results.
+            messages=list(events)
+            for row in db.execute('SELECT * FROM outbox WHERE chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 100',scope):
+                if not row['delivery_key'].startswith(('recommendation:','reminder:')):
+                    continue
+                messages.append(dict(key='outbox:'+str(row['id']),id=row['id'],author='Салли',text=row['text'],
+                    date='',message_id=row['telegram_message_id'],processed=1 if row['telegram_message_id'] else 0,source='sally',
+                    delivery_uncertain=bool(not row['telegram_message_id'] and db.execute('SELECT 1 FROM operations WHERE key=?',('web-response:'+str(row['id']),)).fetchone())))
+            messages.sort(key=lambda e:(e['message_id'] if e['message_id'] and e['message_id']>0 else 10**15,e.get('edit_update_id',0)))
+            with self.store.connect() as transport:
+                media=[dict(r) for r in transport.execute('SELECT id,event_id,filename,kind,mime FROM media WHERE product=? AND context=? AND event_id IS NOT NULL',('sally',context))]
+            for event in events:
+                event['attachments']=[r for r in media if r['event_id']==event['id']]
+            # Historical image/audio jobs also carry usable Telegram IDs before Web was enabled.
+            for event in events:
+                if event.get('source') in ('audio_pending','image_pending') and not event['text']:
+                    event['text']='[Вложение обрабатывается]'
             recommendations = []
             for r in db.execute('SELECT id,payload FROM recommendations WHERE chat_id=? AND topic_id=? ORDER BY id DESC LIMIT 20', scope):
                 payload = json.loads(r['payload'])
@@ -89,8 +117,15 @@ class WebData:
             reviews = [dict(r) for r in db.execute('''SELECT r.id,r.old_fact_id,r.patch,o.telegram_message_id
                 FROM fact_reviews r LEFT JOIN outbox o ON o.delivery_key='fact-review:'||r.id
                 WHERE r.chat_id=? AND r.topic_id=? AND r.state='pending' ''', scope)]
-        return dict(**item,events=events,recommendations=recommendations,facts=facts,commitments=commitments,reviews=reviews,
+        return dict(**item,events=events,messages=messages,recommendations=recommendations,facts=facts,commitments=commitments,reviews=reviews,
                     telegram_url=self.telegram_url(self.sales_chat,context))
+
+    def reply_target(self,context,message_id):
+        with reader(self.sales_path) as db:
+            scope=(self.sales_chat,int(context),message_id)
+            if not (db.execute('SELECT 1 FROM events WHERE chat_id=? AND topic_id=? AND message_id=? AND processed>=0 AND processed!=2',scope).fetchone()
+                    or db.execute('SELECT 1 FROM outbox WHERE chat_id=? AND topic_id=? AND telegram_message_id=?',scope).fetchone()):
+                raise WebError(404,'Сообщение для ответа недоступно')
 
     @staticmethod
     def telegram_url(chat, message=''):

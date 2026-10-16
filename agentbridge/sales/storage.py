@@ -20,10 +20,12 @@ def encoded(value):
 SALI_NAME = r'(?:сал{1,2}и|sal{1,2}[iy])'
 
 
-def should_respond(text, bot_username, addressed_elsewhere=False):
+def should_respond(text, bot_username, addressed_elsewhere=False, general=False, replied_to_bot=False):
     mentions = re.findall(r'@([A-Za-z0-9_]+)', text)
     mentions_sali = any(name.lower() == bot_username.lower() for name in mentions)
     explicit = mentions_sali or bool(re.search(rf'(?i)\b{SALI_NAME}\b', text))
+    if general:
+        return explicit or replied_to_bot
     quiet = bool(re.fullmatch(r'(?i)\s*(спасибо|ок|окей|понял[аи]?|принято|\+)\s*[.! ]*', text))
     return explicit or not (quiet or addressed_elsewhere or (mentions and not mentions_sali))
 
@@ -61,6 +63,8 @@ class SalesStore:
                     telegram_message_id INTEGER,
                     UNIQUE(delivery_key,part));
                 CREATE TABLE IF NOT EXISTS operations (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS event_media (
+                    event_id INTEGER PRIMARY KEY, metadata TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS document_chunks (
                     event_id INTEGER NOT NULL, chunk INTEGER NOT NULL, fingerprint TEXT NOT NULL,
                     payload TEXT NOT NULL, PRIMARY KEY(event_id,chunk,fingerprint));
@@ -112,6 +116,8 @@ class SalesStore:
                 # Legacy pending events are catch-up; receipt time is no longer recoverable.
                 db.execute('ALTER TABLE events ADD COLUMN received_at REAL NOT NULL DEFAULT 0')
             allow_message_edits(db, "events")
+            for table, kind in (('image_jobs','image'),('audio_jobs','audio')):
+                db.execute(f"INSERT OR IGNORE INTO event_media SELECT event_id,json_set(metadata,'$.kind',?) FROM {table}", (kind,))
             from .commitments import DDL
             db.executescript(DDL)
             columns = {row[1] for row in db.execute('PRAGMA table_info(commitments)')}
@@ -132,7 +138,7 @@ class SalesStore:
 
     def ingest(self, *, update_id, chat_id, topic_id, title, message_id,
                author_id, author, date, text, source="telegram_text", reply_to=None,
-               respond=True, response_text=None, authorization_pending=False, audio=None, image=None, is_edit=False):
+               respond=True, response_text=None, authorization_pending=False, audio=None, image=None, is_edit=False, media=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR IGNORE INTO deals(chat_id,topic_id,title) VALUES (?,?,?)",
@@ -149,6 +155,8 @@ class SalesStore:
                 (-1 if respond else -2) if authorization_pending else int(not respond), time.time(), update_id if is_edit else 0)).rowcount
             if inserted:
                 event_id = db.execute('SELECT id FROM events WHERE update_id=?', (update_id,)).fetchone()[0]
+                if media:
+                    db.execute('INSERT INTO event_media VALUES (?,?)', (event_id, encoded(media)))
                 if audio:
                     db.execute('INSERT INTO audio_jobs(event_id,metadata,caption) VALUES (?,?,?)', (event_id, encoded(audio), text))
                 if image:
@@ -559,6 +567,21 @@ class SalesStore:
     def notice(self, chat, topic, key, text):
         with self.connect() as db:
             self._queue(db, chat, topic, key, text)
+
+    def claim_web_response(self, row):
+        """Web-triggered answers stop on an ambiguous send instead of duplicating it."""
+        if not row['delivery_key'].startswith('recommendation:'):
+            return True
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rec=db.execute('SELECT event_ids FROM recommendations WHERE id=?',(int(row['delivery_key'].split(':')[1]),)).fetchone()
+            if not rec or not db.execute('SELECT 1 FROM events WHERE id IN (SELECT value FROM json_each(?)) AND author_id<0',(rec[0],)).fetchone():
+                return True
+            key='web-response:'+str(row['id'])
+            if db.execute('SELECT 1 FROM operations WHERE key=?',(key,)).fetchone():
+                return False
+            db.execute('INSERT INTO operations VALUES (?,?)',(key,encoded('sending')))
+            return True
 
     def codex_failed(self, state, chat, topic, text=None):
         with self.connect() as db:

@@ -392,7 +392,7 @@ class Commitments:
         row = db.execute("SELECT value FROM operations WHERE key='commitments_reenabled_at'").fetchone()
         if not row:
             return True
-        topics = [r[0] for r in db.execute('SELECT topic_id FROM deals WHERE chat_id=? ORDER BY topic_id', (self.chat_id,))]
+        topics = [r[0] for r in db.execute('SELECT topic_id FROM deals WHERE chat_id=? AND topic_id>0 ORDER BY topic_id', (self.chat_id,))]
         # Reconcile first; distribute old follow-ups across three working days after re-enabling.
         return now >= business_after(datetime.fromtimestamp(json.loads(row[0]), LOCAL), 1 + topics.index(topic) % 3)
 
