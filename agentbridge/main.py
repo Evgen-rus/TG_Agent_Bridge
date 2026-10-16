@@ -162,6 +162,8 @@ def main() -> None:
         self_audit=self_audit,
         self_audit_owner_user_id=settings.self_audit_owner_user_id,
     )
+    from .web.runtime import attach_web
+    attach_web(telegram_application, root, 'rick', service, settings)
     previous_unclean = store.start_run()
     if previous_unclean:
         store.queue_operational_notice(

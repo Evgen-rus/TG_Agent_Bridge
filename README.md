@@ -581,3 +581,7 @@ inbox с исходным `message_id` и `edit_update_id=update_id`; повто
 сохраняются. Редактирование команды не запускает команду/рестарт Сали.
 При первом запуске миграция сохраняет все строки, ID, индексы и расширяет
 уникальность сообщения до `(chat_id,message_id,edit_update_id)`.
+
+## Веб-приложения Rick и Sally
+
+Выбраны Rick A (Signal) и Sally A (Ledger). Опциональные интерфейсы по приглашениям, настройка, ограничения и деплой описаны в [agentbridge/web/README.md](agentbridge/web/README.md). Существующие Telegram-процессы и данные используются повторно; веб-функции включаются AGENTBRIDGE_WEB_ENABLED=true. Новые настройки — в .env.example.

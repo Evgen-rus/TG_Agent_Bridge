@@ -833,3 +833,23 @@ inbox с исходным `message_id` и `edit_update_id=update_id`; повто
 сохраняются. Редактирование команды не запускает команду/рестарт Сали.
 При первом запуске миграция сохраняет все строки, ID, индексы и расширяет
 уникальность сообщения до `(chat_id,message_id,edit_update_id)`.
+
+## Invite-only Rick/Sally web adapters
+
+`agentbridge/web/README.md` documents the opt-in web adapter hosted inside the
+existing bot processes. Rick serves loopback HTTP and a durable web worker; Sally
+consumes its own web jobs inside its existing loop. No extra Telegram poller is
+started. Sessions, invitations and request transport records live separately in
+`runtime/web/access.sqlite3`; business facts/history remain in the existing stores.
+
+All reads and commands enforce product and per-context grants. Owner Rick questions
+reuse owner methods; a per-chat owner-query lock serializes web/Telegram access.
+Non-owner questions are ephemeral tool-free provider turns with no owner context.
+Sally web text uses the existing durable ingest, batching, model lock, checkpoint,
+facts and topic outbox, with an explicit web source and reserved negative IDs.
+Interrupted web jobs are marked uncertain, without replaying costly turns.
+
+The selected Signal/Ledger React views expose real data and distinct manifests and
+sessions at `/rick/` and `/sally/`. Approval, media and reminder commands stay in
+existing Telegram workflows; no web actor is impersonated as a Telegram callback.
+Only immutable frontend assets are eligible for service-worker caching.

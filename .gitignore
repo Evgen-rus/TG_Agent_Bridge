@@ -11,6 +11,8 @@ chats/*
 !chats/.gitkeep
 
 # Pytest basetemp leftovers
+.pytest_cache/
+.pytest_tmp_codex_target/
 tmp/
 tmp_pytest/
 My_dev_projectTG_Agent_Bridgetmp_pytest/

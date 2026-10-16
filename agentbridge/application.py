@@ -209,6 +209,7 @@ class AgentBridgeApplication:
         else:
             self.knowledge_dir = Path.cwd() / "knowledge"
         self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._owner_query_locks: dict[int, asyncio.Lock] = {}
 
     def is_monitored_chat(self, telegram_chat_id: int) -> bool:
         return self.registry.get(telegram_chat_id) is not None
@@ -1794,6 +1795,12 @@ class AgentBridgeApplication:
         return "\n\n".join(parts), len(messages), total, truncated
 
     async def _answer_owner_query_for_chat(
+        self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None,
+    ) -> str:
+        async with self._owner_query_locks.setdefault(chat.telegram_chat_id, asyncio.Lock()):
+            return await self._answer_owner_query_for_chat_locked(chat, question, scope=scope)
+
+    async def _answer_owner_query_for_chat_locked(
         self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None,
     ) -> str:
         if self.attachment_fetcher is not None:
