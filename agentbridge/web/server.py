@@ -157,9 +157,12 @@ def make_server(root: Path, store, data, origin, port=18082):
                             if not row or (row['user_id'] != user['id'] and not (product=='sally' and row['event_id'] is not None) and row['user_id'] != 0 and not shared):
                                 raise WebError(404,'Вложение недоступно')
                             file = Path(row['path'])
-                            if not file.is_relative_to(store.path.parent/'media') or not file.is_file():
+                            missing = not file.is_relative_to(store.path.parent/'media') or not file.is_file()
+                            if missing:
                                 db.execute('UPDATE media SET requested=1 WHERE id=?', (ident,))
-                                raise WebError(409,'Загружаем вложение из Telegram. Повторите через несколько секунд.')
+                        # Commit the download request before returning an HTTP error.
+                        if missing:
+                            raise WebError(409,'Загружаем вложение из Telegram. Повторите через несколько секунд.')
                         return self.send(200,file.read_bytes(),row['mime'])
                     if endpoint == 'api/detail' and not mutation:
                         return self.send(200,data.detail(user,product,context))

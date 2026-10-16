@@ -194,6 +194,19 @@ async def test_remote_media_metadata_can_be_recovered_without_business_duplicati
     with s.access.connect() as db:
         row=db.execute("SELECT * FROM media WHERE id='sally-1'").fetchone()
         assert row['file_id']=='tg-image' and row['event_id']==1 and row['kind']=='image'
+        db.execute("UPDATE media SET requested=1 WHERE id='sally-1'")
+        path=Path(row['path'])
+    async def download(custom_path):
+        Path(custom_path).write_bytes(b'cached-test-image')
+    async def get_file(file_id):
+        assert file_id=='tg-image'
+        return SimpleNamespace(file_size=17,download_to_drive=download)
+    s.bot.get_file=get_file
+    s.runtime._last_media_refresh=0
+    await s.runtime.refresh_media()
+    assert path.read_bytes()==b'cached-test-image'
+    with s.access.connect() as db:
+        assert db.execute("SELECT requested FROM media WHERE id='sally-1'").fetchone()[0]==0
     with s.store.connect() as db:assert db.execute('SELECT count(*) FROM events').fetchone()[0]==1
 
 

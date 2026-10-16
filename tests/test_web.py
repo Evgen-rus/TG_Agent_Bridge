@@ -325,6 +325,13 @@ def test_binary_upload_auth_csrf_scope_private_read_and_mime(web,http):
     assert http('POST','/sally/api/ask',{'context':'101','text':'Фото','attachments':[media['id']]},post)[0]==202
     with web.access.connect() as db:db.execute('UPDATE media SET event_id=1 WHERE id=?',(media['id'],))
     assert http('GET',url,headers={'Cookie':'__Secure-sally_sid='+owner_token})[0]==200
+    with web.access.connect() as db:
+        path=db.execute('SELECT path FROM media WHERE id=?',(media['id'],)).fetchone()[0]
+        db.execute('UPDATE media SET file_id=? WHERE id=?',('telegram-file',media['id']))
+    Path(path).unlink()
+    assert http('GET',url,headers=headers)[0]==409
+    with web.access.connect() as db:
+        assert db.execute('SELECT requested FROM media WHERE id=?',(media['id'],)).fetchone()[0]==1
 
 
 def test_sally_shared_chronology_authorship_reply_and_context_boundaries(web):
