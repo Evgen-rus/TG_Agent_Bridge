@@ -63,9 +63,7 @@ class WebStore:
             return False
         if user['role'] == 'owner':
             return True
-        if user['role'] != product:
-            return False
-        return context is None or str(context) in json.loads(user['scopes'])
+        return user['role'] == product
 
     def invite(self, login, scopes):
         roles = {'evgen': ('Евгений', 'owner'), 'dmitry': ('Дмитрий', 'rick'), 'sergey': ('Сергей', 'sally')}

@@ -842,7 +842,9 @@ consumes its own web jobs inside its existing loop. No extra Telegram poller is
 started. Sessions, invitations and request transport records live separately in
 `runtime/web/access.sqlite3`; business facts/history remain in the existing stores.
 
-All reads and commands enforce product and per-context grants. Owner Rick questions
+All reads and commands enforce product roles and live context membership. Dmitry
+sees all current/future monitored Rick chats; Sergey sees all current/future
+topics in the configured Sally group, including for existing accounts/invitations. Owner Rick questions
 reuse owner methods; a per-chat owner-query lock serializes web/Telegram access.
 Non-owner questions are ephemeral tool-free provider turns with no owner context.
 Sally web text uses the existing durable ingest, batching, model lock, checkpoint,

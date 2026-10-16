@@ -1,5 +1,5 @@
 import {it,expect,vi,afterEach} from 'vitest';
-import {render,screen,waitFor} from '@testing-library/react';
+import {render,screen,waitFor,fireEvent} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import Production from './Production';
 
@@ -7,6 +7,7 @@ afterEach(()=>vi.unstubAllGlobals());
 
 it('реальный UI: вход, контекст, ошибка отправки и повтор с тем же idempotency key',async()=>{
  let authenticated=false,attempt=0,completed=false;
+ const contexts=[{id:'101',title:'Рабочий контекст'}];
  const keys:string[]=[];
  const fetchMock=vi.fn(async(input:string,options?:RequestInit)=>{
   const route=input.split('/api/')[1];
@@ -15,7 +16,7 @@ it('реальный UI: вход, контекст, ошибка отправк
    if(authenticated)value={name:'Евгений',login:'evgen',role:'owner',csrf:'csrf-test'};
    else {status=401;value={error:'Войдите'}}
   }else if(route==='login'){authenticated=true}
-  else if(route==='contexts')value=[{id:'101',title:'Рабочий контекст'}];
+  else if(route==='contexts')value=contexts;
   else if(route.startsWith('detail'))value={id:'101',title:'Рабочий контекст',events:[],recommendations:[],facts:[],commitments:[],reviews:[]};
   else if(route.startsWith('history'))value=completed?[{id:1,payload:JSON.stringify({text:'Мой вопрос'}),state:'done',result:'Готовый ответ',created:1800000000}]:[];
   else if(route==='ask'){
@@ -43,4 +44,8 @@ it('реальный UI: вход, контекст, ошибка отправк
  expect(keys[0]).toBe(keys[1]);
  await u.click(screen.getByRole('button',{name:'Скопировать'}));
  await waitFor(()=>expect(screen.getByText('Скопировано. Отправка остаётся за вами.')).toBeTruthy());
+ contexts.push({id:'102',title:'Новый клиент'});
+ fireEvent(window,new Event('focus'));
+ await u.click(screen.getByRole('button',{name:'События'}));
+ expect(await screen.findByRole('button',{name:/Новый клиент/})).toBeTruthy();
 });

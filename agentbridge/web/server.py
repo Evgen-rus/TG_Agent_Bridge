@@ -127,14 +127,11 @@ def make_server(root: Path, store, data, origin, port=18082):
                             raise WebError(400,'Выберите приложение')
                         return self.send(200,data.contexts(user,target))
                     if endpoint == 'api/invite' and mutation and user['role']=='owner':
-                        login, scopes = payload.get('login'), payload.get('scopes')
+                        login = payload.get('login')
                         target = {'dmitry':'rick','sergey':'sally'}.get(login)
-                        if not target or not isinstance(scopes,list) or not scopes:
-                            raise WebError(400,'Выберите пользователя и доступные контексты')
-                        valid = {c['id'] for c in data.contexts(user,target)}
-                        if any(s not in valid for s in scopes):
-                            raise WebError(400,'Недоступный контекст в приглашении')
-                        invite = store.invite(login,scopes)
+                        if not target:
+                            raise WebError(400,'Выберите пользователя')
+                        invite = store.invite(login,[])
                         return self.send(200,{'url':f'{origin}/{target}/#invite={invite}'})
                     if endpoint == 'api/revoke' and mutation and user['role']=='owner':
                         if payload.get('login') not in ('dmitry','sergey'):

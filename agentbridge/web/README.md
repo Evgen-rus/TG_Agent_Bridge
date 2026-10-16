@@ -14,21 +14,24 @@ The process reads only `mobile-concepts/dist` and the two original application i
 No Python dependencies were added. The frontend build uses the committed npm lockfile.
 
 Invite-only accounts: `evgen` (owner), `dmitry` (Rick), `sergey` (Sally). No public
-registration. Owner creates single-use invitations, selects explicit chat/topic
-IDs, and can revoke access; reinviting a revoked account resets its password and
-scopes. Owner setup: `python -m agentbridge.web.admin --send-owner`; this is an
+registration. Owner creates single-use invitations and can revoke access. Dmitry can access
+all current and future monitored Rick chats; Sergey can access all current and
+future topics in the configured Sally group. Existing accounts and unused
+invitations receive this product-wide access without re-enrollment; product
+isolation and disabled-account checks remain enforced. Reinviting a revoked
+account resets its password. Owner setup: `python -m agentbridge.web.admin --send-owner`; this is an
 explicit operator action, never an automatic startup message. It sends the link
 only to the configured Rick OWNER_CHAT_ID and keeps a mode-0600 recovery file.
 Tokens are in URL fragments and POST bodies, never request logs. Never print that
 file, cookies or invitation tokens into deployment logs.
 
 `runtime/web/access.sqlite3` stores scrypt password hashes, hashed session/invite
-tokens, explicit grants, throttle counters and durable web requests/results. It
+tokens, product roles, throttle counters and durable web requests/results. It
 does not become agent memory. Sessions have distinct product cookies, paths and
 server-side product checks; Secure/HttpOnly/SameSite=Strict, seven-day expiry,
 CSRF tokens and strict Origin checks for POST, including login/enrollment.
 Login throttles both IP and account. Invite expiry is 24 hours.
-Read paths use SQLite mode=ro/query_only and filter each context before reads.
+Read paths use SQLite mode=ro/query_only and validate each context against the live registry or configured Sally group before reads.
 API output never includes auth secrets, Codex thread IDs, env or file paths.
 
 Commands use a per-user/product idempotency key with payload conflict detection,
@@ -62,6 +65,9 @@ pretending a browser actor has a Telegram membership/message callback identity.
 The service worker caches only hashed build assets, never HTML/API/client history.
 No client data is written to localStorage. Manifests have different id/start_url,
 scope and original icons. Real Android installation/keyboard QA is still manual.
+
+The context list refreshes every 15 seconds and when the window regains focus.
+New empty Telegram topics appear once Sally persists them in her deals registry.
 
 ## Deployment and rollback
 

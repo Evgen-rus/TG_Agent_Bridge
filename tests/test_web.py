@@ -52,19 +52,36 @@ def test_invite_password_single_use_and_product_isolation(web):
         web.access.session(session,'rick')
 
 
-def test_scoped_reads_and_cross_topic_denial(web):
+def test_member_sees_current_and_future_topics_only_in_own_product_and_group(web,chat_registry):
     actor,_=user(web.access,'sergey',['101'],'sally')
-    assert web.data.contexts(actor,'sally')==[{'id':'101','title':'Visible'}]
+    assert {r['id'] for r in web.data.contexts(actor,'sally')}=={'101','102'}
     detail=web.data.detail(actor,'sally','101')
     assert [f['text'] for f in detail['facts']]==['Visible fact']
     assert 'Hidden fact' not in json.dumps(detail)
+    with web.sales.connect() as db:
+        db.execute("INSERT INTO deals(chat_id,topic_id,title) VALUES (-100,103,'New topic'),(-200,104,'Other group')")
+    assert {r['id'] for r in web.data.contexts(actor,'sally')}=={'101','102','103'}
+    assert web.data.detail(actor,'sally','103')['title']=='New topic'
     with pytest.raises(WebError):
-        web.data.detail(actor,'sally','102')
+        web.data.detail(actor,'sally','104')
     with pytest.raises(WebError):
         web.data.contexts(actor,'rick')
     owner,_=user(web.access,'evgen',[],'rick')
-    assert len(web.data.contexts(owner,'sally'))==2
+    assert len(web.data.contexts(owner,'sally'))==3
     assert web.data.detail(owner,'rick','-100123456')['facts']=={}
+    dmitry,session=user(web.access,'dmitry',['obsolete-chat'],'rick')
+    assert web.data.detail(dmitry,'rick','-100123456')['title']=='Acme Support'
+    chat=chat_registry.all_chats()[0]
+    from dataclasses import replace
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chat_registry,'all_chats',lambda:[chat,replace(chat,telegram_chat_id=-100999,name='New client')])
+        assert web.data.detail(web.access.session(session,'rick'),'rick','-100999')['title']=='New client'
+    with pytest.raises(WebError):
+        web.data.contexts(dmitry,'sally')
+    with web.access.connect() as db:
+        db.execute('UPDATE users SET disabled=1 WHERE id=?',(dmitry['id'],))
+    with pytest.raises(WebError):
+        web.access.session(session,'rick')
 
 
 def test_jobs_idempotency_conflicts_restart_and_revoked_acl(web):
@@ -75,7 +92,7 @@ def test_jobs_idempotency_conflicts_restart_and_revoked_acl(web):
         web.access.enqueue(actor,'sally','101','a'*20,{'text':'different'})
     assert exc.value.status==409
     with pytest.raises(WebError):
-        web.access.enqueue(actor,'sally','102','b'*20,{'text':'question'})
+        web.access.enqueue(actor,'rick','102','b'*20,{'text':'question'})
     assert web.access.claim('rick') is None
     claimed,_=web.access.claim('sally')
     assert claimed['id']==job
@@ -165,6 +182,21 @@ def test_http_manifest_static_traversal_and_idempotency(web,http):
     manifests=[json.loads(http('GET',f'/{p}/manifest.webmanifest')[2]) for p in ('rick','sally')]
     assert manifests[0]['id']!=manifests[1]['id']
     assert manifests[0]['scope']=='/rick/' and manifests[1]['scope']=='/sally/'
+
+
+def test_owner_invites_members_without_selecting_contexts(web,http):
+    owner,token=user(web.access,'evgen',[],'rick')
+    headers={'Cookie':'__Secure-rick_sid='+token,'X-CSRF-Token':owner['csrf'],
+             'Origin':'https://example.test','Content-Type':'application/json'}
+    for login,product in [('dmitry','rick'),('sergey','sally')]:
+        status,_,raw=http('POST','/rick/api/invite',{'login':login},headers)
+        assert status==200
+        invite=json.loads(raw)['url'].split('#invite=')[1]
+        web.access.enroll(invite,'safe-password-for-test')
+        session=web.access.login(login,'safe-password-for-test',product,login)
+        actor=web.access.session(session,product)
+        assert WebStore.allowed(actor,product,'future-context')
+        assert not WebStore.allowed(actor,'sally' if product=='rick' else 'rick')
 
 
 @pytest.mark.asyncio
