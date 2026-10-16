@@ -37,3 +37,11 @@
 .general-link{margin-bottom:16px;width:100%}
 
 .compose-error{margin:8px 12px;max-height:24dvh;overflow-y:auto;flex-shrink:0}.compose-error p{margin:0;overflow-wrap:anywhere}
+
+.chat-controls{position:relative;flex-shrink:0}
+.live-app .jump-to-latest{position:absolute;right:16px;bottom:calc(100% + 12px);display:flex;align-items:center;gap:8px;min-height:44px;padding:10px 16px;background:var(--accent);color:var(--ink);border:1px solid var(--border);border-radius:24px;box-shadow:0 3px 18px #0002;z-index:2}
+.agent-working{display:flex;align-items:center;gap:5px;width:fit-content;min-height:44px;padding:14px 18px;border-radius:18px;background:var(--raised);color:var(--accent)}
+.agent-working i{width:7px;height:7px;border-radius:50%;background:currentColor;animation:agent-pulse 1.2s ease-in-out infinite}
+.agent-working i:nth-child(2){animation-delay:.15s}.agent-working i:nth-child(3){animation-delay:.3s}
+@keyframes agent-pulse{0%,70%,100%{opacity:.3}35%{opacity:1}}
+@media(prefers-reduced-motion:reduce){.agent-working i{animation:none;opacity:.7}}
