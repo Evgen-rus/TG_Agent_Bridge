@@ -200,6 +200,154 @@ def test_owner_invites_members_without_selecting_contexts(web,http):
 
 
 @pytest.mark.asyncio
+async def test_rick_web_reminder_confirmation_refinement_and_duplicate(web,chat_registry):
+    import asyncio
+    from agentbridge.agents.base import GeneralTaskPlan
+    from agentbridge.application import AgentBridgeApplication
+    from agentbridge.web.runtime import WebRuntime
+    class Owner:
+        async def plan_general_task(self,**kwargs):
+            return GeneralTaskPlan('plan','Напомнить проверить отчёт','reminder',
+                '2099-10-17T04:00:00+00:00' if 'позже' in kwargs['request'] else '',
+                '17 октября 11:00','Проверить отчёт')
+        async def answer_owner_query(self,**kwargs):
+            raise AssertionError('Reminder must not become a plain model answer')
+    service=AgentBridgeApplication(chat_registry,web.rick,Owner(),owner_chat_id=-100777)
+    runtime=WebRuntime(web.root,'rick',service,None)
+    runtime.store=web.access
+    owner,_=user(web.access,'evgen',[],'rick')
+    member,_=user(web.access,'dmitry',[],'rick')
+    job_id=web.access.enqueue(owner,'rick','-100123456','reminder-create-key-1',{'text':'Напомни проверить отчёт'})
+    worker=asyncio.create_task(runtime.run())
+    async def wait(state,revision=None):
+        for _ in range(200):
+            row=web.access.history(owner,'rick','-100123456')[0]
+            if row['state']==state and (revision is None or row['revision']==revision):
+                return row
+            await asyncio.sleep(.01)
+        raise AssertionError(row)
+    try:
+        row=await wait('review',1)
+        assert row['task_id'] and not row['can_confirm'] and not service.pending_reminders()
+        with pytest.raises(WebError):
+            web.access.reminder_action(owner,'-100123456',job_id,1,'confirm')
+        with pytest.raises(WebError):
+            web.access.reminder_action(member,'-100123456',job_id,1,'cancel')
+        web.access.reminder_action(owner,'-100123456',job_id,1,'refine','позже, завтра в 11')
+        row=await wait('review',2)
+        assert row['can_confirm'] and not service.pending_reminders()
+        with pytest.raises(WebError):
+            web.access.reminder_action(owner,'-100123456',job_id,1,'confirm')
+        web.access.reminder_action(owner,'-100123456',job_id,2,'confirm')
+        web.access.reminder_action(owner,'-100123456',job_id,2,'confirm')
+        row=await wait('done')
+        assert 'сохранено' in row['result']
+        reminders=service.pending_reminders()
+        assert len(reminders)==1 and reminders[0].related_chat_id==-100123456
+        assert reminders[0].created_by_name=='Евгений'
+        task=web.rick.get_general_task(row['task_id'])
+        assert task.status=='done' and task.payload['reminder_id']==reminders[0].id
+        web.access.reminder_action(owner,'-100123456',job_id,2,'confirm')
+        assert len(service.pending_reminders())==1
+        # Recovery after business commit but before Web acknowledgement never recreates it.
+        await runtime.reminder_action(dict(id=job_id,task_id=task.id,action='confirm'),owner,chat_registry.get(-100123456))
+        assert len(service.pending_reminders())==1
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker,return_exceptions=True)
+
+
+def test_web_reminder_review_survives_restart_and_cancel_is_durable(web):
+    owner,_=user(web.access,'evgen',[],'rick')
+    ident=web.access.enqueue(owner,'rick','-100123456','reminder-review-key-1',{'text':'Напомни'})
+    web.access.claim('rick')
+    web.access.reminder_review(ident,10,'Подтвердите',True)
+    reopened=WebStore(web.access.path)
+    reopened.interrupted('rick')
+    assert reopened.history(owner,'rick','-100123456')[0]['state']=='review'
+    reopened.reminder_action(owner,'-100123456',ident,1,'cancel')
+    assert reopened.claim('rick')[0]['action']=='cancel'
+
+
+def test_http_rick_telegram_and_push_routes_are_authenticated(web,http):
+    owner,token=user(web.access,'evgen',[],'rick')
+    web.data.owner_chat=-100777
+    headers={'Cookie':'__Secure-rick_sid='+token,'X-CSRF-Token':owner['csrf'],
+             'Origin':'https://example.test','Content-Type':'application/json'}
+    assert json.loads(http('GET','/rick/api/telegram',headers=headers)[2])['url']=='https://t.me/c/777/'
+    reminder=web.rick.create_reminder(-100777,'2099-10-17T04:00:00Z','Личное напоминание')
+    assert json.loads(http('GET',f'/rick/api/reminder?id={reminder}',headers=headers)[2])['action']=='Личное напоминание'
+    assert http('GET','/rick/api/reminder?id=999',headers=headers)[0]==404
+    member,member_token=user(web.access,'dmitry',[],'rick')
+    assert http('GET',f'/rick/api/reminder?id={reminder}',headers={'Cookie':'__Secure-rick_sid='+member_token})[0]==403
+    assert http('GET','/rick/api/push-config')[0]==401
+    config=json.loads(http('GET','/rick/api/push-config',headers=headers)[2])
+    assert config['public_key'] and config['subscribed'] is False
+    assert http('POST','/rick/api/push-subscribe',{'subscription':{}},headers)[0]==400
+    assert http('POST','/rick/api/reminder-action',{'context':'-100123456','job_id':1,'revision':1,'action':'confirm'},
+                dict(headers,**{'X-CSRF-Token':'wrong'}))[0]==403
+
+
+def test_notification_scan_queues_due_reminders_independently_from_telegram(web,chat_registry):
+    import time
+    from datetime import datetime,timezone
+    from agentbridge.application import AgentBridgeApplication
+    from agentbridge.web.runtime import WebRuntime
+    owner,_=user(web.access,'evgen',[],'rick')
+    service=AgentBridgeApplication(chat_registry,web.rick,object(),owner_chat_id=-100777)
+    runtime=WebRuntime(web.root,'rick',service,None)
+    runtime.store=web.access
+    due=datetime.fromtimestamp(time.time()-5,timezone.utc).isoformat()
+    reminder=service.create_reminder(due,'Do not expose this text',related_chat_id=-100123456)
+    calls=[]
+    push=SimpleNamespace(enqueue=lambda *args,**kwargs:calls.append((args,kwargs)))
+    runtime.queue_notifications(push)
+    assert calls[0][0]==(owner['id'],f'reminder:{reminder}','-100123456','reminder')
+    assert 'Do not expose' not in str(calls)
+    service.mark_reminder_sent(reminder)
+    calls.clear()
+    runtime.queue_notifications(push)
+    assert calls[0][0][1]==f'reminder:{reminder}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('committed',[False,True])
+async def test_interrupted_web_confirmation_recovers_with_one_reminder(web,chat_registry,committed):
+    import asyncio
+    from agentbridge.application import AgentBridgeApplication
+    from agentbridge.web.runtime import WebRuntime
+    owner,_=user(web.access,'evgen',[],'rick')
+    service=AgentBridgeApplication(chat_registry,web.rick,object(),owner_chat_id=-100777)
+    runtime=WebRuntime(web.root,'rick',service,None)
+    runtime.store=web.access
+    job=web.access.enqueue(owner,'rick','-100123456','recover-reminder-key',{'text':'Напомни'})
+    web.access.claim('rick')
+    task=web.rick.create_general_task(-100777,'Напомни','Завтра','reminder',dict(
+        web_user_id=owner['id'],web_job_id=job,related_chat_id=-100123456,
+        remind_at_utc='2099-10-17T04:00:00+00:00',reminder_text='Проверить отчёт'))
+    web.access.reminder_review(job,task,'Подтвердите',True)
+    web.access.reminder_action(owner,'-100123456',job,1,'confirm')
+    web.access.claim('rick')
+    web.rick.set_general_task_status(task,'confirming','executing')
+    if committed:
+        web.rick.complete_reminder_task(task)
+    web.access.interrupted('rick')
+    assert web.access.history(owner,'rick','-100123456')[0]['state']=='pending'
+    worker=asyncio.create_task(runtime.run())
+    try:
+        for _ in range(100):
+            row=web.access.history(owner,'rick','-100123456')[0]
+            if row['state']=='done':
+                break
+            await asyncio.sleep(.01)
+        assert row['state']=='done' and 'сохранено' in row['result']
+        assert len(service.pending_reminders())==1
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker,return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_worker_member_never_uses_owner_provider(web,chat_registry):
     from agentbridge.web.runtime import WebRuntime
     from agentbridge.application import AgentBridgeApplication

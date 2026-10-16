@@ -84,9 +84,39 @@ preserved as text where possible. Encrypted, damaged or oversized files fail
 explicitly. Scanned PDFs ask for page images; automatic whole-PDF OCR is not added.
 
 Drafts survive failed uploads/sends and context switches while logged in. Successful
-uploads are reused on a retry; the original command key is retained. Approval,
-reminder changes and memory confirmation continue through Telegram, without
-impersonating Web actors as Telegram callback users.
+uploads are reused on a retry; the original command key is retained. Rick owner
+reminders use the existing planner with confirm, clarify and cancel controls in
+Web. Other approvals and memory confirmation remain in Telegram. Web never
+impersonates Telegram callback users or exposes general, developer, restart or
+analytics execution through reminder controls.
+
+Rick recording has two controls: square discards the recording; arrow finishes
+and immediately uploads/sends. Failed uploads/sends retain the draft. Sally keeps
+finish, preview, cancel and separate send. Rick's “Ещё” contains the owner link
+to Telegram and opt-in notifications per device.
+
+Web Push runs inside Rick with the existing service worker. `pywebpush` handles
+encryption/VAPID; no extra service, scheduler, account or env setting is needed.
+The private key is generated at `runtime/web/vapid-private.pem` (0600 on Linux).
+Retain it with runtime backups; never commit or expose it. Subscriptions, event
+dedupe and delivery queue are in `access.sqlite3`. Only known HTTPS Apple,
+Google and Mozilla push hosts are allowed; redirects and env proxies are disabled.
+
+Notifications need explicit browser permission via “Включить на этом устройстве”,
+a valid Rick login, OS permissions and network. On iOS 16.4+ install on the Home
+Screen and open there. Delivery timing depends on browser/OS. Logout, expiry or
+revocation suppress queued sends; re-login requires enabling the new session.
+Only a generic answer/reminder notice appears on the lock screen; opening it
+loads the authorized context. API/history content is never cached offline.
+
+Reminders still arrive in Telegram independently of push, including reminders
+created in Telegram. Push scans due reminders and completed Web requests from the
+last 24 hours; events before device subscription are not replayed. Transient push
+failure retries with backoff up to eight attempts; 404/410 removes the subscription.
+Telegram keeps its original retries. Push acceptance does not prove phone display.
+A crash after acceptance may repeat a push; stable notification tags collapse
+copies. Ready-answer push refers to Web answers; Telegram answers arrive there
+through the original Telegram flow.
 
 The service worker caches only hashed build assets, never HTML/API/client history.
 No client data is written to localStorage. Manifests have different id/start_url,

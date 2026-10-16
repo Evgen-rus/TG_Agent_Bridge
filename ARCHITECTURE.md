@@ -879,7 +879,11 @@ versions and reply IDs. Rick keeps client events/recommendations and internal We
 turns separate; member work is visible to owner, owner-private turns never to
 members. Follow-ups include only authorized working conversation. No Rick Web
 path sends to client Telegram chats. Owner-only memory and development controls
-are not exposed to members. Approvals remain Telegram workflows.
+are not exposed to members. Memory and other approvals remain Telegram workflows;
+owner reminder confirmation is also available in Rick Web using the same task
+store. Web controls cannot execute other task kinds. Revision checks prevent
+confirmation of an outdated card. Reminder creation and business task completion
+commit atomically; duplicate confirmations cannot create another reminder.
 
 `web/media.py` handles binary uploads (20 MiB each, at most 8 per request, bounded
 upload concurrency/rate/quota) with product/context/user ACL, Origin and CSRF.
@@ -907,4 +911,17 @@ layout extraction. No executable documents or external fetches are enabled.
 
 Upload errors appear next to the composer with filename, reason and recovery steps.
 Drafts survive failure; each file fetch has a 60-second deadline and named progress.
-Recording uses icon-only square/cancel controls and requires a separate send.
+Rick recording uses square to discard and arrow to finish and immediately send;
+Sally keeps finish/preview/cancel and separate send. Context/visibility changes
+cannot send a late recording; upload failure retains the draft.
+
+Rick Web Push uses a separate asynchronous task in the existing process, so a
+model turn cannot hold up due notifications. Subscriptions are bound to the Rick
+session/user and rechecked before delivery. Logout/expiry/revocation suppresses
+sends. The durable transport queue retries transient errors, removes 404/410
+endpoints, and deduplicates events across restarts. Generic notifications contain
+no client text; clicks open the authorized Rick context. Existing Telegram
+reminder delivery runs independently. Only events from the past 24 hours and
+after device subscription qualify. Push acceptance is not proof of OS display;
+delivery is at least once with a stable notification tag. VAPID secrets stay in
+ignored runtime storage. See `web/README.md` for device activation and limits.

@@ -459,8 +459,7 @@ class ChatThreadStore:
         два потока успевают прочитать одно и то же состояние до записи. Здесь
         блокировка берётся до первого SELECT: без неё решение «новый лимит или
         продолжение» вычислялось бы по снимку, который второй поток уже успел
-        испортить. Единственное место, где это действительно нужно, — атомарные
-        проверка-и-запись метки лимита."""
+        испортить. Используется для атомарной метки лимита и завершения напоминания."""
         connection = sqlite3.connect(self.database_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
@@ -2373,6 +2372,24 @@ class ChatThreadStore:
                 (owner_chat_id, request_text, understanding, kind, json.dumps(payload, ensure_ascii=False), now, now),
             )
             return int(cursor.lastrowid)
+
+    def complete_reminder_task(self, task_id: int) -> int:
+        # Reminder creation and task completion must survive a crash together.
+        with self._write_locked() as connection:
+            task = connection.execute("SELECT * FROM owner_general_tasks WHERE id=? AND kind='reminder' AND status='executing'",(task_id,)).fetchone()
+            if task is None:
+                raise ValueError('Reminder task is not executing')
+            payload = json.loads(task['payload_json'])
+            reminder_id = connection.execute('''INSERT INTO reminders
+                (owner_chat_id,remind_at_utc,text,related_chat_id,related_chat_name,
+                 created_by_user_id,created_by_username,created_by_name) VALUES (?,?,?,?,?,?,?,?)''',
+                (task['owner_chat_id'],payload['remind_at_utc'],payload['reminder_text'],
+                 payload.get('related_chat_id'),payload.get('related_chat_name'),payload.get('created_by_user_id'),
+                 payload.get('created_by_username'),payload.get('created_by_name'))).lastrowid
+            payload['reminder_id'] = reminder_id
+            connection.execute("UPDATE owner_general_tasks SET status='done',payload_json=?,updated_at=? WHERE id=?",
+                               (json.dumps(payload,ensure_ascii=False),_now(),task_id))
+            return int(reminder_id)
 
     def get_general_task(self, task_id: int) -> GeneralTaskRecord | None:
         with self._connect() as connection:

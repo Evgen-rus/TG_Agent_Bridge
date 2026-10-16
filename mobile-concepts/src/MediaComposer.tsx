@@ -8,18 +8,65 @@ const blank=():Draft=>({text:'',files:[],key:crypto.randomUUID()});
 export function MediaComposer({visible,product,context,csrf,busy,reply,onReplyClear,onSend,onError}:{visible:boolean;product:string;context:string;csrf:string;busy:boolean;reply?:number|null;onReplyClear:()=>void;onSend:(text:string,ids:string[],key:string)=>Promise<void>;onError:(s:string)=>void}){
  const drafts=useRef(new Map<string,Draft>());
  const [draft,setDraft]=useState<Draft>(blank),[working,setWorking]=useState(false),[recording,setRecording]=useState(false),[progress,setProgress]=useState('');
- const recorder=useRef<MediaRecorder|null>(null),stream=useRef<MediaStream|null>(null),cancelled=useRef(false),fileInput=useRef<HTMLInputElement>(null);
- const active=useRef(context);active.current=context;
- useEffect(()=>{if(!visible){cancelled.current=true;if(recorder.current?.state==='recording')recorder.current.stop()}},[visible]);
  const [preview,setPreview]=useState('');
- useEffect(()=>{cancelled.current=true;if(recorder.current?.state==='recording')recorder.current.stop();const next=drafts.current.get(context)||blank();setDraft(next);setPreview('')},[context]);
- useEffect(()=>()=>{cancelled.current=true;if(recorder.current?.state==='recording')recorder.current.stop();stream.current?.getTracks().forEach(t=>t.stop())},[]);
+ const recorder=useRef<MediaRecorder|null>(null),session=useRef<{cancelled:boolean;send:boolean}|null>(null),sending=useRef(false),mounted=useRef(true),fileInput=useRef<HTMLInputElement>(null);
+ const active=useRef({context,product,visible});active.current={context,product,visible};
+ const immediateVoice=product==='rick';
+ const finishRecording=()=>{if(session.current&&recorder.current?.state==='recording'){session.current.send=true;recorder.current.stop()}};
+ const cancelRecording=()=>{if(session.current)session.current.cancelled=true;if(recorder.current?.state==='recording')recorder.current.stop();setRecording(false)};
+ useEffect(()=>{cancelRecording();const next=drafts.current.get(context)||blank();setDraft(next);setPreview('')},[context,product,visible]);
+ useEffect(()=>()=>{if(preview)URL.revokeObjectURL(preview)},[preview]);
+ useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;if(session.current)session.current.cancelled=true;if(recorder.current?.state==='recording')recorder.current.stop()}},[]);
  const change=(next:Draft)=>{drafts.current.set(context,next);setDraft(next)};
  const files=(selected:File[])=>{if(draft.files.length+selected.length>8){onError('Не более 8 вложений');return}if(selected.some(f=>f.size>20*1024*1024)){onError('Каждый файл должен быть до 20 МБ');return}change({...draft,files:[...draft.files,...selected.map(file=>({file}))],key:crypto.randomUUID()})};
- const record=async()=>{try{const media=await navigator.mediaDevices.getUserMedia({audio:true});stream.current=media;const mime=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus'].find(t=>MediaRecorder.isTypeSupported(t));const r=new MediaRecorder(media,mime?{mimeType:mime}:undefined);recorder.current=r;const chunks:BlobPart[]=[];let bytes=0;cancelled.current=false;const target=context;r.ondataavailable=e=>{bytes+=e.data.size;if(bytes>20*1024*1024){cancelled.current=true;r.stop();onError('Запись превысила 20 МБ')}else chunks.push(e.data)};r.onstop=()=>{media.getTracks().forEach(t=>t.stop());setRecording(false);recorder.current=null;if(cancelled.current||active.current!==target)return;const blob=new Blob(chunks,{type:r.mimeType});const ext=r.mimeType.includes('mp4')?'m4a':r.mimeType.includes('ogg')?'ogg':'webm';const current=drafts.current.get(target)||blank();const next={...current,files:[...current.files,{file:new File([blob],`Голосовое.${ext}`,{type:r.mimeType})}],key:crypto.randomUUID()};if(next.files.length>8){onError('Не более 8 вложений');return}drafts.current.set(target,next);setDraft(next);setPreview(URL.createObjectURL(blob))};r.start(1000);setRecording(true)}catch{onError('Не удалось включить микрофон. Проверьте разрешение браузера или прикрепите аудиофайл.')}};
- useEffect(()=>()=>{if(preview)URL.revokeObjectURL(preview)},[preview]);
- const submit=async()=>{if(working||busy||recording||(!draft.text.trim()&&!draft.files.length))return;setWorking(true);onError('');try{for(const item of draft.files){if(item.id)continue;setProgress(`Загружаем «${item.file.name}»…`);let response:Response;try{response=await fetch(`/${product}/api/upload?context=${encodeURIComponent(context)}&filename=${encodeURIComponent(item.file.name)}`,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/octet-stream','X-CSRF-Token':csrf},body:item.file,signal:AbortSignal.timeout(60000)});const result=await response.json().catch(()=>({error:response.status===413?'Файл больше 20 МБ. Уменьшите его или разделите на части.':'Сервер не принял файл. Повторите загрузку позже.'}));if(!response.ok)throw new Error(result.error||'Не удалось загрузить файл');item.id=result.id}catch(e){const reason=(e as Error).name==='TimeoutError'?'Загрузка не завершилась за минуту. Проверьте соединение и повторите.':(e as Error).message;throw new Error(`«${item.file.name}»: ${reason} Сообщение с вложениями не отправлено. Удалите этот файл крестиком или замените его и повторите отправку.`)}}setProgress('Сохраняем сообщение…');await onSend(draft.text,draft.files.map(f=>f.id!),draft.key+':'+(reply||''));const next=blank();drafts.current.set(context,next);if(active.current===context){setDraft(next);setPreview('');onReplyClear()}}catch(e){onError((e as Error).message)}finally{setWorking(false)}};
- return <div className="media-compose"><div className="attachment-draft">{reply&&<span>Ответ на #{reply}<button aria-label="Отменить ответ" onClick={onReplyClear}><X size={16}/></button></span>}{draft.files.map((f,i)=><span key={i}>{f.file.name}<button aria-label={`Удалить ${f.file.name}`} disabled={working} onClick={()=>change({...draft,files:draft.files.filter((_,n)=>n!==i),key:crypto.randomUUID()})}><X size={16}/></button></span>)}{preview&&<audio controls src={preview}/>}</div><form className="composer" onSubmit={e=>{e.preventDefault();void submit()}}><input ref={fileInput} type="file" multiple hidden accept="image/jpeg,image/png,image/webp,image/gif,audio/*,.txt,.md,.pdf,.docx" onChange={e=>{files(Array.from(e.target.files||[]));e.target.value=''}}/><button type="button" aria-label="Прикрепить файлы" disabled={working||recording} onClick={()=>fileInput.current?.click()}><Paperclip size={20}/></button><label className="sr-only" htmlFor="live-message">Сообщение</label><textarea id="live-message" rows={1} maxLength={6000} value={draft.text} disabled={working} onChange={e=>change({...draft,text:e.target.value,key:crypto.randomUUID()})} placeholder="Сообщение…"/>{recording?<button type="button" aria-label="Завершить запись" title="Завершить запись" onClick={()=>recorder.current?.stop()}><Square size={18}/></button>:<button type="button" aria-label="Записать голосовое" disabled={working} onClick={()=>void record()}><Mic size={20}/></button>}{recording?<button type="button" aria-label="Отменить запись" title="Отменить запись" onClick={()=>{cancelled.current=true;recorder.current?.stop()}}><X size={18}/></button>:<button disabled={working||busy||(!draft.text.trim()&&!draft.files.length)} aria-label="Отправить сообщение"><ArrowUp size={21}/></button>}</form>{working&&<small role="status">{progress}</small>}</div>
+ const record=async()=>{
+  if(recording||working)return;
+  const capture={cancelled:false,send:false};session.current=capture;setRecording(true);
+  const valid=()=>mounted.current&&!capture.cancelled&&session.current===capture&&active.current.context===context&&active.current.product===product&&active.current.visible;
+  let media:MediaStream|undefined;
+  try{
+   media=await navigator.mediaDevices.getUserMedia({audio:true});
+   if(!valid()){media.getTracks().forEach(t=>t.stop());return}
+   const mime=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus'].find(t=>MediaRecorder.isTypeSupported(t));
+   const captureMedia=media,r=new MediaRecorder(media,mime?{mimeType:mime}:undefined);recorder.current=r;
+   const chunks:BlobPart[]=[];let bytes=0;
+   r.ondataavailable=e=>{bytes+=e.data.size;if(bytes>20*1024*1024){capture.cancelled=true;if(r.state==='recording')r.stop();if(mounted.current)onError('Запись превысила 20 МБ')}else chunks.push(e.data)};
+   r.onstop=()=>{
+    captureMedia.getTracks().forEach(t=>t.stop());
+    if(recorder.current===r){recorder.current=null;if(mounted.current)setRecording(false)}
+    if(!valid()||!capture.send)return;
+    const blob=new Blob(chunks,{type:r.mimeType}),ext=r.mimeType.includes('mp4')?'m4a':r.mimeType.includes('ogg')?'ogg':'webm';
+    const current=drafts.current.get(context)||blank();
+    const next={...current,files:[...current.files,{file:new File([blob],`Голосовое.${ext}`,{type:r.mimeType})}],key:crypto.randomUUID()};
+    if(next.files.length>8){onError('Не более 8 вложений');return}
+    drafts.current.set(context,next);setDraft(next);if(immediateVoice)void submit(next,valid);else setPreview(URL.createObjectURL(blob));
+   };
+   r.start(1000);
+  }catch{media?.getTracks().forEach(t=>t.stop());if(valid()){setRecording(false);onError('Не удалось включить микрофон. Проверьте разрешение браузера или прикрепите аудиофайл.')}}
+ };
+ const submit=async(message=draft,stillCurrent=()=>true)=>{
+  if(sending.current||busy||(!message.text.trim()&&!message.files.length))return;
+  sending.current=true;setWorking(true);onError('');
+  const valid=()=>stillCurrent()&&mounted.current&&active.current.context===context&&active.current.product===product&&active.current.visible;
+  try{
+   for(const item of message.files){
+    if(!valid())return;
+    if(item.id)continue;
+    setProgress(`Загружаем «${item.file.name}»…`);
+    let response:Response;
+    try{
+     response=await fetch(`/${product}/api/upload?context=${encodeURIComponent(context)}&filename=${encodeURIComponent(item.file.name)}`,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/octet-stream','X-CSRF-Token':csrf},body:item.file,signal:AbortSignal.timeout(60000)});
+     const result=await response.json().catch(()=>({error:response.status===413?'Файл больше 20 МБ. Уменьшите его или разделите на части.':'Сервер не принял файл. Повторите загрузку позже.'}));
+     if(!response.ok)throw new Error(result.error||'Не удалось загрузить файл');item.id=result.id;
+    }catch(e){const reason=(e as Error).name==='TimeoutError'?'Загрузка не завершилась за минуту. Проверьте соединение и повторите.':(e as Error).message;throw new Error(`«${item.file.name}»: ${reason} Сообщение с вложениями не отправлено. Удалите этот файл крестиком или замените его и повторите отправку.`)}
+   }
+   if(!valid())return;
+   setProgress('Сохраняем сообщение…');await onSend(message.text,message.files.map(f=>f.id!),message.key+':'+(reply||''));
+   const next=blank();drafts.current.set(context,next);
+   if(valid()){setDraft(next);setPreview('');onReplyClear()}
+  }catch(e){if(valid())onError((e as Error).message)}finally{sending.current=false;if(mounted.current)setWorking(false)}
+ };
+ return <div className="media-compose"><div className="attachment-draft">{reply&&<span>Ответ на #{reply}<button aria-label="Отменить ответ" onClick={onReplyClear}><X size={16}/></button></span>}{draft.files.map((f,i)=><span key={i}>{f.file.name}<button aria-label={`Удалить ${f.file.name}`} disabled={working} onClick={()=>change({...draft,files:draft.files.filter((_,n)=>n!==i),key:crypto.randomUUID()})}><X size={16}/></button></span>)}{preview&&<audio controls src={preview}/>}</div><form className="composer" onSubmit={e=>{e.preventDefault();if(!recording)void submit()}}><input ref={fileInput} type="file" multiple hidden accept="image/jpeg,image/png,image/webp,image/gif,audio/*,.txt,.md,.pdf,.docx" onChange={e=>{files(Array.from(e.target.files||[]));e.target.value=''}}/><button type="button" aria-label="Прикрепить файлы" disabled={working||recording} onClick={()=>fileInput.current?.click()}><Paperclip size={20}/></button><label className="sr-only" htmlFor="live-message">Сообщение</label><textarea id="live-message" rows={1} maxLength={6000} value={draft.text} disabled={working} onChange={e=>change({...draft,text:e.target.value,key:crypto.randomUUID()})} placeholder="Сообщение…"/>{recording?<button type="button" aria-label={immediateVoice?"Отменить запись":"Завершить запись"} title={immediateVoice?"Отменить запись":"Завершить запись"} onClick={immediateVoice?cancelRecording:finishRecording}><Square size={18}/></button>:<button type="button" aria-label="Записать голосовое" disabled={working} onClick={()=>void record()}><Mic size={20}/></button>}{recording?<button type="button" aria-label={immediateVoice?"Отправить голосовое":"Отменить запись"} title={immediateVoice?"Отправить голосовое":"Отменить запись"} disabled={immediateVoice&&busy} onClick={immediateVoice?finishRecording:cancelRecording}>{immediateVoice?<ArrowUp size={21}/>:<X size={18}/>}</button>:<button disabled={working||busy||(!draft.text.trim()&&!draft.files.length)} aria-label="Отправить сообщение"><ArrowUp size={21}/></button>}</form>{working&&<small role="status">{progress}</small>}</div>
 }
 
 export function MediaAttachments({items,product,context}:{items?:Attachment[];product:string;context:string}){

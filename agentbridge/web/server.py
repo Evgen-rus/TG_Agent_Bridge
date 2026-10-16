@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 def make_server(root: Path, store, data, origin, port=18082):
+    from .push import PushService
+    push = PushService(store)
     parsed_origin = urlsplit(origin)
     if parsed_origin.scheme != 'https' or not parsed_origin.netloc or parsed_origin.path:
         raise ValueError('AGENTBRIDGE_WEB_ORIGIN must be an HTTPS origin without a path')
@@ -122,6 +124,18 @@ def make_server(root: Path, store, data, origin, port=18082):
                         return self.send(200,{'ok':True},cookie=f'{cookie_name}=; Path=/{product}/; Secure; HttpOnly; SameSite=Strict; Max-Age=0')
                     if endpoint == 'api/contexts' and not mutation:
                         return self.send(200,data.contexts(user,product))
+                    if endpoint == 'api/push-config' and not mutation and product=='rick':
+                        return self.send(200,push.config(user,token))
+                    if endpoint == 'api/push-subscribe' and mutation and product=='rick':
+                        store.throttle('push:'+str(user['id']),limit=10,seconds=60)
+                        return self.send(200,push.subscribe(user,token,payload.get('subscription')))
+                    if endpoint == 'api/push-unsubscribe' and mutation and product=='rick':
+                        return self.send(200,push.unsubscribe(user,token))
+                    if endpoint == 'api/telegram' and not mutation and product=='rick' and user['role']=='owner':
+                        return self.send(200,{'url':data.telegram_url(data.owner_chat) if data.owner_chat else ''})
+                    if endpoint == 'api/reminder' and not mutation and product=='rick':
+                        ident = int(parse_qs(urlsplit(self.path).query).get('id',['0'])[0])
+                        return self.send(200,data.reminder(user,ident))
                     if endpoint == 'api/invite-contexts' and not mutation and user['role']=='owner':
                         target = parse_qs(urlsplit(self.path).query).get('product',[''])[0]
                         if target not in ('rick','sally'):
@@ -168,6 +182,10 @@ def make_server(root: Path, store, data, origin, port=18082):
                         return self.send(200,data.detail(user,product,context))
                     if endpoint == 'api/history' and not mutation:
                         return self.send(200,store.history(user,product,context))
+                    if endpoint == 'api/reminder-action' and mutation and product=='rick':
+                        job = store.reminder_action(user,context,payload.get('job_id'),payload.get('revision'),
+                                                    payload.get('action'),payload.get('text',''))
+                        return self.send(202,{'id':job})
                     if endpoint == 'api/ask' and mutation:
                         store.throttle('ask:'+str(user['id']),limit=30,seconds=60)
                         text = payload.get('text','')

@@ -56,6 +56,12 @@ class WebStore:
             ''')
             if 'prepared' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN prepared TEXT NOT NULL DEFAULT ''")
+            columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
+            for name, declaration in [('task_id', 'INTEGER'), ('revision', 'INTEGER NOT NULL DEFAULT 0'),
+                                      ('action', "TEXT NOT NULL DEFAULT ''"), ('refinement', "TEXT NOT NULL DEFAULT ''"),
+                                      ('can_confirm', 'INTEGER NOT NULL DEFAULT 0')]:
+                if name not in columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {declaration}')
         if os.name=='posix':
             path.chmod(0o600)
 
@@ -188,8 +194,45 @@ class WebStore:
         with self.connect() as db:
             db.execute('UPDATE jobs SET state=?,result=?,updated=? WHERE id=?', (state, result, time.time(), job_id))
 
+    def reminder_review(self, job_id, task_id, text, can_confirm):
+        with self.connect() as db:
+            db.execute("""UPDATE jobs SET task_id=?,state='review',result=?,can_confirm=?,
+                revision=revision+1,updated=? WHERE id=?""", (task_id,text,int(can_confirm),time.time(),job_id))
+
+    def reminder_action(self, user, context, job_id, revision, action, text=''):
+        if user['role'] != 'owner' or not self.allowed(user,'rick',context):
+            raise WebError(403,'Напоминания доступны владельцу')
+        if type(job_id) is not int or type(revision) is not int or action not in ('confirm','cancel','refine'):
+            raise WebError(400,'Некорректное подтверждение')
+        if not isinstance(text,str) or len(text)>6000 or (action=='refine' and not text.strip()):
+            raise WebError(400,'Напишите уточнение до 6000 символов')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute("SELECT * FROM jobs WHERE id=? AND user_id=? AND product='rick' AND context=?",
+                             (job_id,user['id'],context)).fetchone()
+            if not job or not job['task_id']:
+                raise WebError(404,'Напоминание недоступно')
+            if job['revision'] != revision:
+                raise WebError(409,'Карточка изменилась. Обновите диалог')
+            if job['state'] != 'review':
+                if job['action']==action and job['refinement']==text.strip():
+                    return job_id
+                raise WebError(409,'Действие уже принято. Обновите диалог')
+            if action=='confirm' and not job['can_confirm']:
+                raise WebError(409,'Сначала уточните время и текст напоминания')
+            db.execute("UPDATE jobs SET state='pending',action=?,refinement=?,updated=? WHERE id=?",
+                       (action,text.strip(),time.time(),job_id))
+        return job_id
+
     def interrupted(self, product):
         with self.connect() as db:
+            if product == 'rick':
+                # Fixed reminder actions are replayable; arbitrary model turns are not.
+                db.execute("""UPDATE jobs SET state='pending' WHERE product='rick' AND state='running'
+                    AND task_id IS NOT NULL AND action IN ('confirm','cancel')""")
+                db.execute("""UPDATE jobs SET state='review',can_confirm=0,revision=revision+1,
+                    result='Уточнение было прервано. Уточните дату, время и текст ещё раз.'
+                    WHERE product='rick' AND state='running' AND task_id IS NOT NULL AND action='refine'""")
             if product == 'sally':
                 # Only Sally's persisted ingest and acknowledged sends can safely resume.
                 db.execute("""UPDATE jobs SET state='pending' WHERE product='sally' AND state='running'
@@ -201,7 +244,7 @@ class WebStore:
         if not self.allowed(user, product, context):
             raise WebError(403, 'Нет доступа')
         with self.connect() as db:
-            rows = [dict(r) for r in db.execute('''SELECT j.id,j.payload,j.state,j.result,j.created,j.prepared,u.name AS author FROM jobs j JOIN users u ON u.id=j.user_id
+            rows = [dict(r) for r in db.execute('''SELECT j.id,j.payload,j.state,j.result,j.created,j.prepared,j.task_id,j.revision,j.can_confirm,u.name AS author FROM jobs j JOIN users u ON u.id=j.user_id
                 WHERE (j.user_id=? OR (?='rick' AND u.role='rick')) AND j.product=? AND j.context=? ORDER BY j.id DESC LIMIT 30''',
                 (user['id'], product, product, context))][::-1]
             for row in rows:

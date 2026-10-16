@@ -1198,6 +1198,7 @@ class AgentBridgeApplication:
     async def _prepare_general_task(
         self, request: str, task_id: int | None = None, *,
         related_chat: ChatConfig | None = None, author: dict | None = None, reminder_only: bool = False,
+        allowed_kinds: set[str] | None = None,
     ) -> OwnerQueryResult | None:
         planner = getattr(self.owner_provider, "plan_general_task", None)
         if planner is None:
@@ -1222,7 +1223,7 @@ class AgentBridgeApplication:
             if reminder_only:
                 return None
             return OwnerQueryResult(self._owner_failure_text(exc, what="понимание задачи"))
-        if not isinstance(plan, GeneralTaskPlan) or (reminder_only and plan.kind not in {"reminder", "leadrecord_analytics"}):
+        if not isinstance(plan, GeneralTaskPlan) or (reminder_only and plan.kind not in {"reminder", "leadrecord_analytics"}) or (allowed_kinds is not None and plan.kind not in allowed_kinds):
             return None if reminder_only else OwnerQueryResult("Не удалось подготовить понимание задачи.")
         self.store.save_owner_query_thread(0, "Общие задачи", plan.thread_id,
             prompt_version=getattr(self.owner_provider, "prompt_version", None))
@@ -1427,15 +1428,7 @@ class AgentBridgeApplication:
                 if not future or not reminder_text:
                     self.store.set_general_task_status(task_id, "executing", "failed")
                     return OwnerQueryResult("Не хватает точного времени или текста напоминания. Уточните задачу заново.")
-                reminder_id = self.create_reminder(
-                    remind_at, reminder_text,
-                    related_chat_id=task.payload.get("related_chat_id"),
-                    related_chat_name=task.payload.get("related_chat_name"),
-                    created_by_user_id=task.payload.get("created_by_user_id"),
-                    created_by_username=task.payload.get("created_by_username"),
-                    created_by_name=task.payload.get("created_by_name"),
-                )
-                self.store.set_general_task_status(task_id, "executing", "done")
+                reminder_id = self.store.complete_reminder_task(task_id)
                 return OwnerQueryResult(
                     f"Напоминание #{reminder_id} сохранено на {task.payload.get('local_label') or remind_at} ({self.owner_timezone}).",
                     general_task_id=task_id,

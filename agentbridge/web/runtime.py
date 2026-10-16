@@ -29,6 +29,7 @@ class WebRuntime:
         self.root, self.product, self.service, self.settings = root, product, service, settings
         self.store = WebStore(root / 'runtime/web/access.sqlite3')
         self.task = self.server = None
+        self.notification_task = None
 
     async def start(self, app):
         self.app = app
@@ -44,8 +45,13 @@ class WebRuntime:
                            sales_path,sales_chat,self.settings.owner_chat_id)
             self.server = start_server(self.root, self.store, data)
         self.task = asyncio.create_task(self.run(), name='web-'+self.product)
+        if self.product == 'rick':
+            self.notification_task = asyncio.create_task(self.notifications(), name='web-rick-notifications')
 
     async def stop(self, app):
+        if self.notification_task:
+            self.notification_task.cancel()
+            await asyncio.gather(self.notification_task, return_exceptions=True)
         if self.task:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
@@ -76,9 +82,19 @@ class WebRuntime:
                     if not chat:
                         raise WebError(404, 'Чат недоступен')
                     materials = TemporaryDirectory(prefix='rick-document-')
+                    if user['role']=='owner' and job.get('task_id') and job.get('action'):
+                        await self.reminder_action(job,user,chat)
+                        continue
                     question, attachments = await self.prepare_rick(job,user,payload,Path(materials.name))
                     async with self.service._chat_locks.setdefault(chat.telegram_chat_id, asyncio.Lock()):
                         if user['role'] == 'owner':
+                            planned = await self.service._prepare_general_task(
+                                question, related_chat=chat, reminder_only=True, allowed_kinds={'reminder'},
+                                author={'created_by_name':user['name'], 'web_user_id':user['id'], 'web_job_id':job['id']},
+                            )
+                            if planned is not None:
+                                self.review_reminder(job,planned)
+                                continue
                             result = await self.service._answer_owner_query_for_chat(chat, question, attachments=attachments)
                         else:
                             # No owner thread, context file, tools or persistent member memory.
@@ -104,6 +120,94 @@ class WebRuntime:
             finally:
                 if materials:
                     materials.cleanup()
+
+    @staticmethod
+    def valid_reminder(task):
+        try:
+            return bool(task and task.kind=='reminder' and task.payload.get('reminder_text') and
+                        datetime.fromisoformat(task.payload.get('remind_at_utc','')) > datetime.now(timezone.utc))
+        except (TypeError,ValueError):
+            return False
+
+    def review_reminder(self,job,result):
+        task = self.service.store.get_general_task(result.general_task_id) if result.general_task_id else None
+        if task is None or task.kind!='reminder':
+            self.store.finish(job['id'],'error',result.text)
+            return
+        text = result.text + '\n\nУведомление придёт в Telegram и в приложение, если уведомления включены.'
+        self.store.reminder_review(job['id'],task.id,text,self.valid_reminder(task))
+
+    async def reminder_action(self,job,user,chat):
+        task = self.service.store.get_general_task(job['task_id'])
+        if (task is None or task.kind!='reminder' or task.owner_chat_id!=self.service.owner_chat_id or
+            task.payload.get('web_user_id')!=user['id'] or task.payload.get('web_job_id')!=job['id'] or
+            task.payload.get('related_chat_id')!=chat.telegram_chat_id):
+            raise WebError(403,'Напоминание недоступно')
+        if task.status=='executing' and job['action']=='confirm':
+            # The atomic reminder commit would have changed this state to done.
+            self.service.store.set_general_task_status(task.id,'executing','confirming')
+            task = self.service.store.get_general_task(task.id)
+        if task.status!='confirming':
+            if task.status=='done' and job['action']=='confirm' and task.payload.get('reminder_id'):
+                self.store.finish(job['id'],'done',f"Напоминание #{task.payload['reminder_id']} сохранено на {task.payload.get('local_label') or task.payload['remind_at_utc']} ({self.service.owner_timezone}).")
+                return
+            if task.status=='cancelled' and job['action']=='cancel':
+                self.store.finish(job['id'],'done','Напоминание отменено.')
+                return
+            self.store.finish(job['id'],'uncertain','Подтверждение уже обработано. Проверьте список напоминаний перед повтором.')
+            return
+        if job['action']=='refine':
+            request = task.request_text + '\n\nУточнение владельца:\n' + job['refinement']
+            result = await self.service._prepare_general_task(
+                request,task_id=task.id,related_chat=chat,reminder_only=True,allowed_kinds={'reminder'},
+                author={'created_by_name':user['name'],'web_user_id':user['id'],'web_job_id':job['id']},
+            )
+            if result is None:
+                self.store.reminder_review(job['id'],task.id,'Уточните дату, время и текст напоминания.',False)
+            else:
+                self.review_reminder(job,result)
+            return
+        if job['action']=='confirm' and not self.valid_reminder(task):
+            self.store.reminder_review(job['id'],task.id,'Время уже прошло или не задано. Уточните время и текст напоминания.',False)
+            return
+        result = await self.service.handle_general_task_action(task.id,job['action'],self.service.owner_chat_id)
+        self.store.finish(job['id'],'done',result.text)
+
+    async def notifications(self):
+        from .push import PushService
+        push = PushService(self.store)
+        while True:
+            try:
+                await asyncio.to_thread(self.queue_notifications,push)
+                await asyncio.to_thread(push.flush)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('event=web_push_failed error_type=%s',type(exc).__name__)
+            await asyncio.sleep(2)
+
+    def queue_notifications(self,push):
+        import time
+        cutoff = time.time()-86400
+        with self.store.connect() as db:
+            jobs = db.execute("""SELECT id,user_id,context,state,revision,updated FROM jobs
+                WHERE product='rick' AND state IN ('done','review','error','uncertain') AND updated>=?""",(cutoff,)).fetchall()
+            owners = db.execute("SELECT id FROM users WHERE role='owner' AND disabled=0").fetchall()
+        for job in jobs:
+            if self.service.registry.get(int(job['context'])):
+                push.enqueue(job['user_id'],f"answer:{job['id']}:{job['revision']}:{job['state']}",job['context'],
+                             'answer',created_at=job['updated'])
+        with self.service.store._connect() as db:
+            reminders = db.execute("""SELECT id,related_chat_id,remind_at_utc FROM reminders
+                WHERE owner_chat_id=? AND julianday(remind_at_utc)<=julianday('now')
+                AND julianday(remind_at_utc)>=julianday('now','-1 day')""",(self.service.owner_chat_id,)).fetchall()
+        for reminder in reminders:
+            context = str(reminder['related_chat_id']) if reminder['related_chat_id'] else ''
+            if context and not self.service.registry.get(int(context)):
+                continue
+            for owner in owners:
+                push.enqueue(owner['id'],f"reminder:{reminder['id']}",context,'reminder',
+                             created_at=datetime.fromisoformat(reminder['remind_at_utc']).timestamp())
 
     async def sales(self, job, user, payload):
         topic = int(job['context'])

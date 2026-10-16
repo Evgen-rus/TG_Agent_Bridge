@@ -24,6 +24,16 @@ class WebData:
         self.rick_path, self.sales_path, self.sales_chat = rick_path, sales_path, sales_chat
         self.owner_chat = owner_chat
 
+    def reminder(self,user,ident):
+        if user['role']!='owner' or not WebStore.allowed(user,'rick'):
+            raise WebError(403,'Напоминание доступно владельцу')
+        with reader(self.rick_path) as db:
+            row = db.execute('''SELECT id,text AS action,remind_at_utc,sent_at,related_chat_name
+                FROM reminders WHERE id=? AND owner_chat_id=?''',(ident,self.owner_chat)).fetchone()
+        if not row:
+            raise WebError(404,'Напоминание недоступно')
+        return dict(row)
+
     def contexts(self, user, product):
         if not WebStore.allowed(user, product):
             raise WebError(403, 'Нет доступа к приложению')
