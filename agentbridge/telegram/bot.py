@@ -25,7 +25,7 @@ from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingDraftProposal, OnboardingNotice, OwnerQueryResult, QuestionReplyResult
-from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, media_file_ready, purge_expired_media
+from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, media_file_ready
 from agentbridge.restart import self_restart_supported, spawn_restart_helper
 from agentbridge.transcribe import TranscriptionError, transcribe_audio_file
 from .formatter import (
@@ -791,24 +791,12 @@ def create_telegram_application(
                     logger.exception("event=daily_report_queue_failed component=telegram")
         pending_queries = getattr(message_service, "pending_owner_query_deliveries", None)
         query_results = []
-        query_scan_succeeded = pending_queries is None
         if pending_queries is not None:
             try:
                 query_results = pending_queries()
-                query_scan_succeeded = True
             except Exception:
                 logger.exception("event=owner_query_delivery_scan_failed")
-        if media_dir is not None:
-            store = getattr(message_service, "store", None)
-            retained = store.retained_document_paths() if store is not None else set()
-            retained.update(
-                result.media_path for result in query_results
-                if isinstance(result, OwnerQueryResult) and result.media_path
-            )
-            if query_scan_succeeded:
-                purge_expired_media(media_dir, media_ttl_seconds, retained_paths=retained)
-            else:
-                logger.warning("event=media_purge_skipped reason=owner_query_delivery_scan_failed")
+        # Original attachment retention runs through the daily cleanup command.
         pending = getattr(message_service, "pending_suggestions", None)
         if pending is not None:
             try:
@@ -1050,7 +1038,7 @@ def create_telegram_application(
         if listing is None or media_dir is None:
             return
         for row in listing.list_chat_attachments(chat_id):
-            if media_file_ready(row.media_path) or not row.telegram_file_id:
+            if row.download_status == 'expired' or media_file_ready(row.media_path) or not row.telegram_file_id:
                 continue
             ref = MediaRef(kind="document", file_id=row.telegram_file_id, filename=row.media_filename, mime=row.media_mime)
             path = await materialize_media_ref(application.bot, ref, media_dir, row.chat_id,

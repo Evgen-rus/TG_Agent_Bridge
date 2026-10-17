@@ -56,6 +56,8 @@ class WebStore:
             ''')
             if 'prepared' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN prepared TEXT NOT NULL DEFAULT ''")
+            if 'removed' not in {r[1] for r in db.execute('PRAGMA table_info(media)')}:
+                db.execute("ALTER TABLE media ADD COLUMN removed TEXT NOT NULL DEFAULT ''")
             columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
             for name, declaration in [('task_id', 'INTEGER'), ('revision', 'INTEGER NOT NULL DEFAULT 0'),
                                       ('action', "TEXT NOT NULL DEFAULT ''"), ('refinement', "TEXT NOT NULL DEFAULT ''"),
@@ -170,7 +172,7 @@ class WebStore:
             for item in payload.get('attachments',[]):
                 media = db.execute('SELECT * FROM media WHERE id=? AND user_id=? AND product=? AND context=? AND job_id IS NULL',
                     (item,user['id'],product,context)).fetchone()
-                if not media or not Path(media['path']).is_file():
+                if not media or media['removed'] or not Path(media['path']).is_file():
                     raise WebError(409,'Вложение недоступно или уже использовано')
             if db.execute("SELECT 1 FROM jobs WHERE user_id=? AND state IN ('pending','running','waiting','review')", (user['id'],)).fetchone():
                 raise WebError(409, 'Дождитесь завершения предыдущего запроса')
@@ -226,6 +228,7 @@ class WebStore:
 
     def interrupted(self, product):
         with self.connect() as db:
+            db.execute('UPDATE media SET requested=1 WHERE product=? AND requested=2',(product,))
             if product in ('rick','sally'):
                 # Fixed reminder actions are replayable; arbitrary model turns are not.
                 db.execute("""UPDATE jobs SET state='pending' WHERE product=? AND state='running'
@@ -261,6 +264,9 @@ class WebStore:
                                  (ident, user['id'], product, context)).fetchone()
                 if not row:
                     raise WebError(404, 'Вложение недоступно')
+                if row['removed']:
+                    from agentbridge.retention import EXPIRED_MESSAGE, QUOTA_MESSAGE
+                    raise WebError(410, EXPIRED_MESSAGE if row['removed']=='expired' else QUOTA_MESSAGE)
                 result.append(dict(row))
         return result
 

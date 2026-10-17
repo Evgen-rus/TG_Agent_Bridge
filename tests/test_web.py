@@ -524,6 +524,21 @@ def test_binary_upload_auth_csrf_scope_private_read_and_mime(web,http):
         assert db.execute('SELECT requested FROM media WHERE id=?',(media['id'],)).fetchone()[0]==1
 
 
+def test_expired_media_http_410_never_queues_telegram_download(web,http):
+    from test_media_retention import attachment
+    from agentbridge.web.media import cleanup
+    actor, token = user(web.access,'sergey',[],'sally')
+    path = attachment(web.access,1,user=actor['id'])
+    with web.access.connect() as db:
+        db.execute("UPDATE media SET product='sally',context='101',event_id=1")
+    cleanup(web.access)
+    status, _, body = http('GET','/sally/api/media?context=101&id=1',headers={'Cookie':'__Secure-sally_sid='+token})
+    assert status==410 and 'Вложение удалено по сроку хранения (30 дней)' in json.loads(body)['error']
+    assert not path.exists()
+    with web.access.connect() as db:
+        assert db.execute('SELECT requested FROM media').fetchone()[0]==0
+
+
 def test_sally_shared_chronology_authorship_reply_and_context_boundaries(web):
     actor,_=user(web.access,'sergey',[],'sally')
     web.sales.ingest(update_id=1,chat_id=-100,topic_id=101,title='Deal',message_id=20,

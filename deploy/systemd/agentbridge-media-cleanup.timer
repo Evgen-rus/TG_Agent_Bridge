@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily attachment cleanup at 08:00 Novosibirsk
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Asia/Novosibirsk
+Persistent=true
+AccuracySec=1s
+Unit=agentbridge-media-cleanup.service
+
+[Install]
+WantedBy=timers.target

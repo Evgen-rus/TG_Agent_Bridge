@@ -1791,7 +1791,9 @@ class AgentBridgeApplication:
         self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None, attachments=(),
     ) -> str:
         async with self._owner_query_locks.setdefault(chat.telegram_chat_id, asyncio.Lock()):
-            return await self._answer_owner_query_for_chat_locked(chat, question, scope=scope, attachments=attachments)
+            from .retention import media_lock
+            with media_lock(self.store.database_path.parent, shared=True):
+                return await self._answer_owner_query_for_chat_locked(chat, question, scope=scope, attachments=attachments)
 
     async def _answer_owner_query_for_chat_locked(
         self, chat: ChatConfig, question: str, *, scope: OwnerQueryScope | None = None, attachments=(),

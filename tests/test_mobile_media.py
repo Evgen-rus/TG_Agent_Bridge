@@ -211,6 +211,26 @@ async def test_remote_media_metadata_can_be_recovered_without_business_duplicati
 
 
 @pytest.mark.asyncio
+async def test_expired_telegram_cache_never_downloads_again(setup):
+    s = setup
+    s.store.ingest(update_id=1,chat_id=-100,topic_id=101,title='Deal',message_id=12,author_id=5,author='User',
+        date='2020-01-01T00:00:00+00:00',text='permanent',media=dict(file_id='old',filename='screen.png',kind='photo'))
+    async def forbidden(file_id):
+        pytest.fail('Expired attachment must not be downloaded')
+    s.bot.get_file = forbidden
+    await s.runtime.refresh_media()
+    with s.access.connect() as db:
+        db.execute("UPDATE media SET requested=1")
+    s.runtime._last_media_refresh = 0
+    await s.runtime.refresh_media()
+    with s.access.connect() as db:
+        row = db.execute('SELECT removed,requested FROM media').fetchone()
+        assert tuple(row)==('expired',0)
+    with s.store.connect() as db:
+        assert db.execute('SELECT text FROM events').fetchone()[0]=='permanent'
+
+
+@pytest.mark.asyncio
 async def test_rick_uses_shared_transcriber_and_document_parser_without_telegram(setup,monkeypatch):
     s=setup
     s.runtime.product='rick'

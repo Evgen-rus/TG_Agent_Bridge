@@ -260,7 +260,8 @@ def test_owner_document_without_forward_is_classified_and_listed(tmp_path, chat_
 
 
 @pytest.mark.asyncio
-async def test_processed_document_is_refetched_for_owner_query(tmp_path, chat_registry, monkeypatch) -> None:
+@pytest.mark.parametrize('expired',[False,True])
+async def test_processed_document_is_refetched_for_owner_query(tmp_path, chat_registry, monkeypatch, expired) -> None:
     store = ChatThreadStore(tmp_path / "agentbridge.sqlite3")
     store.ingest_telegram_message(
         update_id=11, chat_id=-100123456, message_id=10, sender_id=5, sender_name="Alice",
@@ -277,13 +278,21 @@ async def test_processed_document_is_refetched_for_owner_query(tmp_path, chat_re
     service = AgentBridgeApplication(chat_registry, store, FakeProvider(), owner_chat_id=7654321, owner_provider=owner_provider)
     create_telegram_application(token="test-token", owner_chat_id=7654321, message_service=service, batch_seconds=0, media_dir=tmp_path / "media")
     async def fetch(_bot, _ref, root, chat_id, message_id):
+        assert not expired, 'Expired attachment must not be downloaded'
         path = root / str(chat_id) / f"{message_id}_recovered.pdf"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"%PDF recovered")
         return path
     monkeypatch.setattr("agentbridge.telegram.bot.materialize_media_ref", fetch)
+    if expired:
+        with store._connect() as db:
+            db.execute("UPDATE telegram_messages SET download_status='expired'")
     await service._answer_owner_query_for_chat(chat_registry.get(-100123456), "Проверь счёт 580")
     row = store.list_chat_attachments(-100123456)[0]
+    if expired:
+        assert row.download_status=='expired' and not row.media_path
+        assert 'attachments' not in owner_provider.calls[-1]
+        return
     assert row.download_status == "available"
     assert Path(row.media_path).read_bytes() == b"%PDF recovered"
     assert len(owner_provider.calls[-1]["attachments"]) == 1

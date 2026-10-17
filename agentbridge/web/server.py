@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import threading
+import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .store import WebError
@@ -177,19 +178,32 @@ def make_server(root: Path, store, data, origin, port=18082):
                             query.get('filename',['file'])[0],self.rfile,length))
                     if endpoint == 'api/media' and not mutation:
                         ident = query.get('id',[''])[0]
-                        with store.connect() as db:
+                        from agentbridge.retention import EXPIRED_MESSAGE, QUOTA_MESSAGE, media_lock, RETENTION_SECONDS
+                        with media_lock(store.path.parent,shared=True), store.connect() as db:
+                            db.execute('BEGIN IMMEDIATE')
                             row = db.execute('SELECT * FROM media WHERE id=? AND product=? AND context=?', (ident,product,context)).fetchone()
                             shared = row and row['job_id'] and db.execute("SELECT 1 FROM jobs j JOIN users u ON u.id=j.user_id WHERE j.id=? AND u.role='rick'",(row['job_id'],)).fetchone()
                             if not row or (row['user_id'] != user['id'] and not (product=='sally' and row['event_id'] is not None) and row['user_id'] != 0 and not shared):
                                 raise WebError(404,'Вложение недоступно')
+                            state = db.execute('SELECT state FROM jobs WHERE id=?',(row['job_id'],)).fetchone()
+                            expired = row['created'] < time.time()-RETENTION_SECONDS and (row['job_id'] is None or (state and state['state']=='done'))
+                            if row['removed'] or expired:
+                                reason = row['removed'] or 'expired'
+                                db.execute('UPDATE media SET removed=?,requested=CASE WHEN requested=2 THEN 2 ELSE 0 END WHERE id=?',(reason,ident))
+                                db.commit()
+                                raise WebError(410,EXPIRED_MESSAGE if reason=='expired' else QUOTA_MESSAGE)
                             file = Path(row['path'])
-                            missing = not file.is_relative_to(store.path.parent/'media') or not file.is_file()
+                            from agentbridge.retention import safe_path
+                            file = safe_path(file,store.path.parent/'media')
+                            missing = file is None or not file.is_file()
                             if missing:
-                                db.execute('UPDATE media SET requested=1 WHERE id=?', (ident,))
+                                db.execute('UPDATE media SET requested=1 WHERE id=? AND requested=0', (ident,))
+                            else:
+                                content = file.read_bytes()
                         # Commit the download request before returning an HTTP error.
                         if missing:
                             raise WebError(409,'Загружаем вложение из Telegram. Повторите через несколько секунд.')
-                        return self.send(200,file.read_bytes(),row['mime'])
+                        return self.send(200,content,row['mime'])
                     if endpoint == 'api/detail' and not mutation:
                         return self.send(200,data.detail(user,product,context))
                     if endpoint == 'api/history' and not mutation:

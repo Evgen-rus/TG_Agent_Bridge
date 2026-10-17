@@ -890,9 +890,21 @@ upload concurrency/rate/quota) with product/context/user ACL, Origin and CSRF.
 SQLite stores private random file IDs and Telegram references; bytes are below
 `runtime/web/media`, never static assets. Media GET validates current context and
 membership before reading; missing Telegram copies are downloaded by the existing
-bot process on demand. The local cache expires after seven days when Telegram can
-restore it; unsent and Rick source uploads are retained, within a 200 MiB account
-quota. Only immutable frontend assets are eligible for service-worker caching.
+bot process on demand until retention expires. Originals expire after 30 days
+from initial ingest/upload, without resetting age on download. The daily
+`python -m agentbridge.cleanup_media --apply` command only visits `runtime/media`
+(excluding `owner_generated`), `runtime/sales_buddy/audio`,
+`runtime/sales_buddy/images` and `runtime/web/media`. Default is preview.
+`agentbridge-media-cleanup.timer` runs at 08:00 Asia/Novosibirsk with persistent
+catch-up after reboot. Kernel file locks serialize cleaners/uploads and protect
+active owner document reads; SQLite transactions protect queued/running jobs.
+Unfinished/error/uncertain Web jobs and active downloads are retained. Under the
+200 MiB per-account quota, oldest completed originals may be evicted earlier;
+unattributed Telegram cache is excluded. Durable tombstones prevent re-download
+(HTTP 410, existing inline error UI). Unreferenced files require 30 days of age,
+generated-name/path checks, and no unfinished Telegram source that could own them.
+No messages, transcripts, extracted text, memory, facts or threads are deleted.
+Only immutable frontend assets are eligible for service-worker caching.
 
 Images use real-content Pillow validation on Web upload and the existing agent
 image mechanisms; Sally albums share one batch. Browser MediaRecorder audio uses

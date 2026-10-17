@@ -13,6 +13,9 @@ from agentbridge.media import MAX_DOWNLOAD_BYTES, safe_filename
 from agentbridge.sales.images import image_suffix
 from agentbridge.sales.audio import audio_suffix
 from .store import WebError
+from agentbridge.retention import RETENTION_SECONDS, media_lock, orphan_files, remove_file, safe_path
+
+USER_QUOTA = 200 * 1024 * 1024
 
 
 def classify(path, filename):
@@ -56,7 +59,8 @@ def upload(store, user, product, context, filename, stream, size):
     if not _upload_slots.acquire(blocking=False):
         raise WebError(429, 'Загрузка занята. Повторите через несколько секунд.')
     try:
-        return _upload(store,user,product,context,filename,stream,size)
+        with media_lock(store.path.parent):
+            return _upload(store,user,product,context,filename,stream,size)
     finally:
         _upload_slots.release()
 
@@ -69,11 +73,12 @@ def _upload(store, user, product, context, filename, stream, size):
     folder.mkdir(parents=True, exist_ok=True)
     if os.name == 'posix':
         folder.chmod(0o700)
-    cleanup(store)
+    _cleanup(store)
+    _cleanup(store, user_id=user['id'], incoming=size)
     with store.connect() as db:
         rows = db.execute('SELECT path FROM media WHERE user_id=?', (user['id'],)).fetchall()
-    if sum(Path(r['path']).stat().st_size for r in rows if Path(r['path']).is_file()) + size > 200 * 1024 * 1024:
-        raise WebError(413, 'Достигнут лимит вложений 200 МБ; дождитесь очистки кеша.')
+    if sum(Path(r['path']).stat().st_size for r in rows if Path(r['path']).is_file()) + size > USER_QUOTA:
+        raise WebError(413, 'Недостаточно места: лимит вложений 200 МБ. Файлы незавершённых задач сохранены; завершите задачи или загрузите меньший файл.')
     ident = uuid4().hex
     temp = folder / (ident+'.part')
     try:
@@ -101,18 +106,53 @@ def _upload(store, user, product, context, filename, stream, size):
         temp.unlink(missing_ok=True)
 
 
-def cleanup(store):
-    folder=store.path.parent/'media'
-    if folder.is_dir():
-        for path in folder.glob('*.part'):
-            if path.stat().st_mtime<time.time()-3600:
-                path.unlink(missing_ok=True)
+def cleanup(store, *, dry_run=False):
+    with media_lock(store.path.parent):
+        return _cleanup(store, dry_run=dry_run)
+
+
+def _cleanup(store, *, dry_run=False, user_id=None, incoming=0):
+    folder = store.path.parent/'media'
+    cutoff = time.time()-RETENTION_SECONDS
+    counts = [0, 0, 0]
     with store.connect() as db:
-        rows = db.execute('''SELECT * FROM media WHERE created<? AND
-            (file_id!='' OR (job_id IS NULL AND user_id>0))''', (time.time()-7*86400,)).fetchall()
+        # Enqueue/claim cannot race the decision to evict a completed upload.
+        db.execute('BEGIN IMMEDIATE')
+        rows = db.execute('''SELECT m.*,j.state AS job_state FROM media m
+            LEFT JOIN jobs j ON j.id=m.job_id ORDER BY m.created,m.id''').fetchall()
+        known = {str(Path(r['path']).absolute()) for r in rows}
+        total = sum(p.stat().st_size for r in rows if r['user_id']==user_id
+                    and (p:=safe_path(r['path'],folder)) and p.is_file())
         for row in rows:
-            path = Path(row['path'])
-            if path.is_relative_to(store.path.parent/'media'):
-                path.unlink(missing_ok=True)
-            if not row['file_id']:
-                db.execute('DELETE FROM media WHERE id=?', (row['id'],))
+            if not db.in_transaction:
+                db.execute('BEGIN IMMEDIATE')
+            row = db.execute('''SELECT m.*,j.state AS job_state FROM media m
+                LEFT JOIN jobs j ON j.id=m.job_id WHERE m.id=?''',(row['id'],)).fetchone()
+            sending = db.execute("SELECT 1 FROM web_delivery WHERE job_id=? AND state!='sent' LIMIT 1",(row['job_id'],)).fetchone()
+            if sending or row['requested']==2 or (row['job_id'] is not None and row['job_state']!='done'):
+                continue
+            aged = row['created'] < cutoff
+            quota = user_id is not None and user_id>0 and row['user_id']==user_id and total+incoming>USER_QUOTA
+            if not row['removed'] and not aged and not (quota and row['job_state']=='done'):
+                continue
+            path = safe_path(row['path'],folder)
+            if path is None:
+                continue
+            if not dry_run:
+                # Durable tombstone first; a crash may leave bytes, never a re-download.
+                db.execute('UPDATE media SET removed=?,requested=0 WHERE id=?',
+                           (row['removed'] or ('expired' if aged else 'quota'),row['id']))
+                db.commit()
+            result = remove_file(path,dry_run=dry_run)
+            counts = [a+b for a,b in zip(counts,result)]
+            if not result[2]:
+                if row['user_id']==user_id:
+                    total -= result[1]
+        if user_id is None:
+            if not db.in_transaction:
+                db.execute('BEGIN IMMEDIATE')
+            known.update(str(Path(r[0]).with_suffix('.part').absolute()) for r in
+                         db.execute('SELECT path FROM media WHERE requested=2'))
+            for path in orphan_files(folder,known):
+                counts = [a+b for a,b in zip(counts,remove_file(path,dry_run=dry_run))]
+    return dict(files=counts[0], bytes=counts[1], errors=counts[2])

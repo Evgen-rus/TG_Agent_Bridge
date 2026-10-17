@@ -69,9 +69,13 @@ TXT/MD/PDF/DOCX and browser voice recording with preview/cancel. `api/upload` is
 a separate binary endpoint with Origin, CSRF, authentication, context ACL,
 rate/concurrency limits and a 200 MiB local-source quota per account. Media bytes
 are private and are served only by an authorized `api/media` request, never by
-static paths. A Telegram-backed cache may be evicted after seven days and fetched
-again; unsent and Rick source uploads are retained within quota. Expired unused
-uploads and abandoned partial files are removed. Images are magic-byte and
+static paths. Original files expire after 30 days; unfinished jobs stay protected.
+Expired attachments return HTTP 410 and are never downloaded from Telegram again.
+When an upload would exceed 200 MiB per user, oldest completed originals may be
+evicted sooner. Pending/error/uncertain jobs remain; insufficient space returns
+an explicit error. Telegram cache with user_id=0 has no user quota.
+Daily cleanup also handles old abandoned partial files; see `Docs/OPERATIONS.md`.
+Images are magic-byte and
 Pillow-verified, limited to 40 million pixels. Audio containers use existing STT
 settings; Android WebM is kept as audio/WebM, sent to Telegram as a document.
 Sally uses the existing durable AudioWorker/ImageWorker; Rick uses its existing

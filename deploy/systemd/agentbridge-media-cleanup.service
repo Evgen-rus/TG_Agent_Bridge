@@ -1,0 +1,15 @@
+[Unit]
+Description=Rick and Sally original attachment retention
+
+[Service]
+Type=oneshot
+User=rick
+Group=rick
+WorkingDirectory=/home/rick/TG_Agent_Bridge
+ExecStart=/home/rick/TG_Agent_Bridge/.venv/bin/python -m agentbridge.cleanup_media --apply
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/rick/TG_Agent_Bridge/runtime

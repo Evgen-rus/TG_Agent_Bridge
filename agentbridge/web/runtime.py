@@ -357,7 +357,7 @@ class WebRuntime:
     async def refresh_media(self):
         if not hasattr(self,'app'):
             return
-        from .media import cleanup
+        from agentbridge.retention import RETENTION_SECONDS
         from agentbridge.media import MAX_DOWNLOAD_BYTES
         import mimetypes
         import time
@@ -368,18 +368,22 @@ class WebRuntime:
         connect = self.service.store.connect if self.product=='sally' else self.service.store._connect
         with connect() as db:
             if self.product=='sally':
-                records = [dict(r) for r in db.execute('''SELECT e.id,e.topic_id,m.metadata FROM event_media m
+                records = [dict(r) for r in db.execute('''SELECT e.id,e.topic_id,e.date,m.metadata FROM event_media m
                     JOIN events e ON e.id=m.event_id WHERE e.chat_id=? AND e.processed>=0 AND e.processed!=2
                     ORDER BY e.id DESC LIMIT 200''',(self.settings.chat_id,))]
             else:
-                records = [dict(id=r['id'],topic_id=r['chat_id'],metadata=json.dumps(dict(file_id=r['telegram_file_id'],
+                records = [dict(id=r['id'],topic_id=r['chat_id'],date=r['created_at'],metadata=json.dumps(dict(file_id=r['telegram_file_id'],
                     kind=r['media_kind'],mime=r['media_mime'],filename=r['media_filename']))) for r in db.execute('''SELECT * FROM telegram_messages
                     WHERE telegram_file_id!='' ORDER BY id DESC LIMIT 200''')]
         folder = self.store.path.parent/'media'
         folder.mkdir(exist_ok=True)
         with self.store.connect() as db:
             for row in records:
+                source_date = datetime.fromisoformat(row['date'].replace('Z','+00:00'))
+                created = (source_date if source_date.tzinfo else source_date.replace(tzinfo=timezone.utc)).timestamp()
                 if db.execute('SELECT 1 FROM media WHERE product=? AND event_id=?',(self.product,row['id'])).fetchone():
+                    db.execute('UPDATE media SET created=min(created,?) WHERE product=? AND event_id=?',
+                               (created,self.product,row['id']))
                     continue
                 meta=json.loads(row['metadata'])
                 ident=self.product+'-'+str(row['id'])
@@ -390,9 +394,16 @@ class WebRuntime:
                 kind='image' if kind in ('photo','image') else 'audio' if kind in ('voice','audio') else 'document'
                 db.execute('''INSERT OR IGNORE INTO media(id,user_id,product,context,filename,kind,mime,path,created,file_id,event_id)
                     VALUES (?,0,?,?,?,?,?,?,?,?,?)''',(ident,self.product,str(row['topic_id']),meta.get('filename') or 'file'+suffix,
-                    kind,mimetypes.guess_type('a'+suffix)[0] or 'application/octet-stream',str(folder/(ident+suffix)),time.time(),meta['file_id'],row['id']))
-            pending=[dict(r) for r in db.execute('SELECT * FROM media WHERE product=? AND requested=1 AND file_id!=? LIMIT 4',(self.product,''))]
+                    kind,mimetypes.guess_type('a'+suffix)[0] or 'application/octet-stream',str(folder/(ident+suffix)),created,meta['file_id'],row['id']))
+            db.execute("""UPDATE media SET removed='expired',requested=0 WHERE product=? AND removed=''
+                AND created<? AND (job_id IS NULL OR EXISTS(SELECT 1 FROM jobs j WHERE j.id=media.job_id AND j.state='done'))
+                AND requested!=2""",(self.product,time.time()-RETENTION_SECONDS))
+            db.execute("UPDATE media SET requested=0 WHERE product=? AND removed!='' AND requested=1",(self.product,))
+            pending=[dict(r) for r in db.execute("SELECT * FROM media WHERE product=? AND requested=1 AND removed='' AND file_id!=? LIMIT 4",(self.product,''))]
         for row in pending:
+            with self.store.connect() as db:
+                if not db.execute("UPDATE media SET requested=2 WHERE id=? AND requested=1 AND removed=''",(row['id'],)).rowcount:
+                    continue
             path=Path(row['path'])
             temp=path.with_suffix('.part')
             try:
@@ -404,12 +415,13 @@ class WebRuntime:
                     continue
                 temp.replace(path)
                 with self.store.connect() as db:
-                    db.execute('UPDATE media SET requested=0,created=? WHERE id=?',(time.time(),row['id']))
+                    db.execute('UPDATE media SET requested=0 WHERE id=?',(row['id'],))
             except Exception as exc:
                 logger.warning('event=web_media_download_failed error_type=%s',type(exc).__name__)
             finally:
                 temp.unlink(missing_ok=True)
-        await asyncio.to_thread(cleanup,self.store)
+                with self.store.connect() as db:
+                    db.execute('UPDATE media SET requested=0 WHERE id=?',(row['id'],))
 
 
 def attach_web(app, root: Path, product, service, settings):
