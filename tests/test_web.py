@@ -184,6 +184,30 @@ def test_http_manifest_static_traversal_and_idempotency(web,http):
     assert manifests[0]['scope']=='/rick/' and manifests[1]['scope']=='/sally/'
 
 
+def test_sally_install_icons_are_public_pngs_and_rick_keeps_originals(web,http):
+    from io import BytesIO
+    import shutil
+    from PIL import Image
+    source=Path(__file__).resolve().parents[1]/'agentbridge/web/icons'
+    shutil.copytree(source,web.root/'agentbridge/web/icons')
+    manifest=json.loads(http('GET','/sally/manifest.webmanifest')[2])
+    assert {icon['sizes'] for icon in manifest['icons']}=={'192x192','512x512'}
+    for icon in manifest['icons']:
+        status,headers,raw=http('GET',icon['src'])
+        assert status==200 and headers['Content-Type']=='image/png'
+        with Image.open(BytesIO(raw)) as image:
+            assert image.size==tuple(map(int,icon['sizes'].split('x')))
+            assert image.mode=='RGB'
+    status,_,raw=http('GET','/sally/sally-v2-180.png')
+    assert status==200
+    with Image.open(BytesIO(raw)) as image:
+        assert image.size==(180,180)
+    assert http('GET','/sally/icon.png')[2]==http('GET','/sally/sally-v2-512.png')[2]
+    assert http('GET','/rick/sally-v2-192.png')[0]==404
+    rick=json.loads(http('GET','/rick/manifest.webmanifest')[2])
+    assert [icon['src'] for icon in rick['icons']]==['/rick/icon.png','/rick/icon.svg']
+
+
 def test_owner_invites_members_without_selecting_contexts(web,http):
     owner,token=user(web.access,'evgen',[],'rick')
     headers={'Cookie':'__Secure-rick_sid='+token,'X-CSRF-Token':owner['csrf'],

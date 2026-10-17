@@ -17,7 +17,7 @@ it('service worker shows a generic reminder and opens the existing Rick context'
  const {listeners,client,showNotification}=worker();let pending:Promise<unknown>|undefined;
  listeners.push({data:{json:()=>({body:'Время напоминания. Откройте Рика.',url:'/rick/?context=202',tag:'event'})},waitUntil:(p:Promise<unknown>)=>{pending=p}});
  await pending;
- expect(showNotification).toHaveBeenCalledWith('Рик',expect.objectContaining({body:'Время напоминания. Откройте Рика.',tag:'event'}));
+ expect(showNotification).toHaveBeenCalledWith('Рик',expect.objectContaining({body:'Время напоминания. Откройте Рика.',tag:'event',icon:'/rick/icon.svg'}));
  listeners.notificationclick({notification:{close:vi.fn(),data:{url:'https://example.test/rick/?context=202'}},waitUntil:(p:Promise<unknown>)=>{pending=p}});
  await pending;
  expect(client.navigate).toHaveBeenCalledWith('https://example.test/rick/?context=202');expect(client.focus).toHaveBeenCalledOnce();
@@ -35,7 +35,7 @@ it('Sally worker displays its own reminders and focuses only Sally',async()=>{
  const {listeners,client,showNotification}=worker('sally');let pending:Promise<unknown>|undefined;
  listeners.push({data:{json:()=>({body:'Время напоминания. Откройте Сали.',url:'/sally/?context=0&reminder=5',tag:'private-hash'})},waitUntil:(p:Promise<unknown>)=>{pending=p}});
  await pending;
- expect(showNotification).toHaveBeenCalledWith('Салли',expect.objectContaining({body:'Время напоминания. Откройте Салли.'}));
+ expect(showNotification).toHaveBeenCalledWith('Салли',expect.objectContaining({body:'Время напоминания. Откройте Салли.',icon:'/sally/sally-v2-192.png'}));
  listeners.notificationclick({notification:{close:vi.fn(),data:{url:'https://example.test/sally/?context=0&reminder=5'}},waitUntil:(p:Promise<unknown>)=>{pending=p}});
  await pending;
  expect(client.navigate).toHaveBeenCalledWith('https://example.test/sally/?context=0&reminder=5');

@@ -16,6 +16,8 @@ it.each(['rick','sally'])('%s shows only animated dots while working and removes
   return new Response(JSON.stringify(value),{status:200});
  }));
  render(<Production/>);
+ expect(document.querySelector('link[rel="apple-touch-icon"]')?.getAttribute('href')??null).toBe(product==='sally'?'/sally/sally-v2-180.png':null);
+ expect(document.querySelector('link[rel="icon"]')?.getAttribute('href')??null).toBe(product==='sally'?'/sally/sally-v2-192.png':null);
  if(product==='sally')fireEvent.click(await screen.findByRole('button',{name:'General · общий чат'}));
  else fireEvent.click(await screen.findByRole('button',{name:'Диалог'}));
  const indicator=await screen.findByRole('status',{name:'Идёт обработка'});

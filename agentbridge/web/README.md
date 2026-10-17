@@ -10,7 +10,8 @@ existing Sally process. Both are opt-in using `AGENTBRIDGE_WEB_ENABLED=true`.
 `AGENTBRIDGE_WEB_SALES_ENV_FILE` points to the existing separate Sally config
 (default `runtime/sales_buddy/.env`). Rick reads its non-secret database location
 and group ID for authorized views; bot credentials are not copied into Rick's env.
-The process reads only `mobile-concepts/dist` and the two original application icons.
+The process reads `mobile-concepts/dist`, the original Rick icon and Sally's PNGs
+under `agentbridge/web/icons` (192/512 manifest, 180 Apple touch, 192 push).
 PDF text extraction uses pypdf; Web image validation uses Pillow, both pinned in requirements.txt. The frontend build uses the committed npm lockfile.
 
 Invite-only accounts: `evgen` (owner), `dmitry` (Rick), `sergey` (Sally). No public
@@ -130,7 +131,9 @@ presence immediately. Other devices and the other product are unaffected.
 
 The service worker caches only hashed build assets, never HTML/API/client history.
 No client data is written to localStorage. Manifests have different id/start_url,
-scope and original icons. Real Android installation/keyboard QA is still manual.
+scope and separate icons. Sally uses the selected minimalist portrait with
+versioned PNG URLs; existing home-screen installs may need re-adding to refresh
+their OS-managed icon. Real phone installation/keyboard QA is still manual.
 
 The context list refreshes every 15 seconds and when the window regains focus.
 New empty Telegram topics appear once Sally persists them in her deals registry.

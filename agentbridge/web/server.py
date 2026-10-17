@@ -222,10 +222,15 @@ def make_server(root: Path, store, data, origin, port=18082):
                     raise WebError(404,'Действие недоступно')
                 relative = '/'.join(parts[2:]) or 'index.html'
                 if relative == 'manifest.webmanifest':
+                    icons = [dict(src=f'/{product}/icon.png',sizes='512x512',type='image/png',purpose='any'),dict(src=f'/{product}/icon.svg',sizes='any',type='image/svg+xml',purpose='any')]
+                    if product == 'sally':
+                        icons = [dict(src=f'/sally/sally-v2-{size}.png',sizes=f'{size}x{size}',type='image/png',purpose='any') for size in (192,512)]
                     return self.send(200,dict(id=f'/{product}/',name='Rick' if product=='rick' else 'Sally',short_name=product.title(),
                         start_url=f'/{product}/',scope=f'/{product}/',display='standalone',background_color='#101218' if product=='rick' else '#f6f7f3',
-                        theme_color='#101218' if product=='rick' else '#f6f7f3',icons=[dict(src=f'/{product}/icon.png',sizes='512x512',type='image/png',purpose='any'),dict(src=f'/{product}/icon.svg',sizes='any',type='image/svg+xml',purpose='any')]),'application/manifest+json')
-                if relative == 'icon.svg':
+                        theme_color='#101218' if product=='rick' else '#f6f7f3',icons=icons),'application/manifest+json')
+                if product == 'sally' and relative in ('sally-v2-180.png','sally-v2-192.png','sally-v2-512.png','icon.png'):
+                    file = root/'agentbridge/web/icons'/('sally-v2-512.png' if relative=='icon.png' else relative)
+                elif relative == 'icon.svg':
                     file = root/f'Rick_Sally_Concept_Kit/design/{product}-icon.svg'
                 elif relative == 'icon.png':
                     file = root/f'Rick_Sally_Concept_Kit/design/{product}-icon.png'

@@ -19,7 +19,7 @@ self.addEventListener('push',event=>{
  if(url.origin!==self.location.origin||url.pathname!==root)return;
  event.waitUntil(self.registration.showNotification(label,{
   body:url.searchParams.has('reminder')||typeof data.body==='string'&&data.body.startsWith('Время напоминания.')?`Время напоминания. Откройте ${product==='rick'?'Рика':'Салли'}.`:`Ответ ${product==='rick'?'Рика':'Салли'} готов. Откройте приложение.`,
-  tag:typeof data.tag==='string'?data.tag:product,data:{url:url.href},icon:root+'icon.svg',
+  tag:typeof data.tag==='string'?data.tag:product,data:{url:url.href},icon:root+(product==='sally'?'sally-v2-192.png':'icon.svg'),
  }));
 });
 self.addEventListener('notificationclick',event=>{
