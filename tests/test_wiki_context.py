@@ -170,3 +170,22 @@ async def test_sally_revocation_bypasses_cache_when_current_query_has_no_match(s
     provider.learning.decide(ident,'disable','Команда')
     await provider.analyze(context)
     assert len(SDK.turns)==before+1
+
+
+def test_rick_web_thread_uses_real_sdk_parameter_validation(tmp_path,monkeypatch):
+    from openai_codex.api import ThreadStartParams
+    from agentbridge.agents.codex import CodexProvider
+
+    class Codex:
+        def __init__(self,config): pass
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def thread_start(self,**kwargs):
+            ThreadStartParams(cwd=kwargs['cwd'])
+            assert 'подтверждённые правила Wiki' in kwargs['developer_instructions']
+            return object()
+
+    monkeypatch.setattr('agentbridge.agents.codex.Codex',Codex)
+    provider=CodexProvider(cwd=tmp_path)
+    monkeypatch.setattr(provider,'_run_json',lambda *args,**kwargs: {'answer':'Память подключена'})
+    assert provider._answer_web_question('Проверка','Чат','Wiki')=='Память подключена'
