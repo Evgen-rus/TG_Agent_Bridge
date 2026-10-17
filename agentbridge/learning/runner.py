@@ -27,12 +27,15 @@ def validate_candidates(payload, sources):
         keywords = item.get('keywords')
         if not isinstance(keywords, list) or len(keywords) > 30 or any(not isinstance(k, str) or len(k) > 100 for k in keywords):
             raise ValueError('invalid_learning_keywords')
-        if item.get('scope') not in {'global', 'chat'} or not isinstance(item.get('context'), str):
+        if item.get('scope') not in {'global', 'chat'}:
             raise ValueError('invalid_learning_scope')
+        contexts = {allowed[i]['context'] for i in ids}
         if item['scope'] == 'global':
             item['context'] = ''
-        elif not item['context'] or any(allowed[i]['context'] != item['context'] for i in ids):
+        elif len(contexts)!=1 or not next(iter(contexts)):
             raise ValueError('invalid_learning_context')
+        else:
+            item['context'] = next(iter(contexts))
         if item.get('previous_id') is not None and (type(item['previous_id']) is not int or item['previous_id'] <= 0):
             raise ValueError('invalid_learning_previous')
         candidates.append(item)

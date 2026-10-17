@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from .store import tokens
 
 from openai_codex import ApprovalMode, Codex, Sandbox
@@ -15,13 +16,15 @@ INSTRUCTIONS = '''Ты извлекаешь кандидаты устойчив�
 Если уроков нет, верни candidates=[]. Не принимай и не изменяй действующие правила.
 При противоречии действующему правилу укажи его previous_id как предложение замены.
 Глобальные правила не содержат имён, фактов и исходных сообщений чужих сделок.
-Для урока одной темы выбери scope=chat и context точно из источника; общая привычка
-помощника может иметь scope=global, context=''. title — короткое название,
+Для урока одной темы выбери scope=chat; привязку к диалогу определит сервер из
+подтверждающих источников. Для источников без диалога доступен только scope=global.
+Общая привычка помощника может иметь scope=global. title — короткое название,
 situation — когда применять, behavior — что делать иначе, rationale — основание.
 keywords содержат русские ключевые слова и синонимы для локального поиска.'''
 
 STR = {'type': 'string'}
-PROPERTIES = {key: STR for key in ('title', 'situation', 'behavior', 'rationale', 'scope', 'context')}
+PROPERTIES = {key: STR for key in ('title', 'situation', 'behavior', 'rationale')}
+PROPERTIES['scope'] = {'type':'string','enum':['global','chat']}
 PROPERTIES.update(keywords={'type': 'array', 'items': STR}, source_ids={'type': 'array', 'items': STR},
                   previous_id={'type': ['integer', 'null']})
 SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['candidates'],
@@ -58,9 +61,14 @@ class LearningProvider(SalesCodexProvider):
     def extract(self, sources):
         if not sources:
             return {'candidates': []}
+        schema = deepcopy(SCHEMA)
+        properties = schema['properties']['candidates']['items']['properties']
+        properties['source_ids']['items'] = {'type':'string','enum':[source['source_id'] for source in sources]}
+        if not any(source['context'] for source in sources):
+            properties['scope']['enum'] = ['global']
         with Codex(config=self._config()) as codex:
             thread = codex.thread_start(model=self.model, cwd=self.cwd,
                 sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all, ephemeral=True,
                 developer_instructions=INSTRUCTIONS,
                 config={'model_reasoning_effort': self.reasoning_effort})
-            return self._run(thread, {'sources': sources, 'active_rules': self.relevant_rules(sources)}, SCHEMA)
+            return self._run(thread, {'sources': sources, 'active_rules': self.relevant_rules(sources)}, schema)

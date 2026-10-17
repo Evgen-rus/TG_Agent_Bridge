@@ -46,6 +46,28 @@ def test_schema():
     assert _source('thanks','Спасибо, но сначала уточни дату','1','Команда',NOW)
 
 
+def test_extraction_schema_restricts_evidence_without_restricting_lesson_text(tmp_path,monkeypatch):
+    from agentbridge.learning.provider import LearningProvider
+    class SDK:
+        def __init__(self,config): pass
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def thread_start(self,**kwargs): return object()
+    monkeypatch.setattr('agentbridge.learning.provider.Codex',SDK)
+    provider=LearningProvider(model='fake',reasoning_effort='low',cwd=tmp_path,codex_home=tmp_path)
+    captured=[]
+    monkeypatch.setattr(provider,'_run',lambda thread,payload,schema: captured.append(schema) or {'candidates':[]})
+    provider.extract([source(1,context='')])
+    schema=captured[0]
+    validate_structured_output_schema(schema)
+    properties=schema['properties']['candidates']['items']['properties']
+    assert properties['source_ids']['items']['enum']==['1']
+    assert properties['scope']['enum']==['global']
+    assert 'enum' not in properties['title']
+    assert 'enum' not in properties['keywords']['items']
+    assert 'context' not in properties
+
+
 def test_journal_no_lessons_restart_edit_and_empty(tmp_path):
     store = LearningStore(tmp_path / 'db.sqlite3')
     rows = [source(1)]
@@ -87,10 +109,16 @@ def test_limits_context_isolation_exact_duplicates(tmp_path):
 
 def test_unknown_source_and_cross_context_do_not_commit(tmp_path):
     store = LearningStore(tmp_path / 'db.sqlite3')
-    for bad in [candidate(['missing']), dict(candidate(['1']), context='2')]:
+    for bad in [candidate(['missing']), candidate(['1','2'])]:
         with pytest.raises(ValueError):
             run_learning(store, Fake({'candidates': [bad]}), lambda floor: [source(1)], now=NOW)
     assert not store.sources_processed([('1', 'v1')])
+    with pytest.raises(ValueError):
+        validate_candidates({'candidates':[candidate(['1','2'])]},[source(1),source(2,context='2')])
+    actual = validate_candidates({'candidates':[dict(candidate(['1']),context='guessed')]},[source(1)])
+    assert actual[0]['context']=='1'
+    with pytest.raises(ValueError):
+        validate_candidates({'candidates':[candidate(['1'])]},[source(1,context='')])
 
 
 def test_long_sources_split_without_truncation():
