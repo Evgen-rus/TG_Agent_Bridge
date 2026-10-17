@@ -1,0 +1,10 @@
+[Unit]
+Description=Sally daily learning at 08:45 Novosibirsk
+
+[Timer]
+OnCalendar=*-*-* 08:45:00 Asia/Novosibirsk
+Persistent=true
+Unit=sally-learning.service
+
+[Install]
+WantedBy=timers.target

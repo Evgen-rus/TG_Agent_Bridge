@@ -25,6 +25,9 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     settings = SalesSettings.load(root, args.env_file)
+    from dotenv import dotenv_values
+    values = dotenv_values(args.env_file or root / '.env')
+    os.environ.setdefault('SALLY_WIKI_ENABLED', str(values.get('SALLY_WIKI_ENABLED') or 'false'))
     if os.name == 'posix':
         os.umask(0o077)
     settings.runtime.mkdir(parents=True, exist_ok=True)
@@ -41,6 +44,9 @@ def main():
                                  cwd=cwd, codex_home=settings.codex_home, knowledge=knowledge, store=store)
     service = SalesService(store, provider,
                            system_chat_id=settings.chat_id, system_topic_id=settings.system_topic_id)
+    from agentbridge.learning.context import load_store
+    service.learning = load_store(store.path)
+    provider.learning = service.learning
     app = create_sales_application(settings, service)
     from agentbridge.web.runtime import attach_web
     attach_web(app, root, 'sally', service, settings)

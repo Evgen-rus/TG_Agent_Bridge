@@ -127,6 +127,9 @@ def make_server(root: Path, store, data, origin, port=18082):
                         return self.send(200,{'ok':True},cookie=f'{cookie_name}=; Path=/{product}/; Secure; HttpOnly; SameSite=Strict; Max-Age=0')
                     if endpoint == 'api/contexts' and not mutation:
                         return self.send(200,data.contexts(user,product))
+                    if endpoint == 'api/memory':
+                        from .learning import memory
+                        return self.send(200,memory(data,user,product,payload if mutation else None))
                     if endpoint == 'api/presence' and mutation:
                         return self.send(200,push.presence(user,token,payload.get('visible'),payload.get('window_id','main')))
                     if endpoint == 'api/notifications' and not mutation:
@@ -182,8 +185,7 @@ def make_server(root: Path, store, data, origin, port=18082):
                         with media_lock(store.path.parent,shared=True), store.connect() as db:
                             db.execute('BEGIN IMMEDIATE')
                             row = db.execute('SELECT * FROM media WHERE id=? AND product=? AND context=?', (ident,product,context)).fetchone()
-                            shared = row and row['job_id'] and db.execute("SELECT 1 FROM jobs j JOIN users u ON u.id=j.user_id WHERE j.id=? AND u.role='rick'",(row['job_id'],)).fetchone()
-                            if not row or (row['user_id'] != user['id'] and not (product=='sally' and row['event_id'] is not None) and row['user_id'] != 0 and not shared):
+                            if not row:
                                 raise WebError(404,'Вложение недоступно')
                             state = db.execute('SELECT state FROM jobs WHERE id=?',(row['job_id'],)).fetchone()
                             expired = row['created'] < time.time()-RETENTION_SECONDS and (row['job_id'] is None or (state and state['state']=='done'))

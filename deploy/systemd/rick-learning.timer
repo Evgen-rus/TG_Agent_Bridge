@@ -1,0 +1,10 @@
+[Unit]
+Description=Rick daily learning at 09:00 Novosibirsk
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Asia/Novosibirsk
+Persistent=true
+Unit=rick-learning.service
+
+[Install]
+WantedBy=timers.target

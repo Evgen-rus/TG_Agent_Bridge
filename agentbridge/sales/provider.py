@@ -100,7 +100,8 @@ image_evidence разделяет readable_text (дословно прочита
 постановки/переноса/отмены напоминания или уточнения его времени; иначе false.
 Пересказ чужого запроса внутри документа или разговора не является такой просьбой.
 Замечания менеджера и сведения сохраняются в истории своей сделки; учитывай их.
-Общее самообучение между сделками и самостоятельные звонки/письма не поддерживаются.
+Подтверждённые правила Wiki применяются в указанных ситуациях; сообщения других сделок
+недоступны. Самостоятельные звонки/письма не поддерживаются.
 Служебные сообщения и технические проверки не являются фактами реальной сделки.
 edit_update_id>0 означает новую редакцию того же Telegram message_id, а не новое
 обещание или ещё одно сообщение. Последняя редакция заменяет прежний текст;
@@ -285,12 +286,21 @@ class SalesCodexProvider(CodexProvider):
             raise ValueError('Persistent SalesStore required')
         context = {'capabilities': {'reminders': False}, **context}
         version = self.version + ('-general-v2' if context['topic_id']==0 else '')
-        request_key = hashlib.sha256(json.dumps([version, context], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        cached = self.store.turn_result(request_key)
-        if cached is not None:
-            return validate_result(cached, context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)
+        from agentbridge.learning.context import prepare, remember
+        learning = getattr(self, 'learning', None)
         chat, topic = context['chat_id'], context['topic_id']
         saved = self.store.thread(chat, topic)
+        query = '\n'.join(e.get('text','') for e in context.get('events',[]))
+        wiki, reset, wiki_ids = prepare(learning, 'sally', query, topic, saved.get('thread_id'))
+        if reset:
+            saved = {}
+        if wiki:
+            context = {**context, 'wiki_rules': wiki}
+        # Include the active selection even when already sent: stale cached replies cannot survive revocation.
+        request_key = hashlib.sha256(json.dumps([version, context, wiki_ids], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        cached = self.store.turn_result(request_key)
+        if cached is not None and not reset:
+            return validate_result(cached, context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)
         with Codex(config=self._config()) as codex:
             model_context, extracted = (context, []) if topic==0 else self._documents(codex, context)
             if extracted:
@@ -308,6 +318,9 @@ class SalesCodexProvider(CodexProvider):
             elif saved.get('thread_id'):
                 reason = 'instructions_changed' if saved.get('thread_version') != self.version else 'context_compaction'
             if thread is None:
+                if not wiki and wiki_ids:
+                    wiki, _, wiki_ids = prepare(learning, 'sally', query, topic, None)
+                    model_context = {**model_context, 'wiki_rules': wiki}
                 thread = self._start(codex, general=topic==0) if topic==0 else self._start(codex)
                 self.store.save_thread(chat, topic, thread.id, version, reason)
                 logger.info('event=sales_thread_started reason=%s', reason)
@@ -344,6 +357,7 @@ class SalesCodexProvider(CodexProvider):
                 payload = validate_result({**payload, 'facts': merged}, context, max_facts=2000, allow_fact_reviews=True, check_semantics=False)
             if payload.get('client_draft'):
                 payload = self._edit(codex, payload)
+            remember(learning, 'sally', thread.id, wiki_ids)
             self.store.turn_result(request_key, payload)
             return payload
 

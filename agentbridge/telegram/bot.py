@@ -28,6 +28,7 @@ from agentbridge.application import IncomingMessage, MemoryProposal, OnboardingD
 from agentbridge.media import DEFAULT_MEDIA_TTL_SECONDS, MediaRef, delete_media_file, media_file_ready
 from agentbridge.restart import self_restart_supported, spawn_restart_helper
 from agentbridge.transcribe import TranscriptionError, transcribe_audio_file
+from agentbridge.learning.telegram import CALLBACK as WIKI_CALLBACK, deliver_notifications, review_callback, refinement_reply
 from .formatter import (
     format_learning_proposal,
     format_memory_proposal,
@@ -779,6 +780,9 @@ def create_telegram_application(
                 return False
 
     async def _retry_pending_deliveries(bot) -> None:
+        learning = getattr(message_service, 'learning', None)
+        if learning is not None:
+            await deliver_notifications(learning, bot, owner_chat_id)
         if daily_report_enabled and live_enabled:
             store = getattr(message_service, "store", None)
             if store is not None:
@@ -1470,6 +1474,13 @@ def create_telegram_application(
             return
         if chat.id == owner_chat_id:
             _ingest(update, chat.id, True)
+            authorized_id = self_audit_owner_user_id or (owner_chat_id if owner_chat_id > 0 else None)
+            if await refinement_reply(getattr(message_service, 'learning', None), update, context,
+                    sender is not None and sender.id == authorized_id):
+                marker = getattr(message_service, 'mark_update_processed', None)
+                if marker is not None:
+                    marker(update.update_id)
+                return
             if await owner_reply(update, context):
                 marker = getattr(message_service, "mark_update_processed", None)
                 if marker is not None:
@@ -1795,6 +1806,14 @@ def create_telegram_application(
         await _send(context.bot, chat_id=owner_chat_id, text=setter(user_id, enabled))
 
     polling_request = HeartbeatHTTPXRequest(heartbeat, polling_hard_timeout_seconds)
+    async def wiki_callback(update, context):
+        user, chat = update.effective_user, update.effective_chat
+        authorized_id = self_audit_owner_user_id or (owner_chat_id if owner_chat_id > 0 else None)
+        learning = getattr(message_service, 'learning', None)
+        allowed = bool(learning and user and not user.is_bot and chat and
+            chat.id == owner_chat_id and user.id == authorized_id)
+        await review_callback(learning, update, context, allowed)
+
     application = (
         Application.builder()
         .token(token.strip())
@@ -1817,4 +1836,7 @@ def create_telegram_application(
     application.add_handler(CommandHandler("remind", remind_command, filters=filters.UpdateType.MESSAGE))
     application.add_handler(CommandHandler("reminders", reminders_command, filters=filters.UpdateType.MESSAGE))
     application.add_handler(CommandHandler("dev", dev_command, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CallbackQueryHandler(
+        wiki_callback, pattern=WIKI_CALLBACK,
+    ))
     return application

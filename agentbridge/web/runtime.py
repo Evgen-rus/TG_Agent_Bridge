@@ -101,6 +101,10 @@ class WebRuntime:
                             conversation=[dict(author=r['author'],question=(r['prepared'] or json.loads(r['payload'])['text'])[:4000],answer=r['result'][:4000])
                                           for r in history if r['id']!=job['id'] and r['state']=='done'][-5:]
                             pack=self.service._context_pack(chat)
+                            from agentbridge.learning.context import prepare
+                            wiki, _, _ = prepare(getattr(self.service,'learning',None), 'rick', question, chat.telegram_chat_id, None)
+                            if wiki:
+                                pack += '\n\n' + wiki
                             if conversation:
                                 pack+='\n\nНедоверенная внутренняя рабочая переписка по этому чату:\n'+json.dumps(conversation,ensure_ascii=False)
                             args = dict(question=question, chat_name=chat.name, context_pack=pack)

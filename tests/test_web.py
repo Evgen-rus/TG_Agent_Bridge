@@ -168,6 +168,44 @@ def test_http_auth_csrf_origin_cookies_and_no_cache(web,http):
     assert http('GET','/rick/api/session',headers=auth)[0]==401
 
 
+@pytest.mark.parametrize('login,product',[('dmitry','rick'),('sergey','sally')])
+def test_memory_members_sources_decisions_csrf_and_product_boundary(web,http,login,product):
+    from agentbridge.learning.store import LearningStore
+    path=web.data.rick_path if product=='rick' else web.data.sales_path
+    lessons=LearningStore(path)
+    ident=lessons.commit_batch([{'source_id':'owner:1','version':'1','context':'owner',
+        'text':'Owner discussion visible to team','author':'Евгений'}],
+        [{'title':'Lesson','situation':'Relevant request','behavior':'Use clear wording',
+          'rationale':'Team correction','scope':'global','source_ids':['owner:1']}])[0]
+    actor,token=user(web.access,login,[],product)
+    headers={'Cookie':f'__Secure-{product}_sid='+token,'X-CSRF-Token':actor['csrf'],
+             'Origin':'https://example.test','Content-Type':'application/json'}
+    status,_,raw=http('GET',f'/{product}/api/memory',headers=headers)
+    assert status==200
+    snapshot=json.loads(raw)
+    assert snapshot['candidates'][0]['sources'][0]['text']=='Owner discussion visible to team'
+    action={'id':ident,'action':'accept','expected_version':1}
+    assert http('POST',f'/{product}/api/memory',action,{**headers,'X-CSRF-Token':''})[0]==403
+    assert http('POST',f'/{product}/api/memory',dict(action,expected_version=True),headers)[0]==400
+    assert http('POST',f'/{product}/api/memory',action,headers)[0]==200
+    assert http('POST',f'/{product}/api/memory',action,headers)[0]==200
+    assert len(lessons.snapshot()['rules'])==1
+    assert http('POST',f'/{product}/api/memory',dict(action,action='disable',expected_version=99),headers)[0]==409
+    assert lessons.get(ident)['status']=='active'
+    other='sally' if product=='rick' else 'rick'
+    assert http('GET',f'/{other}/api/memory',headers=headers)[0]==401
+    from agentbridge.web.learning import memory
+    with pytest.raises(WebError):
+        memory(web.data,actor,other)
+    status,_,raw=http('POST',f'/{product}/api/memory',dict(action,action='refine',behavior='Use specific wording'),headers)
+    assert status==200
+    revised=json.loads(raw)['candidates'][0]
+    assert revised['behavior']=='Use specific wording' and revised['previous_id']==ident
+    assert lessons.get(ident)['status']=='active'
+    assert http('POST',f'/{product}/api/memory',{'id':revised['id'],'action':'accept','expected_version':revised['version']},headers)[0]==200
+    assert lessons.get(ident)['status']=='superseded'
+
+
 def test_http_manifest_static_traversal_and_idempotency(web,http):
     actor,token=user(web.access,'dmitry',['-100123456'],'rick')
     headers={'Cookie':'__Secure-rick_sid='+token,'X-CSRF-Token':actor['csrf'],'Origin':'https://example.test','Content-Type':'application/json','Idempotency-Key':'c'*20}
@@ -488,7 +526,7 @@ async def test_sally_web_ingest_uses_existing_process_and_deduplicates(web):
         assert db.execute('SELECT count(*) FROM outbox WHERE chat_id=-100 AND topic_id=101').fetchone()[0]>=1
 
 
-def test_binary_upload_auth_csrf_scope_private_read_and_mime(web,http):
+def test_binary_upload_auth_csrf_context_shared_read_and_mime(web,http):
     from io import BytesIO
     from PIL import Image
     actor,token=user(web.access,'sergey',[],'sally')
@@ -508,7 +546,7 @@ def test_binary_upload_auth_csrf_scope_private_read_and_mime(web,http):
     assert response['Cache-Control']=='no-store' and response['Content-Type']=='image/png'
     assert http('GET',url)[0]==401
     owner,owner_token=user(web.access,'evgen',[],'sally')
-    assert http('GET',url,headers={'Cookie':'__Secure-sally_sid='+owner_token})[0]==404
+    assert http('GET',url,headers={'Cookie':'__Secure-sally_sid='+owner_token})[0]==200
     assert http('GET',url.replace('101','102'),headers=headers)[0]==404
     post=dict(headers,**{'Content-Type':'application/json','Idempotency-Key':'binary-command-key'})
     assert http('POST','/sally/api/ask',{'context':'101','text':'Фото','attachments':[media['id']]},post)[0]==202
@@ -555,10 +593,44 @@ def test_sally_shared_chronology_authorship_reply_and_context_boundaries(web):
     with pytest.raises(WebError):web.data.reply_target('102',20)
 
 
-def test_rick_owner_private_turns_and_member_work_are_separate(web):
+def test_rick_owner_and_member_conversations_are_shared_within_context(web):
     owner,_=user(web.access,'evgen',[],'rick')
     member,_=user(web.access,'dmitry',[],'rick')
-    web.access.enqueue(owner,'rick','-100123456','owner-private-key1',{'text':'OWNER PRIVATE'})
+    web.access.enqueue(owner,'rick','-100123456','owner-shared-key1',{'text':'OWNER DISCUSSION'})
     web.access.enqueue(member,'rick','-100123456','member-shared-key1',{'text':'SHARED WORK'})
-    assert 'OWNER PRIVATE' not in json.dumps(web.access.history(member,'rick','-100123456'))
+    assert 'OWNER DISCUSSION' in json.dumps(web.access.history(member,'rick','-100123456'))
     assert len(web.access.history(owner,'rick','-100123456'))==2
+
+
+@pytest.mark.parametrize('login,product,context,other_context',[
+    ('dmitry','rick','-100123456','-999'),('sergey','sally','101','102')])
+def test_product_team_reads_owner_questions_results_and_attachments(web,http,login,product,context,other_context):
+    owner,owner_token=user(web.access,'evgen',[],product)
+    member,member_token=user(web.access,login,[],product)
+    owner_headers={'Cookie':f'__Secure-{product}_sid='+owner_token,'X-CSRF-Token':owner['csrf'],
+        'Origin':'https://example.test','Content-Type':'application/octet-stream'}
+    status,_,raw=http('POST',f'/{product}/api/upload?context={context}&filename=notes.txt',b'Owner discussion notes',owner_headers)
+    assert status==201
+    attachment=json.loads(raw)
+    status,_,raw=http('POST',f'/{product}/api/ask',{'context':context,'text':'Owner question','attachments':[attachment['id']]},
+        {**owner_headers,'Content-Type':'application/json','Idempotency-Key':'owner-discussion-key'})
+    assert status==202
+    web.access.finish(json.loads(raw)['id'],'done','Shared owner answer')
+    member_headers={'Cookie':f'__Secure-{product}_sid='+member_token}
+    status,_,raw=http('GET',f'/{product}/api/history?context={context}',headers=member_headers)
+    assert status==200
+    history=json.loads(raw)
+    assert history[0]['author']=='Евгений' and 'Owner question' in history[0]['payload']
+    assert history[0]['result']=='Shared owner answer'
+    assert history[0]['attachments'][0]['id']==attachment['id']
+    media_url=f'/{product}/api/media?context={context}&id='+attachment['id']
+    assert http('GET',media_url,headers=member_headers)[2]==b'Owner discussion notes'
+    assert http('GET',media_url.replace(f'context={context}',f'context={other_context}'),headers=member_headers)[0]==404
+    # Reading shared files does not allow submitting them as another person's upload.
+    assert http('POST',f'/{product}/api/ask',{'context':context,'text':'Reuse','attachments':[attachment['id']]},
+        {**member_headers,'Content-Type':'application/json','Origin':'https://example.test',
+         'X-CSRF-Token':member['csrf'],'Idempotency-Key':'member-reuse-key'})[0]==404
+    other='sally' if product=='rick' else 'rick'
+    assert http('GET',media_url.replace(f'/{product}/',f'/{other}/'),headers=member_headers)[0]==401
+    with pytest.raises(WebError):
+        web.access.history(member,other,context)

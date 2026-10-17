@@ -30,6 +30,8 @@ def main() -> None:
     logging.info("event=process_starting component=application")
     registry = ChatRegistry.load(settings.chats_dir)
     store = ChatThreadStore(settings.database_path)
+    from .learning.context import load_store
+    learning = load_store(settings.database_path)
     logging.getLogger().addHandler(OperationalEventHandler(store.record_operational_event))
     # SQLite — источник истины о лимите, поэтому новый процесс начинает с того
     # состояния, которое пережило рестарт, а не с «лимита никогда не было».
@@ -137,6 +139,7 @@ def main() -> None:
         on_usage_recovered=note_owner_codex_recovered, usage_limit_active=limit_active,
     )
     self_audit = SelfAudit(store, audit_provider, settings.log_dir)
+    service.learning = learning
     telegram_application = create_telegram_application(
         token=settings.telegram_bot_token,
         owner_chat_id=settings.owner_chat_id,

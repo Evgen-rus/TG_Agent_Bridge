@@ -1,0 +1,17 @@
+[Unit]
+Description=Sally confirmed-rule learning extraction
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rick
+Group=rick
+WorkingDirectory=/home/rick/TG_Agent_Bridge
+ExecStart=/home/rick/TG_Agent_Bridge/.venv/bin/python -m agentbridge.learning --product sally
+TimeoutStartSec=1h
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal

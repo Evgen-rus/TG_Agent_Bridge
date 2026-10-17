@@ -49,3 +49,14 @@
 @media(prefers-reduced-motion:reduce){.agent-working i{animation:none;opacity:.7}}
 
 .due-reminder{position:sticky;top:0;z-index:5;border:2px solid var(--accent,#b68b46);box-shadow:0 0 0 3px #b68b4624}
+.memory-tabs,.memory-actions{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}
+.memory-tabs .button{min-height:44px;flex:1;font-size:12px;padding:10px}
+.live-app .memory-tabs [aria-pressed=true]{border:1px solid var(--accent);color:var(--accent);background:var(--tint)}
+.memory-rule a{color:var(--accent);text-underline-offset:3px}
+.memory-rule{padding:22px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.memory-rule>small{color:var(--muted);font-size:12px}
+.memory-rule h2{font-size:20px;margin:12px 0 20px}
+.memory-rule dl{margin:0}.memory-rule dt{font-weight:600;font-size:13px;margin-top:18px}
+.memory-rule dd{margin:6px 0 0;white-space:pre-wrap;font-size:14px;line-height:1.65}
+.memory-edit,.memory-edit label{display:grid;gap:10px}.memory-edit{margin-top:20px}
+.memory-edit label{font-size:13px}.memory-edit textarea{min-height:88px;width:100%;padding:12px;font:inherit;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text);resize:vertical}

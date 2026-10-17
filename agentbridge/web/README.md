@@ -59,16 +59,19 @@ Bot API cannot fetch arbitrary old messages.
 Rick questions never send to client chats. Owner questions reuse the original
 owner provider/context policy. Dmitry uses the existing tool-free, read-only,
 deny-all provider with only the selected work context and authorized internal
-conversation. Owner-private turns, owner working memory, /dev, code, restart and
-configuration remain inaccessible. Member work is visible to owner; owner-private
-queries are not shared with members. Client recommendations/events remain visible
-in their original screens, including available Telegram attachments.
+conversation. All saved Web questions, answers and attachments in a product/context
+are visible to its team, including owner discussions: Dmitry in Rick and Sergey in
+Sally. Product isolation remains enforced. Upload submission and reminder controls
+retain their existing author checks. /dev, code, restart and configuration are not
+exposed by the Web adapter. Owner working context remains the existing separate
+provider input. Client recommendations/events remain visible in their original
+screens, including available Telegram attachments.
 
 Both apps support 8 attachments per request, 20 MiB per file, multiple images,
 TXT/MD/PDF/DOCX and browser voice recording with preview/cancel. `api/upload` is
 a separate binary endpoint with Origin, CSRF, authentication, context ACL,
 rate/concurrency limits and a 200 MiB local-source quota per account. Media bytes
-are private and are served only by an authorized `api/media` request, never by
+are shared within the authorized product/context and served by `api/media`, never by
 static paths. Original files expire after 30 days; unfinished jobs stay protected.
 Expired attachments return HTTP 410 and are never downloaded from Telegram again.
 When an upload would exceed 200 MiB per user, oldest completed originals may be
@@ -91,7 +94,11 @@ explicitly. Scanned PDFs ask for page images; automatic whole-PDF OCR is not add
 Drafts survive failed uploads/sends and context switches while logged in. Successful
 uploads are reused on a retry; the original command key is retained. Rick owner
 reminders use the existing planner with confirm, clarify and cancel controls in
-Web. Other approvals and memory confirmation remain in Telegram. Web never
+Web. Team learning candidates and rules are available under More → Memory in
+both apps, including their sources and version history. Accept, refine, reject
+and disable use the same LearningStore operations as Telegram, with expected
+versions to reject stale decisions. Refinement requires separate acceptance.
+Other operational approvals remain in Telegram. Web never
 impersonates Telegram callback users or exposes general, developer, restart or
 analytics execution through reminder controls.
 

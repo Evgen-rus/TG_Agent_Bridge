@@ -1,5 +1,58 @@
 # Рик: что делать, когда сломалось
 
+## Долговременная Wiki
+
+Салли: 08:45, Рик: 09:00 `Asia/Novosibirsk`. Данные Wiki находятся в собственных
+`sales.sqlite3` и `agentbridge.sqlite3`. Миграции добавочные, повторно безопасные.
+Перед первой миграцией сделать SQLite online backup обеих баз и проверить
+`PRAGMA integrity_check` снимков. Исходные записи и прежние знания сохраняются.
+
+Из существующего каталога `/home/rick/TG_Agent_Bridge`, от пользователя `rick`:
+
+```bash
+.venv/bin/python -m agentbridge.learning --product rick --migrate-only
+.venv/bin/python -m agentbridge.learning --product sally --migrate-only
+.venv/bin/python -m agentbridge.learning --product rick --force
+.venv/bin/python -m agentbridge.learning --product sally --force
+```
+
+`--force` разрешает ручное извлечение при выключенном флаге расписания. Он
+никогда не принимает кандидатов. Пустая очередь не вызывает Codex. Сначала
+проверить извлечение при выключенных `RICK_WIKI_ENABLED` и `SALLY_WIKI_ENABLED`;
+кандидаты появятся в приложениях и после перезапуска — в Telegram. Принимать
+реальные правила может только команда. Флаги Салли читаются из её env-файла,
+по умолчанию `runtime/sales_buddy/.env` (override `AGENTBRIDGE_WEB_SALES_ENV_FILE`).
+Настройки модели и авторизация Codex остаются существующими.
+
+Для расписания установить из `deploy/systemd/` файлы `rick-learning.service`,
+`rick-learning.timer`, `sally-learning.service`, `sally-learning.timer` в
+`/etc/systemd/system/`, выполнить `systemctl daemon-reload`. После проверки
+включить флаги извлечения/применения и соответствующие timers:
+
+```bash
+sudo systemctl enable --now rick-learning.timer sally-learning.timer
+systemctl list-timers rick-learning.timer sally-learning.timer --all
+systemctl status rick-learning.service sally-learning.service --no-pager
+journalctl -u rick-learning.service -u sally-learning.service --since today --no-pager
+```
+
+Журнал задания содержит только тип ошибки или счётчики пакетов, обработанных
+источников, кандидатов и остатка. Ненулевой остаток переносится на следующий
+запуск. Не выводить исходные сообщения и SDK transport errors в рабочие логи.
+Сбой обучения не меняет доступность обычных ботов. В `wiki_sources` находятся
+успешно проверенные версии; отсутствие уроков тоже завершает обработку.
+
+Для отключения извлечения выставить `RICK_LEARNING_ENABLED=false` и/или
+`SALLY_LEARNING_ENABLED=false`, остановить соответствующий timer. Для отключения
+подгрузки выставить `RICK_WIKI_ENABLED=false` и/или `SALLY_WIKI_ENABLED=false`
+и перезапустить только соответствующий основной сервис. Следующий ответ
+заменит тред, если в нём были переданные Wiki-правила. Все знания сохраняются.
+
+Откат: выключить новые функции и timers, вернуть предыдущую проверенную
+ревизию/сборку, перезапустить затронутые сервисы. Добавленные таблицы старому
+коду не мешают. Копию базы восстанавливать только при повреждении, отдельно
+сохранив новые события; обычный откат кода не требует отката рабочих данных.
+
 ## Очистка оригиналов вложений Rick и Sally
 
 Ежедневно в 08:00 `Asia/Novosibirsk` запускается

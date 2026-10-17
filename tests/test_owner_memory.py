@@ -53,7 +53,7 @@ async def _wait_for_memory_tasks(app: AgentBridgeApplication) -> None:
 
 
 class _MemoryOwnerProvider:
-    prompt_version = 14
+    prompt_version = OWNER_CONTEXT_PROMPT_VERSION
     memory_prompt_version = 1
 
     def __init__(self, *, update_result=None, failure: Exception | None = None):

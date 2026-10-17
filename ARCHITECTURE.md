@@ -1,5 +1,47 @@
 # AgentBridge architecture
 
+## Human-confirmed Wiki learning
+
+`agentbridge/learning/` adds product-local Wiki tables to the existing Rick and
+Sally databases. It does not replace working deal state, the owner's experimental
+working context, old memory entries or chat wiki files. Legacy Rick learning
+rules are copied once with their evidence and remain linked to legacy undo and
+supersession. When Wiki application is enabled, migrated rules use the bounded
+Wiki selector rather than being injected a second time as legacy rules.
+
+Two `systemd` oneshots run daily in `Asia/Novosibirsk`: Sally 08:45 and Rick
+09:00. Persistent timers catch up after downtime; each product has an OS file
+lock. First extraction includes 14 days of saved history; its cutoff stays fixed
+so later catch-up and edits remain eligible. Saved messages, corrections,
+recommendations and completed web discussions are read without re-running sales
+analysis. Local filtering and dedup precede up to ten 20,000-character source
+packets per run. Extraction uses an ephemeral, tool-free Codex SDK turn. Source
+versions and candidate creation commit atomically; empty or already processed
+queues cause no model call. A successful no-lesson analysis is also journaled.
+
+Candidates contain situation, behavior, rationale, scope and source evidence.
+They never activate automatically. The existing bot retry loops deliver the
+durable Wiki outbox with review buttons; multipart delivery retains at-least-once
+semantics. Telegram and authenticated `api/memory` call the same SQLite
+transactional decisions with version checks. Refinement creates an immutable
+pending revision; acceptance atomically supersedes the previous active rule.
+Rejection, disabling and history remain visible in each app's More / Memory.
+
+Owner and Sergey share Sally sources and decisions; owner and Dmitry share Rick
+sources and decisions, including owner discussions. Web discussion history and
+attachment reads are shared within an authorized product/context. Upload ownership,
+existing administrative permissions, login/CSRF and separation of products remain.
+
+`RICK_LEARNING_ENABLED` / `SALLY_LEARNING_ENABLED` control extraction, and
+`RICK_WIKI_ENABLED` / `SALLY_WIKI_ENABLED` control answer context independently.
+All default to false. Local search selects at most three applicable rules under
+6,000 characters, without source histories. Sent rule IDs identify immutable
+versions per Codex thread; repeated packets are omitted. Revocation, replacement
+or disabling Wiki resets an affected thread before its next turn. A fresh SDK
+fallback receives current rules again before its answer is delivered. SQLite
+history remains recoverable. Wiki lookup failures are logged safely and do not
+block normal bot processing.
+
 This document is a compact orientation map for future Codex work. The current
 code and tests are authoritative when they differ from this summary.
 

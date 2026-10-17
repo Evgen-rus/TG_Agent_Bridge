@@ -18,6 +18,7 @@ from .images import ImageWorker
 from .activity import SalesActivity
 from .storage import SALI_NAME, should_respond
 from .commitments import Commitments, delivery_allowed, disable
+from agentbridge.learning.telegram import deliver_notifications, review_callback, refinement_reply
 
 logger = logging.getLogger(__name__)
 HELP = 'Я Сали. Создайте тему для сделки и отправьте предысторию, текст разговора, .txt/.md в UTF-8 (до 2 МБ), фото или изображение файлом (JPEG/PNG/WEBP/GIF до 20 МБ), голосовое или аудиозапись (до 20 МБ). В этой теме я помню вашу сделку. Для напоминания напишите, например: «Сали, напомни сегодня в 17:00 позвонить клиенту». Время — по Новосибирску; дождитесь подтверждения сохранения. Напоминания доступны при включённом контроле договорённостей. PDF/DOCX с текстовым слоем — до 20 МБ, PDF до 100 страниц; сканированные и смешанные PDF — до 10 страниц, длинные разделите на части. В General отвечаю на обращение по имени, тегу или ответу на моё сообщение. Администратор может запросить /restart с подтверждением.'
@@ -64,6 +65,9 @@ class SalesTelegram:
         else:
             if not member_allowed(member):
                 return
+        if not authorization_pending and await refinement_reply(
+                getattr(self.service, 'learning', None), update, context, True):
+            return
         text = message_text(message)
         command = text.split()[0].partition('@') if text.startswith('/') else ('', '', '')
         restart_requested = (command[0] == '/restart' and (not command[1] or
@@ -200,6 +204,17 @@ class SalesTelegram:
 
     async def callback(self, update, context):
         query = update.callback_query
+        if query and (query.data or '').startswith('wiki:'):
+            learning = getattr(self.service, 'learning', None)
+            user, chat = update.effective_user, update.effective_chat
+            allowed = False
+            if learning and user and not user.is_bot and chat and chat.id == self.chat_id:
+                try:
+                    allowed = member_allowed(await context.bot.get_chat_member(self.chat_id, user.id))
+                except Exception:
+                    pass
+            await review_callback(learning, update, context, allowed)
+            return
         if query and (query.data or '').startswith('sales_fact:'):
             await self.fact_review_callback(update, context)
             return
@@ -361,6 +376,9 @@ class SalesTelegram:
             await self._deliver_once(bot)
 
     async def _deliver_once(self, bot):
+        learning = getattr(self.service, 'learning', None)
+        if learning is not None:
+            await deliver_notifications(learning, bot, self.chat_id)
         blocked = set()
         for row in await asyncio.to_thread(self.service.store.deliveries):
             if row['chat_id'] != self.chat_id or row['topic_id'] in blocked:
@@ -458,7 +476,7 @@ def create_sales_application(settings, service):
         .get_updates_request(HeartbeatHTTPXRequest(heartbeat, 30))
         .post_init(adapter.start).post_stop(adapter.stop).build())
     app.add_handler(MessageHandler(filters.ALL, adapter.ingest))
-    app.add_handler(CallbackQueryHandler(adapter.callback, pattern=r'^(?:sales_restart:|sales_fact:)'))
+    app.add_handler(CallbackQueryHandler(adapter.callback, pattern=r'^(?:sales_restart:|sales_fact:|wiki:)'))
 
     async def error(update, context):
         logger.warning('event=sales_telegram_failed error_type=%s', type(context.error).__name__)

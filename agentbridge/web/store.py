@@ -248,8 +248,8 @@ class WebStore:
             raise WebError(403, 'Нет доступа')
         with self.connect() as db:
             rows = [dict(r) for r in db.execute('''SELECT j.id,j.payload,j.state,j.result,j.created,j.prepared,j.task_id,j.revision,j.can_confirm,u.name AS author FROM jobs j JOIN users u ON u.id=j.user_id
-                WHERE (j.user_id=? OR (?='rick' AND u.role='rick')) AND j.product=? AND j.context=? ORDER BY j.id DESC LIMIT 30''',
-                (user['id'], product, product, context))][::-1]
+                WHERE j.product=? AND j.context=? ORDER BY j.id DESC LIMIT 30''',
+                (product, context))][::-1]
             for row in rows:
                 row['attachments']=[dict(r) for r in db.execute('SELECT id,filename,kind,mime FROM media WHERE job_id=?',(row['id'],))]
             return rows

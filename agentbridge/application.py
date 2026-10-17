@@ -481,10 +481,17 @@ class AgentBridgeApplication:
             combined_message = "\n".join(
                 f"{item.sender_name.strip() or 'Неизвестный отправитель'}{_forward_label(item.forward_origin)}: {_episode_text(item)}" for item in messages
             )
-        rules = self.store.active_rule_texts(chat.telegram_chat_id)
+        rules = self._active_rules(chat.telegram_chat_id)
         thread_id = self._thread_id_for_provider(chat.telegram_chat_id)
+        from .learning.context import prepare, remember
+        learning = getattr(self, 'learning', None)
+        wiki, reset, wiki_ids = prepare(learning, 'rick', combined_message, chat.telegram_chat_id, thread_id)
+        if reset:
+            thread_id = None
         exclude_ids = {item.update_id for item in messages if item.update_id is not None}
         context_pack = self._context_pack(chat, episode=combined_message, exclude_update_ids=exclude_ids)
+        if wiki:
+            context_pack += '\n\n' + wiki
         attachments = _episode_attachments(messages)
         logger.info(
             "event=codex_suggest_start chat_id=%s chat=%r batch_size=%d rule_count=%d thread=%s notify=%s attachments=%d",
@@ -502,6 +509,11 @@ class AgentBridgeApplication:
             "attachments": attachments,
         }
         reply = await self.provider.suggest(**suggest_kwargs)
+        if thread_id and reply.thread_id != thread_id and wiki_ids:
+            # SDK recovery may silently replace continuity; restore omitted Wiki before delivery.
+            full_wiki, _, wiki_ids = prepare(learning, 'rick', combined_message, chat.telegram_chat_id, None)
+            suggest_kwargs.update(thread_id=reply.thread_id, context_pack=(context_pack.removesuffix('\n\n'+wiki) if wiki else context_pack)+'\n\n'+full_wiki)
+            reply = await self.provider.suggest(**suggest_kwargs)
         reply = await self._maybe_critique(reply, suggest_kwargs)
         refactor = getattr(self.provider, "refactor_reply", None)
         if refactor is not None:
@@ -521,6 +533,7 @@ class AgentBridgeApplication:
             except Exception:
                 logger.exception("event=sepia_refactor_failed fallback=rick_draft")
         self._persist_thread(chat, reply.thread_id)
+        remember(learning, 'rick', reply.thread_id, wiki_ids)
         self._apply_state_update(chat.telegram_chat_id, reply.candidate_state, reply.situation)
         action = reply.resolved_action()
         if not notify or not reply.notifies_owner():
@@ -568,6 +581,17 @@ class AgentBridgeApplication:
             telegram_chat_id, saved, current,
         )
         return None
+
+    def _active_rules(self, telegram_chat_id):
+        rules = self.store.active_rule_texts(telegram_chat_id)
+        learning = getattr(self, 'learning', None)
+        if learning:
+            try:
+                migrated = learning.legacy_texts()
+                return [rule for rule in rules if rule not in migrated]
+            except Exception as exc:
+                logger.warning('event=wiki_legacy_lookup_failed error_type=%s',type(exc).__name__)
+        return rules
 
     def _persist_thread(self, chat: ChatConfig, thread_id: str) -> None:
         self.store.save_thread(
@@ -646,6 +670,14 @@ class AgentBridgeApplication:
             history_truncated = False
         recent = [item for item in recent if item.update_id not in skipped]
         experience = self.store.recent_experience(chat.telegram_chat_id)
+        learning = getattr(self, 'learning', None)
+        if learning:
+            try:
+                migrated = learning.legacy_texts()
+                experience = [item for item in experience if item.rsplit(' → ',1)[-1] not in migrated]
+            except Exception as exc:
+                logger.warning('event=wiki_experience_lookup_failed error_type=%s',type(exc).__name__)
+                experience = []
         shared = self._shared_knowledge(chat)
         parts = [
             f"Wiki:\n{chat.wiki or '(пусто)'}",
@@ -676,7 +708,7 @@ class AgentBridgeApplication:
             parts.append(
                 "Подтверждённая память:\n" + "\n".join(f"- [{item.kind}/{item.scope}] {item.content}" for item in memories)
             )
-        rules = self.store.active_rule_texts(chat.telegram_chat_id)
+        rules = self._active_rules(chat.telegram_chat_id)
         parts.append("Правила:\n" + ("\n".join(f"- {rule}" for rule in rules) or "(нет)"))
         if experience:
             parts.append("Похожий подтверждённый опыт:\n" + "\n".join(f"- {item}" for item in experience))
@@ -830,7 +862,7 @@ class AgentBridgeApplication:
         recommendation = self.store.get_recommendation_by_owner_message(owner_chat_id, reply_to_message_id)
         if recommendation is None:
             return None
-        rules = self.store.active_rule_texts(recommendation.telegram_chat_id)
+        rules = self._active_rules(recommendation.telegram_chat_id)
         logger.info("event=feedback_analysis_start recommendation_id=%s author_id=%s", recommendation.id, author_user_id)
         analysis = await self.owner_provider.analyze_feedback(
             feedback=feedback, chat_name=recommendation.chat_name, original_message=recommendation.original_message,
@@ -1213,6 +1245,13 @@ class AgentBridgeApplication:
         if related_chat is not None:
             planner_request = f"Выбранный клиент: {related_chat.name}\n\nИсходный запрос:\n{request}"
         thread_id = self._owner_query_thread_id_for_provider(0)
+        from .learning.context import prepare, remember
+        learning = getattr(self, 'learning', None)
+        wiki, reset, wiki_ids = prepare(learning, 'rick', request, '', thread_id)
+        if reset:
+            thread_id = None
+        if wiki:
+            planner_request += '\n\n' + wiki
         try:
             plan = await planner(
                 request=planner_request, timezone_name=self.owner_timezone,
@@ -1227,6 +1266,7 @@ class AgentBridgeApplication:
             return None if reminder_only else OwnerQueryResult("Не удалось подготовить понимание задачи.")
         self.store.save_owner_query_thread(0, "Общие задачи", plan.thread_id,
             prompt_version=getattr(self.owner_provider, "prompt_version", None))
+        remember(learning, 'rick', plan.thread_id, wiki_ids)
         if plan.kind == "image" and not plan.image_prompt.strip():
             return OwnerQueryResult("Не удалось подготовить описание изображения.")
         payload = {
@@ -1480,12 +1520,22 @@ class AgentBridgeApplication:
                     general_task_id=task_id)
             runner = getattr(self.owner_provider, "run_general_task", None)
             thread_id = self._owner_query_thread_id_for_provider(0)
-            if runner is None or not thread_id:
+            from .learning.context import prepare, remember
+            learning = getattr(self, 'learning', None)
+            wiki, reset, wiki_ids = prepare(learning, 'rick', task.request_text, '', thread_id)
+            if reset:
+                thread_id = None
+            if runner is None or (not thread_id and not reset):
                 raise RuntimeError("general task runner unavailable")
-            result = await runner(request=task.request_text, thread_id=thread_id)
+            request = task.request_text + ('\n\n'+wiki if wiki else '')
+            result = await runner(request=request, thread_id=thread_id)
+            if thread_id and isinstance(result, OwnerQueryAnswer) and result.thread_id != thread_id and wiki_ids:
+                full_wiki, _, wiki_ids = prepare(learning, 'rick', task.request_text, '', None)
+                result = await runner(request=task.request_text+'\n\n'+full_wiki,thread_id=result.thread_id)
             if isinstance(result, OwnerQueryAnswer):
                 self.store.save_owner_query_thread(0, "Общие задачи", result.thread_id,
                     prompt_version=getattr(self.owner_provider, "prompt_version", None))
+                remember(learning, 'rick', result.thread_id, wiki_ids)
                 answer = result.answer
             else:
                 answer = str(result)
@@ -1784,7 +1834,7 @@ class AgentBridgeApplication:
         memories = self.store.active_memory_entries(chat.telegram_chat_id, chat.memory_project)
         if memories:
             parts.append("Подтверждённая память:\n" + "\n".join(f"- {item.content}" for item in memories))
-        parts.append("Правила:\n" + ("\n".join(f"- {rule}" for rule in self.store.active_rule_texts(chat.telegram_chat_id)) or "(нет)"))
+        parts.append("Правила:\n" + ("\n".join(f"- {rule}" for rule in self._active_rules(chat.telegram_chat_id)) or "(нет)"))
         return "\n\n".join(parts), len(messages), total, truncated
 
     async def _answer_owner_query_for_chat(
@@ -1824,6 +1874,13 @@ class AgentBridgeApplication:
             pack += "\n\nВложения чата (открывай только файлы со status=available по указанному path; имя файла не доказывает содержимое):\n" + "\n".join(catalog)
         if answerer is not None:
             thread_id = self._owner_query_thread_id_for_provider(chat.telegram_chat_id)
+            from .learning.context import prepare, remember
+            learning = getattr(self, 'learning', None)
+            wiki, reset, wiki_ids = prepare(learning, 'rick', question, chat.telegram_chat_id, thread_id)
+            if reset:
+                thread_id = None
+            if wiki:
+                pack += '\n\n' + wiki
             requested_numbers = set(re.findall(r"(?<!\d)\d{3,}(?!\d)", question))
             selected = [
                 item for item in files if media_file_ready(item.media_path) and (
@@ -1836,6 +1893,10 @@ class AgentBridgeApplication:
             if selected or attachments:
                 args["attachments"] = tuple(MediaAttachment(item.media_path, item.media_kind, item.media_mime, item.media_filename) for item in selected) + tuple(attachments)
             result = await answerer(**args)
+            if thread_id and isinstance(result, OwnerQueryAnswer) and result.thread_id != thread_id and wiki_ids:
+                full_wiki, _, wiki_ids = prepare(learning, 'rick', question, chat.telegram_chat_id, None)
+                args.update(thread_id=result.thread_id, context_pack=(pack.removesuffix('\n\n'+wiki) if wiki else pack)+'\n\n'+full_wiki)
+                result = await answerer(**args)
             if isinstance(result, OwnerQueryAnswer):
                 self.store.save_owner_query_thread(
                     chat.telegram_chat_id,
@@ -1844,6 +1905,7 @@ class AgentBridgeApplication:
                     chat.agent_provider,
                     prompt_version=getattr(self.owner_provider, "prompt_version", None),
                 )
+                remember(learning, 'rick', result.thread_id, wiki_ids)
                 answer = result.answer
             else:
                 answer = str(result)
@@ -2100,7 +2162,7 @@ class AgentBridgeApplication:
         analysis = await self.owner_provider.analyze_feedback(
             feedback=combined_feedback, chat_name=recommendation.chat_name, original_message=recommendation.original_message,
             situation=recommendation.situation, suggested_reply=recommendation.suggested_reply,
-            rules=self.store.active_rule_texts(recommendation.telegram_chat_id),
+            rules=self._active_rules(recommendation.telegram_chat_id),
         )
         if analysis.scope == "global" and not _GLOBAL_WORDING.search(combined_feedback):
             analysis = FeedbackAnalysis(
@@ -2142,13 +2204,30 @@ class AgentBridgeApplication:
             chat = self.registry.get(recommendation.telegram_chat_id)
             thread_id = self._thread_id_for_provider(recommendation.telegram_chat_id)
             if chat is not None:
-                rules = self.store.active_rule_texts(recommendation.telegram_chat_id)
+                rules = self._active_rules(recommendation.telegram_chat_id)
+                from .learning.context import prepare, remember
+                learning = getattr(self, 'learning', None)
+                query = recommendation.original_message+'\n'+draft.feedback
+                wiki, reset, wiki_ids = prepare(learning, 'rick', query, chat.telegram_chat_id, thread_id)
+                if reset:
+                    thread_id = None
+                pack = self._context_pack(chat, episode=recommendation.original_message)
+                if wiki:
+                    pack += '\n\n'+wiki
                 reply = await self.provider.revise(
                     feedback=draft.revision_instruction or draft.feedback,
                     message=recommendation.original_message, sender_name=recommendation.sender_name,
                     chat_name=chat.name, wiki=self._contextual_wiki(chat), rules=rules, thread_id=thread_id or "",
-                    context_pack=self._context_pack(chat, episode=recommendation.original_message),
+                    context_pack=pack,
                 )
+                if thread_id and reply.thread_id != thread_id and wiki_ids:
+                    full_wiki, _, wiki_ids = prepare(learning, 'rick', query, chat.telegram_chat_id, None)
+                    reply = await self.provider.revise(
+                        feedback=draft.revision_instruction or draft.feedback,
+                        message=recommendation.original_message,sender_name=recommendation.sender_name,
+                        chat_name=chat.name,wiki=self._contextual_wiki(chat),rules=rules,thread_id=reply.thread_id,
+                        context_pack=(pack.removesuffix('\n\n'+wiki) if wiki else pack)+'\n\n'+full_wiki)
+                remember(learning, 'rick', reply.thread_id, wiki_ids)
                 self._persist_thread(chat, reply.thread_id)
                 self._apply_state_update(chat.telegram_chat_id, reply.candidate_state, reply.situation)
                 if reply.notifies_owner():
